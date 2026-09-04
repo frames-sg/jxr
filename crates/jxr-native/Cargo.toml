@@ -1,0 +1,18 @@
+[package]
+name = "jxr-native"
+description = "Safe Rust JPEG XR parser, CPU decoder, and Annex-A writer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+fearless_simd.workspace = true
+jxr-core = { path = "../jxr-core", version = "=0.1.0" }
+jxr-math = { path = "../jxr-math", version = "=0.1.0" }
+rayon.workspace = true
+
+[lints]
+workspace = true

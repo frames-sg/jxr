@@ -1,0 +1,38 @@
+[package]
+name = "jxr-test-support"
+description = "Unpublished JPEG XR fixtures and external-oracle support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[features]
+metal = ["jxr/metal"]
+cuda = ["jxr/cuda"]
+
+[dependencies]
+jxr = { path = "../jxr", version = "=0.1.0" }
+jxr-native = { path = "../jxr-native", version = "=0.1.0" }
+rayon.workspace = true
+thiserror.workspace = true
+
+[[bin]]
+name = "jxr-load-bench"
+path = "src/bin/jxr-load-bench.rs"
+required-features = ["metal"]
+
+[[bin]]
+name = "jxr-pathology-bench"
+path = "src/bin/jxr-pathology-bench.rs"
+required-features = ["metal"]
+
+[[bin]]
+name = "jxr-cuda-pathology-bench"
+path = "src/bin/jxr-cuda-pathology-bench.rs"
+required-features = ["cuda"]
+
+[lints]
+workspace = true

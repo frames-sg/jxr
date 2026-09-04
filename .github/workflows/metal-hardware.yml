@@ -1,0 +1,77 @@
+name: Metal hardware
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: metal-hardware
+  cancel-in-progress: false
+
+jobs:
+  apple-silicon:
+    runs-on: [self-hosted, macOS, ARM64, metal]
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install Rust checks
+        run: rustup component add rustfmt clippy
+      - name: Prepare T.834 vectors
+        run: tools/t834-conformance/build.sh
+      - name: Build T.835 oracle
+        run: tools/t835-oracle/build.sh
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint all targets
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test full workspace
+        run: cargo test --workspace --all-features
+      - name: Test MPSGraph device lifecycle
+        run: cargo test -p jxr-mpsgraph --test metal -- --ignored --test-threads=1
+      - name: Run CPU conformance
+        id: cpu-conformance
+        continue-on-error: true
+        run: >-
+          cargo run -p jxr-test-support --bin jxr-t834 --
+          --backend cpu
+          --report target/t834-conformance/reports/ci-cpu.tsv
+      - name: Run Annex-A writer conformance
+        id: writer-conformance
+        continue-on-error: true
+        run: >-
+          cargo run -p jxr-test-support --bin jxr-t834 --
+          --backend cpu
+          --rewrap
+          --report target/t834-conformance/reports/ci-annex-a-writer.tsv
+      - name: Run Metal conformance
+        id: metal-conformance
+        continue-on-error: true
+        run: >-
+          cargo run -p jxr-test-support --features metal --bin jxr-t834 --
+          --backend metal
+          --report target/t834-conformance/reports/ci-metal.tsv
+      - name: Run pathology batch benchmark
+        shell: bash
+        run: |
+          mkdir -p target/t834-conformance/reports
+          set -o pipefail
+          cargo run -p jxr-test-support --features metal --bin jxr-pathology-bench |
+            tee target/t834-conformance/reports/pathology-bench.txt
+      - name: Upload conformance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jpeg-xr-metal-hardware-reports
+          path: |
+            target/t834-conformance/reports/ci-cpu.tsv
+            target/t834-conformance/reports/ci-annex-a-writer.tsv
+            target/t834-conformance/reports/ci-metal.tsv
+            target/t834-conformance/reports/pathology-bench.txt
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Enforce conformance results
+        if: ${{ always() && (steps.cpu-conformance.outcome == 'failure' || steps.writer-conformance.outcome == 'failure' || steps.metal-conformance.outcome == 'failure') }}
+        run: exit 1

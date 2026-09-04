@@ -1,0 +1,74 @@
+name: CUDA hardware
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cuda-hardware
+  cancel-in-progress: false
+
+jobs:
+  nvidia:
+    runs-on: [self-hosted, Linux, X64, cuda]
+    timeout-minutes: 180
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Record CUDA environment
+        run: |
+          mkdir -p target/t834-conformance/reports
+          nvidia-smi | tee target/t834-conformance/reports/nvidia-smi.txt
+          nvcc --version | tee target/t834-conformance/reports/nvcc-version.txt
+      - name: Install Rust checks
+        run: rustup component add rustfmt clippy
+      - name: Prepare T.834 vectors
+        run: tools/t834-conformance/build.sh
+      - name: Build T.835 oracle
+        run: tools/t835-oracle/build.sh
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint all targets and features
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Compile CUDA backend without static toolkit linkage
+        run: cargo check -p jxr-cuda --all-targets
+      - name: Test full workspace
+        run: cargo test --workspace --all-features
+      - name: Run ignored CUDA lifecycle and differential tests
+        run: cargo test -p jxr --features cuda --test cuda_contracts -- --ignored --test-threads=1
+      - name: Differentially test the full CUDA corpus and ROI boundaries against CPU
+        run: cargo test -p jxr-test-support --features cuda --test cuda_hardware -- --ignored --test-threads=1
+      - name: Run complete CUDA T.834/T.835 conformance
+        id: cuda-conformance
+        continue-on-error: true
+        run: >-
+          cargo run -p jxr-test-support --features cuda --bin jxr-t834 --
+          --backend cuda
+          --report target/t834-conformance/reports/ci-cuda.tsv
+      - name: Run CUDA pathology benchmark
+        id: cuda-benchmark
+        continue-on-error: true
+        shell: bash
+        env:
+          JXR_BENCH_ITERATIONS: "10"
+        run: |
+          set -o pipefail
+          cargo run --release -p jxr-test-support --features cuda --bin jxr-cuda-pathology-bench |
+            tee target/t834-conformance/reports/cuda-pathology-bench.tsv
+      - name: Upload CUDA validation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jpeg-xr-cuda-hardware-reports
+          path: |
+            target/t834-conformance/reports/nvidia-smi.txt
+            target/t834-conformance/reports/nvcc-version.txt
+            target/t834-conformance/reports/ci-cuda.tsv
+            target/t834-conformance/reports/cuda-pathology-bench.tsv
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Enforce CUDA validation results
+        if: ${{ always() && (steps.cuda-conformance.outcome == 'failure' || steps.cuda-benchmark.outcome == 'failure') }}
+        run: exit 1

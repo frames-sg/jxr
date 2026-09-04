@@ -1,0 +1,36 @@
+[package]
+name = "jxr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+jxr = { path = "..", features = ["cuda"] }
+jxr-test-support = { path = "../../jxr-test-support" }
+
+[[bin]]
+name = "parse_and_decode"
+path = "fuzz_targets/parse_and_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "typed_batch"
+path = "fuzz_targets/typed_batch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cuda_plan"
+path = "fuzz_targets/cuda_plan.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

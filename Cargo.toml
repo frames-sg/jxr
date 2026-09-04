@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/jxr",
+    "crates/jxr-core",
+    "crates/jxr-image",
+    "crates/jxr-math",
+    "crates/jxr-native",
+    "crates/jxr-metal",
+    "crates/jxr-cuda",
+    "crates/jxr-mpsgraph",
+    "crates/jxr-test-support",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/frames-sg/jxr"
+homepage = "https://github.com/frames-sg/jxr"
+keywords = ["jpeg", "jpeg-xr", "jxr", "gpu", "decoder"]
+categories = ["multimedia::images", "compression"]
+
+[workspace.dependencies]
+j2k-core = "=0.10.0"
+j2k-metal-support = "=0.10.0"
+fearless_simd = "=0.7.0"
+cudarc = { version = "=0.19.9", default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "dynamic-loading",
+    "cuda-11040",
+] }
+image = { version = "=0.25.10", default-features = false }
+rayon = "1"
+thiserror = { version = "2", default-features = false }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3

@@ -1,0 +1,29 @@
+[package]
+name = "jxr"
+description = "JPEG XR decoder and Annex-A writer with optional Metal and CUDA reconstruction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+exclude = ["fuzz/**"]
+
+[features]
+default = []
+metal = ["dep:jxr-metal"]
+cuda = ["dep:jxr-cuda"]
+
+[dependencies]
+jxr-core = { path = "../jxr-core", version = "=0.1.0" }
+jxr-native = { path = "../jxr-native", version = "=0.1.0" }
+jxr-metal = { path = "../jxr-metal", version = "=0.1.0", optional = true }
+jxr-cuda = { path = "../jxr-cuda", version = "=0.1.0", optional = true }
+rayon.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

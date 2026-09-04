@@ -1,0 +1,15 @@
+[package]
+name = "jxr-core"
+description = "Shared JPEG XR decoder contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+j2k-core.workspace = true
+
+[lints]
+workspace = true

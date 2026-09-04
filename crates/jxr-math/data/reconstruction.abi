@@ -1,0 +1,9 @@
+# Canonical reconstruction constants shared by Rust, CUDA C, and Metal.
+inverse_permutation = 0,8,4,13,2,15,3,14,1,12,5,9,7,11,6,10
+abi.JxrMacroblockAbi = coefficient_offset:u32,quantizer_dc:u32,quantizer_low_pass:u32,quantizer_high_pass:u32,bands:u32,hp_prediction:u32,coded_x:u32,coded_y:u32
+abi.JxrPlaneAbi = macroblock_offset:u32,macroblock_count:u32,block_columns:u32,block_rows:u32,macroblock_origin_x:u32,macroblock_origin_y:u32,low_offset:u32,low_width:u32,sample_offset:u32,sample_width:u32,sample_height:u32,scale_after_first_transform:u32
+abi.JxrBatchDispatchAbi = image_count:u32,plane_count:u32,plane_index:u32,reserved:u32
+abi.JxrOverlapWorkAbi = first:u32,second:u32,kind:u32,reserved:u32
+abi.JxrSamplePlaneAbi = sample_offset:u32,origin_x:u32,origin_y:u32,width:u32,height:u32,alpha:u32
+abi.JxrSurfacePlaneAbi = byte_offset:u32,row_stride_bytes:u32,width:u32,height:u32,channels:u32,reserved:u32
+abi.JxrOutputAbi = output_width:u32,output_height:u32,crop_x:u32,crop_y:u32,component_count:u32,alpha_plane:u32,internal_color:u32,output_color:u32,chroma_sampling:u32,chroma_centering_x:u32,chroma_centering_y:u32,bit_depth:u32,channel_layout:u32,channels:u32,scaled:u32,alpha_scaled:u32,premultiply_alpha:u32,red_blue_not_swapped:u32,shift_bits:u32,alpha_shift_bits:u32,mantissa_length:u32,alpha_mantissa_length:u32,exponent_bias_bits:u32,alpha_exponent_bias_bits:u32,output_plane:u32,output_plane_count:u32,bit_black:u32,reserved0:u32

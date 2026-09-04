@@ -1,0 +1,51 @@
+[package]
+name = "jxr-metal"
+description = "Metal execution boundary for the JXR decoder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+j2k-core.workspace = true
+j2k-metal-support.workspace = true
+jxr-core = { path = "../jxr-core", version = "=0.1.0" }
+jxr-math = { path = "../jxr-math", version = "=0.1.0" }
+thiserror.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    "NSError",
+    "NSString",
+] }
+objc2-metal = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    "MTLBuffer",
+    "MTLBlitCommandEncoder",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLLibrary",
+    "MTLDevice",
+    "MTLEvent",
+    "MTLResource",
+] }
+
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+undocumented_unsafe_blocks = "warn"
