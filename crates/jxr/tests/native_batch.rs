@@ -397,6 +397,23 @@ fn nchw_u16_batch_writes_directly_into_the_dense_destination() {
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
+fn assert_unavailable_metal_contract(
+    decoder: &jxr::MetalBatchDecoder,
+    prepared: &jxr::PreparedBatch,
+) -> bool {
+    if decoder.session().is_usable() {
+        return false;
+    }
+    // Hosted macOS runners can expose a Metal device without the Apple GPU
+    // features required by reconstruction. Exercise strict failure there.
+    let batch = decoder.decode_prepared(prepared).unwrap();
+    assert!(batch.groups().is_empty());
+    assert_eq!(batch.group_errors().len(), 1);
+    assert!(format!("{:?}", batch.group_errors()).contains("requires an M1-or-newer Apple GPU"));
+    true
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_batch_consumes_shared_preparation_and_keeps_resident_outputs() {
     use jxr::MetalBatchDecoder;
@@ -409,6 +426,9 @@ fn metal_batch_consumes_shared_preparation_and_keeps_resident_outputs() {
         .collect();
     let decoder = MetalBatchDecoder::system_default(BatchDecodeOptions::default()).unwrap();
     let prepared = decoder.prepare(inputs).unwrap();
+    if assert_unavailable_metal_contract(&decoder, &prepared) {
+        return;
+    }
     let batch = decoder.decode_prepared(&prepared).unwrap();
 
     assert!(batch.errors().is_empty());
@@ -436,6 +456,9 @@ fn metal_batch_exposes_nonblocking_and_single_allocation_groups() {
         .collect();
     let decoder = MetalBatchDecoder::system_default(BatchDecodeOptions::default()).unwrap();
     let prepared = decoder.prepare(inputs).unwrap();
+    if assert_unavailable_metal_contract(&decoder, &prepared) {
+        return;
+    }
 
     let submitted = decoder.submit_prepared(&prepared).unwrap();
     assert_eq!(submitted.pending_group_count(), 1);
@@ -478,6 +501,9 @@ fn high_level_metal_batch_writes_an_ordered_caller_owned_destination() {
     let session = jxr::metal::MetalDecoderSession::system_default_ordered().unwrap();
     let decoder = MetalBatchDecoder::with_session(session, BatchDecodeOptions::default()).unwrap();
     let prepared = decoder.prepare(inputs).unwrap();
+    if assert_unavailable_metal_contract(&decoder, &prepared) {
+        return;
+    }
     let layout =
         DenseMetalBatchLayout::new(prepared.groups()[0].info().image_layout().clone(), 2).unwrap();
     let destination = decoder
@@ -513,9 +539,17 @@ fn metal_batch_isolates_an_explicit_cpu_request() {
         ])
         .unwrap();
 
-    assert!(batch.group_errors().is_empty());
-    assert_eq!(batch.groups().len(), 1);
-    assert_eq!(batch.groups()[0].source_indices(), &[0]);
+    if decoder.session().is_usable() {
+        assert!(batch.group_errors().is_empty());
+        assert_eq!(batch.groups().len(), 1);
+        assert_eq!(batch.groups()[0].source_indices(), &[0]);
+    } else {
+        assert!(batch.groups().is_empty());
+        assert_eq!(batch.group_errors().len(), 1);
+        assert!(
+            format!("{:?}", batch.group_errors()).contains("requires an M1-or-newer Apple GPU")
+        );
+    }
     assert_eq!(batch.errors().len(), 1);
     assert_eq!(batch.errors()[0].index(), 1);
     assert_eq!(batch.errors()[0].stage(), BatchErrorStage::Decode);
