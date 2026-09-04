@@ -13,9 +13,9 @@ readme = "README.md"
 
 [dependencies]
 j2k-metal-support.workspace = true
-jxr = { path = "../jxr", version = "=0.1.0", features = ["metal"] }
+jxr = { path = "../jxr", version = "=0.1.1", features = ["metal"] }
 jxr-core = { path = "../jxr-core", version = "=0.1.0" }
-jxr-metal = { path = "../jxr-metal", version = "=0.1.0" }
+jxr-metal = { path = "../jxr-metal", version = "=0.1.1" }
 thiserror.workspace = true
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]

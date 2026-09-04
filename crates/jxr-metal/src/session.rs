@@ -5,7 +5,9 @@ use crate::{
     MetalDestination, MetalDestinationSubmission, MetalError, MetalResidentBatch,
     MetalResidentBatchSubmission, MetalSubmission, ResidentMetalImage, SharedMetalImage,
 };
-use jxr_core::{DecodedImage, DecodedSamples, PlaneDescriptor, StorageKind};
+use jxr_core::DecodedImage;
+#[cfg(target_os = "macos")]
+use jxr_core::{DecodedSamples, PlaneDescriptor, StorageKind};
 
 #[cfg(target_os = "macos")]
 use j2k_metal_support::{
@@ -22,6 +24,7 @@ use objc2_metal::{MTLBlitCommandEncoder, MTLCommandEncoder, MTLCommandQueue, MTL
 #[cfg(target_os = "macos")]
 use crate::runtime::MetalRuntime;
 
+#[cfg(target_os = "macos")]
 const BATCH_SCRATCH_BUDGET: usize = 256 * 1024 * 1024;
 
 /// Reusable Metal runtime session.
@@ -186,6 +189,8 @@ impl MetalDecoderSession {
     }
 
     /// Allocate a private dense destination owned by the caller after return.
+    // The ownership contract is identical on supported and unavailable platforms.
+    #[cfg_attr(not(target_os = "macos"), allow(clippy::needless_pass_by_value))]
     pub fn allocate_batch_destination(
         &self,
         layout: crate::DenseMetalBatchLayout,
@@ -341,6 +346,8 @@ impl MetalDecoderSession {
     }
 
     /// Submit directly into an exclusively retained caller-owned allocation.
+    // The ownership contract is identical on supported and unavailable platforms.
+    #[cfg_attr(not(target_os = "macos"), allow(clippy::needless_pass_by_value))]
     pub fn submit_into(
         &self,
         plan: &MetalDecodePlan,
@@ -371,6 +378,8 @@ impl MetalDecoderSession {
     /// This path intentionally rejects default sessions because their normal
     /// batch scheduler spans four queues, which cannot safely share one tracked
     /// writable allocation without additional synchronization.
+    // The ownership contract is identical on supported and unavailable platforms.
+    #[cfg_attr(not(target_os = "macos"), allow(clippy::needless_pass_by_value))]
     pub fn submit_batch_into(
         &self,
         plans: &[MetalDecodePlan],
@@ -649,6 +658,7 @@ fn batch_groups(plans: &[MetalDecodePlan]) -> Result<Vec<core::ops::Range<usize>
     Ok(groups)
 }
 
+#[cfg(target_os = "macos")]
 fn decoded_image(plan: &MetalDecodePlan, bytes: Vec<u8>) -> Result<DecodedImage, MetalError> {
     let info = plan.info().ok_or(MetalError::InvalidPlan {
         reason: "metadata-only plan cannot produce a decoded image",
@@ -684,6 +694,7 @@ fn decoded_image(plan: &MetalDecodePlan, bytes: Vec<u8>) -> Result<DecodedImage,
     Ok(decoded)
 }
 
+#[cfg(target_os = "macos")]
 fn decoded_samples(
     format: jxr_core::PixelFormat,
     bytes: Vec<u8>,
@@ -725,6 +736,7 @@ fn decoded_samples(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn read_u16(bytes: &[u8]) -> Result<Vec<u16>, MetalError> {
     let chunks = bytes.chunks_exact(2);
     if !chunks.remainder().is_empty() {
@@ -737,6 +749,7 @@ fn read_u16(bytes: &[u8]) -> Result<Vec<u16>, MetalError> {
         .collect())
 }
 
+#[cfg(target_os = "macos")]
 fn read_u32(bytes: &[u8]) -> Result<Vec<u32>, MetalError> {
     let chunks = bytes.chunks_exact(4);
     if !chunks.remainder().is_empty() {

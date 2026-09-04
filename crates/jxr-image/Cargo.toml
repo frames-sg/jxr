@@ -13,7 +13,7 @@ readme = "README.md"
 
 [dependencies]
 image.workspace = true
-jxr = { path = "../jxr", version = "=0.1.0" }
+jxr = { path = "../jxr", version = "=0.1.1" }
 thiserror.workspace = true
 
 [lints]

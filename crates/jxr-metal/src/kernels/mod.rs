@@ -49,6 +49,7 @@ pub const RECONSTRUCTION_KERNELS: [MetalKernelManifest; 5] = [
 ];
 
 /// Assemble one Metal library from the shared arithmetic and focused phase modules.
+#[cfg(target_os = "macos")]
 pub(crate) fn source() -> String {
     [
         jxr_math::tables::METAL_RECONSTRUCTION_CONSTANTS,
@@ -60,4 +61,5 @@ pub(crate) fn source() -> String {
     ]
     .join("\n")
 }
+#[cfg(target_os = "macos")]
 mod common;

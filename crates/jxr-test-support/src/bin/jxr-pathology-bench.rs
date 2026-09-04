@@ -82,6 +82,7 @@ fn run() -> Result<(), BenchmarkError> {
         workload.height,
         reference.samples.byte_len()
     );
+    #[cfg(target_os = "macos")]
     println!(
         "{} Rayon workers; {} Metal queues; {WARMUPS} warmups; {ITERATIONS} alternating measured iterations",
         cpu.worker_count(),

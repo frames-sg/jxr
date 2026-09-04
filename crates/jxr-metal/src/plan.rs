@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#[cfg(target_os = "macos")]
+use jxr_core::{BackendKind, DecodeReport, DecodeStage, StageExecutor, StageReport};
+
 use std::sync::Arc;
 
 use jxr_core::{
-    AlphaMode, BackendKind, BackendRequest, CoefficientArena, CoefficientPlane, DecodeReport,
-    DecodeStage, ImageInfo, MacroblockMetadata, OutputFormatRequest, OverlapMode, PreparedPlan,
-    Rect, StageExecutor, StageReport, SurfaceLayout,
+    AlphaMode, BackendRequest, CoefficientArena, CoefficientPlane, ImageInfo, MacroblockMetadata,
+    OutputFormatRequest, OverlapMode, PreparedPlan, Rect, SurfaceLayout,
 };
 
 use crate::MetalError;
@@ -323,12 +325,14 @@ impl MetalDecodePlan {
         self.reconstruction.is_some()
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn reconstruction(&self) -> Result<&MetalReconstructionInput, MetalError> {
         self.reconstruction
             .as_ref()
             .ok_or_else(|| invalid("metadata-only plan has no coefficient arena"))
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn scratch_bytes(&self) -> Result<usize, MetalError> {
         let input = self.reconstruction()?;
         input
@@ -339,6 +343,7 @@ impl MetalDecodePlan {
             .ok_or_else(|| invalid("Metal scratch byte count overflows usize"))
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn decode_report(&self, host_readback: bool) -> DecodeReport {
         const CPU_STAGES: [DecodeStage; 5] = [
             DecodeStage::Parse,

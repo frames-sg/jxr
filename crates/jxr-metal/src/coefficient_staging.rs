@@ -119,6 +119,7 @@ impl MetalCoefficientStaging {
         Ok(MetalCoefficientArena {
             #[cfg(target_os = "macos")]
             buffer: self.buffer,
+            #[cfg(target_os = "macos")]
             element_offset: self.element_offset,
             descriptor: Arc::new(descriptor),
         })
@@ -129,6 +130,7 @@ impl MetalCoefficientStaging {
 pub struct MetalCoefficientArena {
     #[cfg(target_os = "macos")]
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    #[cfg(target_os = "macos")]
     element_offset: usize,
     descriptor: Arc<CoefficientArenaDescriptor>,
 }

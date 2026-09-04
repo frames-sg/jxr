@@ -14,7 +14,7 @@ metal = ["jxr/metal"]
 cuda = ["jxr/cuda"]
 
 [dependencies]
-jxr = { path = "../jxr", version = "=0.1.0" }
+jxr = { path = "../jxr", version = "=0.1.1" }
 jxr-native = { path = "../jxr-native", version = "=0.1.0" }
 rayon.workspace = true
 thiserror.workspace = true

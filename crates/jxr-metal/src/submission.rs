@@ -56,6 +56,7 @@ pub struct MetalResidentBatchSubmission {
     #[cfg(target_os = "macos")]
     output: Retained<ProtocolObject<dyn MTLBuffer>>,
     layout: DenseMetalBatchLayout,
+    #[cfg(target_os = "macos")]
     reports: Vec<jxr_core::DecodeReport>,
 }
 
@@ -125,6 +126,7 @@ impl MetalConsumerWait {
 }
 
 impl MetalBatchSubmission {
+    #[cfg(target_os = "macos")]
     pub(crate) fn new(submissions: Vec<MetalSubmission>) -> Self {
         Self { submissions }
     }
@@ -206,6 +208,7 @@ pub struct MetalBatchDestinationSubmission {
 }
 
 impl MetalBatchDestinationSubmission {
+    #[cfg(target_os = "macos")]
     pub(crate) fn new(
         submissions: Vec<MetalSubmission>,
         destination: MetalBatchDestination,
@@ -231,6 +234,7 @@ impl MetalBatchDestinationSubmission {
 }
 
 impl MetalDestinationSubmission {
+    #[cfg(target_os = "macos")]
     pub(crate) fn new(
         submission: MetalSubmission,
         destination: MetalDestination,
@@ -336,10 +340,11 @@ impl MetalSubmission {
     }
 
     /// Wait for completion and return the immutable device output.
-    pub fn wait(mut self) -> Result<ResidentMetalImage, MetalError> {
+    pub fn wait(self) -> Result<ResidentMetalImage, MetalError> {
         #[cfg(target_os = "macos")]
         {
-            let mut pending = self
+            let mut this = self;
+            let mut pending = this
                 .pending
                 .take()
                 .ok_or(MetalError::InvalidSubmissionState {

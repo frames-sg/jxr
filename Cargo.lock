@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "jxr"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "jxr-core",
  "jxr-cuda",
@@ -175,7 +175,7 @@ version = "0.1.0"
 
 [[package]]
 name = "jxr-metal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "j2k-core",
  "j2k-metal-support",
