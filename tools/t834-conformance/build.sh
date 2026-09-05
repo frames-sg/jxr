@@ -34,7 +34,11 @@ fi
 
 if [ ! -d "$extracted" ]; then
     extraction=$(mktemp -d "$suite_root/extract.XXXXXX")
-    unzip -q "$archive" -d "$extraction"
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -q "$archive" -d "$extraction"
+    else
+        python3 -m zipfile -e "$archive" "$extraction"
+    fi
     mv "$extraction/JXR_ConformanceSuite_2014" "$extracted"
 fi
 

@@ -6,6 +6,9 @@ is checksum-pinned to SHA-256
 `c066c5e24a212f3bb09eaf235cf21359754ffbb747d9fedc620e09629ca2a55d`.
 No conformance vectors are vendored or published with the Rust crates.
 
+Setup requires `curl`, a SHA-256 utility, and either `unzip` or Python 3.
+The archive checksum is verified before either extractor runs.
+
 Download and extract the suite:
 
 ```sh

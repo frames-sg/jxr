@@ -35,7 +35,11 @@ fi
 
 if [ ! -d "$source_dir" ]; then
     extraction=$(mktemp -d "$oracle_root/extract.XXXXXX")
-    unzip -q "$archive" -d "$extraction"
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -q "$archive" -d "$extraction"
+    else
+        python3 -m zipfile -e "$archive" "$extraction"
+    fi
     mv "$extraction/Software" "$source_dir"
 fi
 

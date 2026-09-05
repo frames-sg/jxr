@@ -4,6 +4,9 @@ This directory builds the official ITU-T T.835 (2012) JPEG XR reference
 software 1.32 as an external validation executable. It is not a production
 dependency and its source is never copied into this repository.
 
+Setup requires `curl`, a SHA-256 utility, `make`, a C compiler, and either
+`unzip` or Python 3. The archive checksum is verified before extraction.
+
 Build it with:
 
 ```sh
