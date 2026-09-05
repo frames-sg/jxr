@@ -2,6 +2,11 @@ name: Metal hardware
 
 on:
   workflow_dispatch:
+    inputs:
+      revision:
+        description: Exact reviewed JXR commit SHA; leave empty to test main
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -11,13 +16,47 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  prepare:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == 'jcwal1516' && github.triggering_actor == 'jcwal1516' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    outputs:
+      revision: ${{ steps.revision.outputs.sha }}
+    steps:
+      - name: Validate revision and report pending Metal status
+        id: revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_REVISION: ${{ inputs.revision }}
+          DEFAULT_REVISION: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision="${REQUESTED_REVISION:-$DEFAULT_REVISION}"
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || { echo "A full lowercase commit SHA is required" >&2; exit 1; }
+          resolved="$(gh api "repos/$REPOSITORY/commits/$revision" --jq .sha)"
+          [[ "$resolved" == "$revision" ]]
+          echo "sha=$revision" >> "$GITHUB_OUTPUT"
+          gh api --method POST "repos/$REPOSITORY/statuses/$revision" \
+            -f state=pending -f context=metal \
+            -f description="Owner-triggered Metal hardware validation running" \
+            -f target_url="$RUN_URL" --silent
+
   apple-silicon:
+    needs: prepare
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == 'jcwal1516' && github.triggering_actor == 'jcwal1516' }}
     runs-on: [self-hosted, macOS, ARM64, metal]
     timeout-minutes: 120
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.prepare.outputs.revision }}
+          persist-credentials: false
       - name: Install Rust checks
         run: rustup component add rustfmt clippy
       - name: Prepare T.834 vectors
@@ -30,6 +69,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test full workspace
         run: cargo test --workspace --all-features
+      - name: Test without default features
+        run: cargo test -p jxr --no-default-features
+      - name: Check documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
       - name: Test MPSGraph device lifecycle
         run: cargo test -p jxr-mpsgraph --test metal -- --ignored --test-threads=1
       - name: Run CPU conformance
@@ -76,3 +119,27 @@ jobs:
       - name: Enforce conformance results
         if: ${{ always() && (steps.cpu-conformance.outcome == 'failure' || steps.writer-conformance.outcome == 'failure' || steps.metal-conformance.outcome == 'failure') }}
         run: exit 1
+
+  report:
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == 'jcwal1516' && github.triggering_actor == 'jcwal1516') && needs.prepare.result == 'success' }}
+    needs: [prepare, apple-silicon]
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Report exact-revision Metal result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REVISION: ${{ needs.prepare.outputs.revision }}
+          RESULT: ${{ needs.apple-silicon.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          state=failure
+          if [[ "$RESULT" == success ]]; then state=success; fi
+          gh api --method POST "repos/$REPOSITORY/statuses/$REVISION" \
+            -f state="$state" -f context=metal \
+            -f description="Metal hardware validation: $RESULT" \
+            -f target_url="$RUN_URL" --silent
