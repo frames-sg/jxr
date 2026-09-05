@@ -1,9 +1,9 @@
 # Architecture
 
-`jxr` is the public facade. `jxr-core` owns stable contracts, `jxr-math` owns
-portable exact arithmetic, and `jxr-native` owns parsing and CPU decoding.
-`jxr-metal` depends inward on those crates and owns device-specific sessions,
-storage, and kernels.
+`jxr` is the public facade. `jxr-core` owns stable contracts and shared device
+reconstruction planning, `jxr-math` owns portable exact arithmetic, and
+`jxr-native` owns parsing and CPU decoding. `jxr-metal` and `jxr-cuda` depend
+inward on those crates and own device-specific sessions, storage, and kernels.
 
 CPU parsing and entropy state never live in an accelerator crate. Device crates
 never implement a second parser. Explicit device requests are strict; automatic
@@ -32,7 +32,9 @@ stage or resource lifetime, not by arbitrary helper categories.
    macroblock phases run in parallel. A session-retained capability token selects
    safe AVX2/NEON HP dequantization and common U8 stores; scalar math remains the
    oracle and fallback.
-5. Metal and CUDA plans retain the same coefficient contract. Their sessions own device
+5. `jxr-core::device_plan` owns the shared plane geometry, overlap schedules, and
+   output plans. Metal and CUDA adapt those plans to their device ABI and retain
+   the same coefficient contract. Their sessions own device
    state, allocation pools, submissions, completion, resident
    output, and host readback. Metal preparation can write entropy results directly
    into shared allocation slices; compatible batches bind those slices without
@@ -81,7 +83,10 @@ homogeneous group. Caller-owned dense destinations require a one-queue session;
 the pending owner retains exclusive destination access through completion.
 `jxr-mpsgraph` accepts the shared native-layout prepared contract, then owns the
 additional coefficient and dense-allocation lifetime required by its exact-queue
-NHWC graph handoff.
+NHWC graph handoff. The shared `j2k-mpsgraph-support` submission guard retains
+those input owners and graph resources through completion; JXR validation and
+result assembly remain in the adapter. See the
+[adapter's release prerequisite](../crates/jxr-mpsgraph/README.md#shared-submission-owner-and-release-prerequisite).
 
 `CudaBatchDecoder` consumes the same groups and coefficient-ready cache. It
 schedules independent images over four streams and can retain per-image outputs,

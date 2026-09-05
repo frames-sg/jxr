@@ -72,105 +72,35 @@ unsafe impl GpuAbi for JxrBatchDispatchAbi {
 const _: () =
     assert!(size_of::<JxrBatchDispatchAbi>() == jxr_math::tables::ABI_JXRBATCHDISPATCHABI_SIZE);
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct JxrOverlapWorkAbi {
-    pub(crate) first: u32,
-    pub(crate) second: u32,
-    pub(crate) kind: u32,
-    pub(crate) reserved: u32,
-}
+pub(crate) use jxr_core::device_plan::{
+    OutputParameterWords as JxrOutputAbi, OverlapWork as JxrOverlapWorkAbi,
+    SamplePlaneWords as JxrSamplePlaneAbi, SurfacePlaneWords as JxrSurfacePlaneAbi,
+};
 
-// SAFETY: Four consecutive u32 fields are padding-free and accept every bit pattern.
-unsafe impl GpuAbi for JxrOverlapWorkAbi {
-    const NAME: &'static str = "JxrOverlapWorkAbi";
-}
-
-const _: () =
-    assert!(size_of::<JxrOverlapWorkAbi>() == jxr_math::tables::ABI_JXROVERLAPWORKABI_SIZE);
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct JxrSamplePlaneAbi {
-    pub(crate) sample_offset: u32,
-    pub(crate) origin_x: u32,
-    pub(crate) origin_y: u32,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) alpha: u32,
-}
-
-// SAFETY: Six consecutive u32 fields are padding-free and accept every bit pattern.
-unsafe impl GpuAbi for JxrSamplePlaneAbi {
-    const NAME: &'static str = "JxrSamplePlaneAbi";
-}
-
-const _: () =
-    assert!(size_of::<JxrSamplePlaneAbi>() == jxr_math::tables::ABI_JXRSAMPLEPLANEABI_SIZE);
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct JxrSurfacePlaneAbi {
-    pub(crate) byte_offset: u32,
-    pub(crate) row_stride_bytes: u32,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) channels: u32,
-    pub(crate) reserved: u32,
-}
-
-// SAFETY: Six consecutive u32 fields are padding-free and accept every bit pattern.
-unsafe impl GpuAbi for JxrSurfacePlaneAbi {
-    const NAME: &'static str = "JxrSurfacePlaneAbi";
-}
-
-const _: () =
-    assert!(size_of::<JxrSurfacePlaneAbi>() == jxr_math::tables::ABI_JXRSURFACEPLANEABI_SIZE);
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct JxrOutputAbi {
-    pub(crate) output_width: u32,
-    pub(crate) output_height: u32,
-    pub(crate) crop_x: u32,
-    pub(crate) crop_y: u32,
-    pub(crate) component_count: u32,
-    pub(crate) alpha_plane: u32,
-    pub(crate) internal_color: u32,
-    pub(crate) output_color: u32,
-    pub(crate) chroma_sampling: u32,
-    pub(crate) chroma_centering_x: u32,
-    pub(crate) chroma_centering_y: u32,
-    pub(crate) bit_depth: u32,
-    pub(crate) channel_layout: u32,
-    pub(crate) channels: u32,
-    pub(crate) scaled: u32,
-    pub(crate) alpha_scaled: u32,
-    pub(crate) premultiply_alpha: u32,
-    pub(crate) red_blue_not_swapped: u32,
-    pub(crate) shift_bits: u32,
-    pub(crate) alpha_shift_bits: u32,
-    pub(crate) mantissa_length: u32,
-    pub(crate) alpha_mantissa_length: u32,
-    pub(crate) exponent_bias_bits: u32,
-    pub(crate) alpha_exponent_bias_bits: u32,
-    pub(crate) output_plane: u32,
-    pub(crate) output_plane_count: u32,
-    pub(crate) bit_black: u32,
-    pub(crate) reserved0: u32,
-}
-
-// SAFETY: Twenty-eight consecutive u32 fields are padding-free, with terminal
-// offset and total size asserted, and all bit patterns are valid.
-unsafe impl GpuAbi for JxrOutputAbi {
-    const NAME: &'static str = "JxrOutputAbi";
-}
-
+// Arrays contain consecutive initialized u32 words; upload traits are supplied
+// by the backend's existing array implementation. Check the shader ABI here.
 const _: () = {
-    assert!(
-        offset_of!(JxrOutputAbi, reserved0) == jxr_math::tables::ABI_JXROUTPUTABI_RESERVED0_OFFSET
-    );
-    assert!(size_of::<JxrOutputAbi>() == jxr_math::tables::ABI_JXROUTPUTABI_SIZE);
+    use jxr_core::device_plan::{
+        OUTPUT_PLANE, SAMPLE_ALPHA, SAMPLE_OFFSET, SURFACE_HEIGHT, SURFACE_OFFSET, SURFACE_WIDTH,
+    };
+    use jxr_math::tables::{
+        ABI_JXROUTPUTABI_OUTPUT_PLANE_OFFSET, ABI_JXROUTPUTABI_RESERVED0_OFFSET,
+        ABI_JXROUTPUTABI_SIZE, ABI_JXROVERLAPWORKABI_SIZE, ABI_JXRSAMPLEPLANEABI_ALPHA_OFFSET,
+        ABI_JXRSAMPLEPLANEABI_SAMPLE_OFFSET_OFFSET, ABI_JXRSAMPLEPLANEABI_SIZE,
+        ABI_JXRSURFACEPLANEABI_BYTE_OFFSET_OFFSET, ABI_JXRSURFACEPLANEABI_HEIGHT_OFFSET,
+        ABI_JXRSURFACEPLANEABI_SIZE, ABI_JXRSURFACEPLANEABI_WIDTH_OFFSET,
+    };
+    assert!(size_of::<JxrOverlapWorkAbi>() == ABI_JXROVERLAPWORKABI_SIZE);
+    assert!(size_of::<JxrSamplePlaneAbi>() == ABI_JXRSAMPLEPLANEABI_SIZE);
+    assert!(size_of::<JxrSurfacePlaneAbi>() == ABI_JXRSURFACEPLANEABI_SIZE);
+    assert!(size_of::<JxrOutputAbi>() == ABI_JXROUTPUTABI_SIZE);
+    assert!(SAMPLE_OFFSET * 4 == ABI_JXRSAMPLEPLANEABI_SAMPLE_OFFSET_OFFSET);
+    assert!(SAMPLE_ALPHA * 4 == ABI_JXRSAMPLEPLANEABI_ALPHA_OFFSET);
+    assert!(SURFACE_OFFSET * 4 == ABI_JXRSURFACEPLANEABI_BYTE_OFFSET_OFFSET);
+    assert!(SURFACE_WIDTH * 4 == ABI_JXRSURFACEPLANEABI_WIDTH_OFFSET);
+    assert!(SURFACE_HEIGHT * 4 == ABI_JXRSURFACEPLANEABI_HEIGHT_OFFSET);
+    assert!(OUTPUT_PLANE * 4 == ABI_JXROUTPUTABI_OUTPUT_PLANE_OFFSET);
+    assert!(27 * 4 == ABI_JXROUTPUTABI_RESERVED0_OFFSET);
 };
 
 // SAFETY: Twelve consecutive u32 fields have no padding, as established by

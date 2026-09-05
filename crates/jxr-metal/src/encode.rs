@@ -1,3 +1,5 @@
+use jxr_core::device_plan::{OUTPUT_PLANE, SURFACE_HEIGHT, SURFACE_WIDTH};
+use jxr_core::device_plan::{SAMPLE_OFFSET, SURFACE_OFFSET};
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use j2k_metal_support::{
@@ -333,9 +335,8 @@ fn encode_output_at(
     let device = runtime.queue.device();
     let mut output_dispatch = build_output_dispatch(plan)?;
     for plane in &mut output_dispatch.samples {
-        plane.sample_offset =
-            plane
-                .sample_offset
+        plane[SAMPLE_OFFSET] =
+            plane[SAMPLE_OFFSET]
                 .checked_add(sample_base)
                 .ok_or(MetalError::InvalidPlan {
                     reason: "batch sample descriptor offset exceeds u32",
@@ -345,9 +346,8 @@ fn encode_output_at(
         reason: "batch output base exceeds the Metal ABI",
     })?;
     for surface in &mut output_dispatch.surfaces {
-        surface.byte_offset =
-            surface
-                .byte_offset
+        surface[SURFACE_OFFSET] =
+            surface[SURFACE_OFFSET]
                 .checked_add(output_base)
                 .ok_or(MetalError::InvalidPlan {
                     reason: "batch output surface offset exceeds u32",
@@ -363,14 +363,15 @@ fn encode_output_at(
     };
     for output_plane in 0..dispatch_count {
         let mut params = output_dispatch.params;
-        params.output_plane = u32::try_from(output_plane).map_err(|_| MetalError::InvalidPlan {
-            reason: "output plane index exceeds the Metal ABI",
-        })?;
+        params[OUTPUT_PLANE] =
+            u32::try_from(output_plane).map_err(|_| MetalError::InvalidPlan {
+                reason: "output plane index exceeds the Metal ABI",
+            })?;
         let surface = output_dispatch.surfaces[output_plane];
         let dims = if output_dispatch.pipeline == StorePipeline::Bits {
-            (surface.width.div_ceil(8), surface.height)
+            (surface[SURFACE_WIDTH].div_ceil(8), surface[SURFACE_HEIGHT])
         } else {
-            (surface.width, surface.height)
+            (surface[SURFACE_WIDTH], surface[SURFACE_HEIGHT])
         };
         encoder.setComputePipelineState(pipeline);
         encoder.bind_buffer(0, samples, 0)?;

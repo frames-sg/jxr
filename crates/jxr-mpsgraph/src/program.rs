@@ -1,38 +1,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use core::{marker::PhantomData, ptr::NonNull};
-use std::{
-    rc::Rc,
-    sync::{Arc, OnceLock},
-};
-
-use block2::RcBlock;
+use j2k_mpsgraph_support::{GraphExecutionError, MpsGraphSubmission};
 use jxr::{DecodeReport, Rect};
 use jxr_metal::{MetalBatchDestination, MetalBatchDestinationSubmission};
 use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber};
+use objc2_foundation::{NSArray, NSNumber};
 use objc2_metal::{MTLBuffer, MTLCommandQueue};
 use objc2_metal_performance_shaders::MPSDataType;
-use objc2_metal_performance_shaders_graph::{
-    MPSGraph, MPSGraphExecutionDescriptor, MPSGraphTensor, MPSGraphTensorData,
-    MPSGraphTensorDataDictionary,
-};
+use objc2_metal_performance_shaders_graph::{MPSGraph, MPSGraphTensor, MPSGraphTensorData};
 
 use crate::{
     Error, MpsGraphInputGroup, MpsGraphPreparedGroup, MpsGraphTensorSpec,
     platform::{MpsGraphBatchDecoder, tensor_data_from_buffer},
 };
-
-type CompletionBlock = RcBlock<dyn Fn(NonNull<MPSGraphTensorDataDictionary>, *mut NSError)>;
-
-#[derive(Clone, Debug)]
-struct OwnedGraphError {
-    domain: String,
-    code: isize,
-    description: String,
-}
-
-type CompletionState = OnceLock<Result<(), OwnedGraphError>>;
 
 /// Static rank-four `MPSGraph` program with one image placeholder.
 pub struct MpsGraphProgram {
@@ -244,56 +224,24 @@ impl MpsGraphProgram {
         codec: Option<MetalBatchDestinationSubmission>,
         metadata: RunMetadata,
     ) -> SubmittedMpsGraphRun {
-        let feeds = NSDictionary::from_slices(&[&*self.image_placeholder], &[tensor_data]);
-        let targets = NSArray::from_retained_slice(&self.targets);
-        // SAFETY: `new` is a standard owning Objective-C constructor.
-        let execution_descriptor = unsafe { MPSGraphExecutionDescriptor::new() };
-        let completion_state = Arc::new(CompletionState::default());
-        let callback_state = Arc::clone(&completion_state);
-        let completion_block: CompletionBlock = RcBlock::new(
-            move |_results: NonNull<MPSGraphTensorDataDictionary>, error: *mut NSError| {
-                let error = NonNull::new(error).map(|error| {
-                    // SAFETY: MPSGraph guarantees this NSError for the callback duration.
-                    let error = unsafe { error.as_ref() };
-                    OwnedGraphError {
-                        domain: error.domain().to_string(),
-                        code: error.code(),
-                        description: error.localizedDescription().to_string(),
-                    }
-                });
-                let _ = callback_state.set(error.map_or(Ok(()), Err));
-            },
-        );
-        // SAFETY: the block has the generated completion signature and is
-        // retained by both the descriptor and returned run guard.
-        unsafe {
-            execution_descriptor.setCompletionHandler(RcBlock::as_ptr(&completion_block));
-        }
-        // SAFETY: every Objective-C object and the unretained input allocation
-        // is retained by the returned guard until the callback has fired.
-        let results = unsafe {
-            self.graph
-                .runAsyncWithMTLCommandQueue_feeds_targetTensors_targetOperations_executionDescriptor(
-                    command_queue,
-                    &feeds,
-                    &targets,
-                    None,
-                    Some(&execution_descriptor),
-                )
+        // SAFETY: the program image contract and queue device were checked
+        // before submission. Codec writes precede graph reads on this same queue.
+        // RunInputOwner retains tensor data and its standalone buffer or resident
+        // destination, and the shared guard retains them through graph completion.
+        let graph = unsafe {
+            MpsGraphSubmission::submit(
+                &self.graph,
+                &self.image_placeholder,
+                &self.targets,
+                command_queue,
+                tensor_data,
+                input_owner,
+            )
         };
         SubmittedMpsGraphRun {
-            graph: self.graph.clone(),
-            image_placeholder: self.image_placeholder.clone(),
-            targets,
-            feeds,
-            results: Some(results),
-            execution_descriptor,
-            completion_block,
-            completion_state,
-            input_owner: Some(input_owner),
+            graph,
             codec,
             metadata: Some(metadata),
-            not_send_or_sync: PhantomData,
         }
     }
 }
@@ -397,18 +345,9 @@ impl MpsGraphRunOutput {
 /// This guard is deliberately neither `Send` nor `Sync`. Dropping it waits
 /// before releasing any unretained Metal storage.
 pub struct SubmittedMpsGraphRun {
-    graph: Retained<MPSGraph>,
-    image_placeholder: Retained<MPSGraphTensor>,
-    targets: Retained<NSArray<MPSGraphTensor>>,
-    feeds: Retained<MPSGraphTensorDataDictionary>,
-    results: Option<Retained<MPSGraphTensorDataDictionary>>,
-    execution_descriptor: Retained<MPSGraphExecutionDescriptor>,
-    completion_block: CompletionBlock,
-    completion_state: Arc<CompletionState>,
-    input_owner: Option<RunInputOwner>,
+    graph: MpsGraphSubmission<RunInputOwner>,
     codec: Option<MetalBatchDestinationSubmission>,
     metadata: Option<RunMetadata>,
-    not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 impl core::fmt::Debug for SubmittedMpsGraphRun {
@@ -423,7 +362,7 @@ impl core::fmt::Debug for SubmittedMpsGraphRun {
 impl SubmittedMpsGraphRun {
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.completion_state.get().is_some()
+        self.graph.is_complete()
     }
 
     /// Wait for both graph and codec completion and return target tensors.
@@ -432,7 +371,7 @@ impl SubmittedMpsGraphRun {
     }
 
     fn finish(&mut self) -> Result<MpsGraphRunOutput, Error> {
-        let graph_error = self.completion_state.wait().clone().err();
+        let graph_error = self.graph.wait().err();
         let completion = self
             .codec
             .take()
@@ -450,26 +389,15 @@ impl SubmittedMpsGraphRun {
             let (_destination, reports) = completion.into_parts();
             metadata.completed = Some((regions, reports));
         }
-        drop(
-            self.input_owner
-                .take()
-                .expect("MPSGraph input owner is consumed exactly once"),
-        );
         if let Some(error) = graph_error {
-            return Err(Error::GraphExecution {
-                domain: error.domain,
-                code: error.code,
-                description: error.description,
-            });
+            return Err(graph_execution_error(error));
         }
-        let dictionary = self
-            .results
-            .take()
-            .expect("MPSGraph results are consumed exactly once");
-        let mut results = Vec::with_capacity(self.targets.len());
-        for (index, target) in self.targets.iter().enumerate() {
-            let result = dictionary
-                .objectForKey(&target)
+        let mut results = Vec::with_capacity(self.graph.target_count());
+        for index in 0..self.graph.target_count() {
+            let result = self
+                .graph
+                .output(index)
+                .map_err(graph_execution_error)?
                 .ok_or(Error::MissingGraphOutput { index })?;
             results.push(result);
         }
@@ -488,15 +416,18 @@ impl SubmittedMpsGraphRun {
 
 impl Drop for SubmittedMpsGraphRun {
     fn drop(&mut self) {
-        if self.input_owner.is_some() {
-            let _ = self.finish();
+        // Cleanup waits without extracting metadata or allocating output vectors.
+        let _ = self.graph.wait();
+        if let Some(codec) = self.codec.take() {
+            let _ = codec.wait();
         }
-        let _ = (
-            &self.graph,
-            &self.image_placeholder,
-            &self.feeds,
-            &self.execution_descriptor,
-            &self.completion_block,
-        );
+    }
+}
+
+fn graph_execution_error(error: GraphExecutionError) -> Error {
+    Error::GraphExecution {
+        domain: error.domain,
+        code: error.code,
+        description: error.description,
     }
 }

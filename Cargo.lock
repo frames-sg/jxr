@@ -132,6 +132,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "j2k-mpsgraph-support"
+version = "0.10.0"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "objc2-metal-performance-shaders-graph",
+]
+
+[[package]]
 name = "jxr"
 version = "0.1.1"
 dependencies = [
@@ -191,8 +202,8 @@ dependencies = [
 name = "jxr-mpsgraph"
 version = "0.1.0"
 dependencies = [
- "block2",
  "j2k-metal-support",
+ "j2k-mpsgraph-support",
  "jxr",
  "jxr-core",
  "jxr-metal",

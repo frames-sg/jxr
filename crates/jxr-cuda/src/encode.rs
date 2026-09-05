@@ -1,3 +1,4 @@
+use jxr_core::device_plan::{OUTPUT_PLANE, SURFACE_HEIGHT, SURFACE_WIDTH};
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::sync::Arc;
@@ -315,14 +316,14 @@ fn launch_output(
     };
     for plane_index in 0..plane_count {
         let mut params = dispatch.params;
-        params.output_plane = u32::try_from(plane_index).map_err(|_| CudaError::InvalidPlan {
+        params[OUTPUT_PLANE] = u32::try_from(plane_index).map_err(|_| CudaError::InvalidPlan {
             reason: "output plane index exceeds the CUDA ABI",
         })?;
         let surface = dispatch.surfaces[plane_index];
         let width = if dispatch.pipeline == StorePipeline::Bits {
-            surface.width.div_ceil(8)
+            surface[SURFACE_WIDTH].div_ceil(8)
         } else {
-            surface.width
+            surface[SURFACE_WIDTH]
         };
         let mut launch = stream.launch_builder(function);
         launch
@@ -338,7 +339,7 @@ fn launch_output(
         // launch is clipped again by the kernel before any read or write.
         unsafe {
             launch.launch(LaunchConfig {
-                grid_dim: (width.div_ceil(16), surface.height.div_ceil(16), 1),
+                grid_dim: (width.div_ceil(16), surface[SURFACE_HEIGHT].div_ceil(16), 1),
                 block_dim: (16, 16, 1),
                 shared_mem_bytes: 0,
             })?;

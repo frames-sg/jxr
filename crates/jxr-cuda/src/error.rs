@@ -90,3 +90,16 @@ pub enum CudaError {
     #[error("CUDA driver operation failed: {0}")]
     Driver(#[from] cudarc::driver::DriverError),
 }
+
+impl From<jxr_core::device_plan::PlanError> for CudaError {
+    fn from(error: jxr_core::device_plan::PlanError) -> Self {
+        match error {
+            jxr_core::device_plan::PlanError::InvalidPlan { reason } => {
+                Self::InvalidPlan { reason }
+            }
+            jxr_core::device_plan::PlanError::UnsupportedOutputFormat { reason } => {
+                Self::UnsupportedOutputFormat { reason }
+            }
+        }
+    }
+}
