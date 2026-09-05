@@ -5,8 +5,7 @@ CUDA reconstruction, and a validated Annex-A still-image container writer.
 
 The project is under active development. Its CPU route byte-matches T.835 for
 all 517 T.834 cases in the repository's Main-syntax scope; Advanced-only output
-syntax and JPEG 2000 `.jpx` wrappers remain outside that scope. Measured CUDA results and their limits are recorded in the
-[2026-09-05 hardware report](docs/cuda-validation-2026-09-05.md); no general
+syntax and JPEG 2000 `.jpx` wrappers remain outside that scope. No general
 CPU-versus-GPU speedup is claimed.
 
 ## Architecture
@@ -29,7 +28,7 @@ compiled through dynamically loaded Driver API/NVRTC bindings, so an all-feature
 build does not need a CUDA toolkit or NVIDIA driver. The self-hosted NVIDIA
 workflow passed on 2026-09-05, including all 517 in-scope T.834/T.835 comparisons,
 CPU/ROI differential tests, and checksum-checked benchmarks. See the
-[hardware report](docs/cuda-validation-2026-09-05.md) and
+[passing CUDA workflow](https://github.com/frames-sg/jxr/actions/runs/33953370733) and
 [CUDA backend decision and validation boundary](docs/cuda-backend.md).
 
 ## Current usable slice

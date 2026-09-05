@@ -72,7 +72,7 @@ because they use Advanced-only output syntax or a JPEG 2000 `.jpx` wrapper.
   CPU differential suite, a serialized self-hosted NVIDIA workflow, and a
   phase-separated pathology benchmark. The NVIDIA workflow passed all 517
   in-scope T.834/T.835 cases, CPU/ROI comparisons, lifecycle tests, and benchmark
-  checksums on 2026-09-05; see the [hardware report](cuda-validation-2026-09-05.md).
+  checksums on 2026-09-05; see the [CUDA workflow](https://github.com/frames-sg/jxr/actions/runs/33953370733).
 
 ## Explicitly incomplete
 

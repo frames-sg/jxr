@@ -177,7 +177,8 @@ Paths, iteration count, and stream count are printed with the result.
 The workflow passed on the self-hosted `Cuda` runner on 2026-09-05. All 517
 in-scope T.834/T.835 cases passed, as did the CPU/ROI differential suite,
 lifecycle tests, and checksum-checked benchmark. The
-[hardware report](cuda-validation-2026-09-05.md) records the tested commit,
-driver/toolkit, measurements, and corpus limits. This validates that NVIDIA
-configuration; it does not establish performance on other devices or a general
-speedup over CPU reconstruction.
+[workflow run](https://github.com/frames-sg/jxr/actions/runs/33953370733)
+records the tested commit and hardware. The benchmark used two small conformance
+fixtures, 32×32 and 145×130 pixels. This validates that NVIDIA configuration;
+it does not establish performance on other devices, representative pathology
+images, or a general speedup over CPU reconstruction.

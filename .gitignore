@@ -7,6 +7,10 @@
 .codex/
 .claude/
 .local-docs/
+# Session reports belong in .local-docs/, never in tracked docs.
+/docs/audit/
+/docs/audits/
+/docs/cuda-validation-????-??-??.md
 .local-tools/
 .codex-security-*/
 reasonix.toml
