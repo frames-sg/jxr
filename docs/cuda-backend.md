@@ -174,7 +174,10 @@ device-to-host median latency plus total p95 latency; image throughput; scratch
 allocation misses; immutable host-to-device bytes; and output transfer bytes.
 Paths, iteration count, and stream count are printed with the result.
 
-No CUDA correctness or performance result is claimed until that workflow passes
-on a compatible NVIDIA GPU, driver, and NVRTC installation. The implementation
-currently compiles on the development Mac, where neither CUDA runtime behavior
-nor CUDA C compilation can be executed.
+The workflow passed on the self-hosted `Cuda` runner on 2026-09-05. All 517
+in-scope T.834/T.835 cases passed, as did the CPU/ROI differential suite,
+lifecycle tests, and checksum-checked benchmark. The
+[hardware report](cuda-validation-2026-09-05.md) records the tested commit,
+driver/toolkit, measurements, and corpus limits. This validates that NVIDIA
+configuration; it does not establish performance on other devices or a general
+speedup over CPU reconstruction.
