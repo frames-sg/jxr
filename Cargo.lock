@@ -134,6 +134,7 @@ dependencies = [
 [[package]]
 name = "j2k-mpsgraph-support"
 version = "0.10.0"
+source = "git+https://github.com/frames-sg/j2k.git?rev=5a0e238307079e6381095bf91b15c156569796d2#5a0e238307079e6381095bf91b15c156569796d2"
 dependencies = [
  "block2",
  "objc2",
