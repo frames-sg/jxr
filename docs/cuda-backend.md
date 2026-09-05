@@ -174,7 +174,11 @@ device-to-host median latency plus total p95 latency; image throughput; scratch
 allocation misses; immutable host-to-device bytes; and output transfer bytes.
 Paths, iteration count, and stream count are printed with the result.
 
-No CUDA correctness or performance result is claimed until that workflow passes
-on a compatible NVIDIA GPU, driver, and NVRTC installation. The implementation
-currently compiles on the development Mac, where neither CUDA runtime behavior
-nor CUDA C compilation can be executed.
+The workflow passed on the self-hosted `Cuda` runner on 2026-09-05. All 517
+in-scope T.834/T.835 cases passed, as did the CPU/ROI differential suite,
+lifecycle tests, and checksum-checked benchmark. The
+[workflow run](https://github.com/frames-sg/jxr/actions/runs/33953370733)
+records the tested commit and hardware. The benchmark used two small conformance
+fixtures, 32×32 and 145×130 pixels. This validates that NVIDIA configuration;
+it does not establish performance on other devices, representative pathology
+images, or a general speedup over CPU reconstruction.

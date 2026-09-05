@@ -76,26 +76,7 @@ impl MetalArenaInput {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MetalPlaneInput {
-    pub(crate) arena_index: u32,
-    pub(crate) macroblock_offset: usize,
-    pub(crate) macroblock_count: usize,
-    pub(crate) block_columns: u8,
-    pub(crate) block_rows: u8,
-    pub(crate) macroblock_origin_x: u32,
-    pub(crate) macroblock_origin_y: u32,
-    pub(crate) macroblocks_x: u32,
-    pub(crate) macroblocks_y: u32,
-    pub(crate) sample_origin_x: u32,
-    pub(crate) sample_origin_y: u32,
-    pub(crate) sample_width: u32,
-    pub(crate) sample_height: u32,
-    pub(crate) low_offset: usize,
-    pub(crate) sample_offset: usize,
-    pub(crate) scale_after_first_transform: bool,
-    pub(crate) alpha: bool,
-}
+pub(crate) use jxr_core::device_plan::ReconstructionPlane as MetalPlaneInput;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MetalReconstructionInput {

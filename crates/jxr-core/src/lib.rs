@@ -6,6 +6,8 @@
 extern crate alloc;
 
 mod container;
+#[doc(hidden)]
+pub mod device_plan;
 mod error;
 mod format;
 mod image;

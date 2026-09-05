@@ -70,21 +70,22 @@ because they use Advanced-only output syntax or a JPEG 2000 `.jpx` wrapper.
   streams, bounded scratch and immutable uploads, asynchronous/resident output,
   checked caller-owned destinations, native and dense batches, an ignored full
   CPU differential suite, a serialized self-hosted NVIDIA workflow, and a
-  phase-separated pathology benchmark. CUDA hardware results are not yet
-  available from the current development Mac.
+  phase-separated pathology benchmark. The NVIDIA workflow passed all 517
+  in-scope T.834/T.835 cases, CPU/ROI comparisons, lifecycle tests, and benchmark
+  checksums on 2026-09-05; see the [CUDA workflow](https://github.com/frames-sg/jxr/actions/runs/33953370733).
 
 ## Explicitly incomplete
 
 - A wider device performance corpus. CPU passes all 517 in-scope T.834/T.835
   differential cases; the affected Metal output-format categories also pass
   byte-for-byte. The hardware commands pass locally on Apple silicon; GitHub
-  dispatch remains unverified until a matching labeled runner is provisioned.
+  Metal dispatch remains queued pending a matching labeled runner.
 - Native reduced-resolution decode for spatially interleaved packets and for
   Metal or CUDA reconstruction. The implemented frequency-mode CPU route is genuinely
   band-limited and does not label full decode plus resampling as native reduction.
-- CUDA runtime, NVRTC kernel compilation, full conformance, and performance have
-  not been validated on compatible NVIDIA hardware yet. No CUDA correctness or
-  speed claim is made until the self-hosted workflow passes and retains reports.
+- CUDA validation on additional NVIDIA devices, drivers, and operating systems.
+  The passing Linux runner covers one configuration. The benchmark uses two
+  small conformance images and establishes no general speedup over CPU.
 - ICC color transforms. Profiles are exposed byte-for-byte for a caller-selected
   color-management system and are never approximated inside the codec.
 Unsupported combinations return errors; they are not approximated by a nearby

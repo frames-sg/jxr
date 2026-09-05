@@ -81,3 +81,16 @@ pub enum MetalError {
     #[error("Metal runtime operation failed: {0}")]
     Runtime(#[from] j2k_metal_support::MetalSupportError),
 }
+
+impl From<jxr_core::device_plan::PlanError> for MetalError {
+    fn from(error: jxr_core::device_plan::PlanError) -> Self {
+        match error {
+            jxr_core::device_plan::PlanError::InvalidPlan { reason } => {
+                Self::InvalidPlan { reason }
+            }
+            jxr_core::device_plan::PlanError::UnsupportedOutputFormat { reason } => {
+                Self::UnsupportedOutputFormat { reason }
+            }
+        }
+    }
+}
