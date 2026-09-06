@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "jxr"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "jxr-core",
  "jxr-cuda",
@@ -157,14 +157,14 @@ dependencies = [
 
 [[package]]
 name = "jxr-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "j2k-core",
 ]
 
 [[package]]
 name = "jxr-cuda"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cudarc",
  "jxr-core",
@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-image"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "jxr",
@@ -187,7 +187,7 @@ version = "0.1.0"
 
 [[package]]
 name = "jxr-metal"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "j2k-core",
  "j2k-metal-support",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-mpsgraph"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "j2k-metal-support",
  "j2k-mpsgraph-support",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-native"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fearless_simd",
  "jxr-core",
