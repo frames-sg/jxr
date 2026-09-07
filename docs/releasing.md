@@ -37,9 +37,9 @@ The 0.1.1 patches for `jxr-metal` and `jxr` make non-macOS Metal stubs pass
 all-target Clippy without changing the ownership contract or decode behavior.
 The patch was checked locally on macOS and with Clippy targeting x86_64 Linux.
 
-## Next patch release
+## 0.1.2 patch release
 
-The next patch set publishes the shared CPU-side device reconstruction plans
+This patch set publishes the shared CPU-side device reconstruction plans
 used by Metal and CUDA, and the MPSGraph submission lifetime owner. Public decode
 contracts and the default CPU-only feature set are unchanged.
 
@@ -54,6 +54,6 @@ Publish the changed packages and their exact-version dependents in this order:
 7. `jxr-mpsgraph` 0.1.1
 
 `jxr-math` remains at the already-published 0.1.0 version. The graph adapter
-cannot be published until `j2k-mpsgraph-support` 0.11.0 is available on crates.io
-and its Git pin has been replaced with the registry dependency. The other J2K
-dependencies remain at 0.10.0; the graph owner does not depend on them.
+uses the published `j2k-mpsgraph-support` 0.11.0 registry dependency. Its source
+matches the previous Git pin. The other J2K dependencies remain at 0.10.0;
+the graph owner does not depend on them.

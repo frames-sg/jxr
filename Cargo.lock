@@ -133,8 +133,9 @@ dependencies = [
 
 [[package]]
 name = "j2k-mpsgraph-support"
-version = "0.10.0"
-source = "git+https://github.com/frames-sg/j2k.git?rev=5a0e238307079e6381095bf91b15c156569796d2#5a0e238307079e6381095bf91b15c156569796d2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d5c5e7d85e8d540e586faadc80b793cb77dcaa1ef8439b6e281e9d701b368d3"
 dependencies = [
  "block2",
  "objc2",
