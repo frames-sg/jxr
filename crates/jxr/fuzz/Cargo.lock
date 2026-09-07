@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "jxr"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "jxr-core",
  "jxr-cuda",
@@ -121,14 +121,14 @@ dependencies = [
 
 [[package]]
 name = "jxr-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "j2k-core",
 ]
 
 [[package]]
 name = "jxr-cuda"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cudarc",
  "jxr-core",
@@ -151,7 +151,7 @@ version = "0.1.0"
 
 [[package]]
 name = "jxr-native"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fearless_simd",
  "jxr-core",

@@ -1,7 +1,7 @@
 [package]
 name = "jxr-image"
 description = "Lossless ownership adapter from JPEG XR decode results to image::DynamicImage"
-version.workspace = true
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,7 +13,7 @@ readme = "README.md"
 
 [dependencies]
 image.workspace = true
-jxr = { path = "../jxr", version = "=0.1.1" }
+jxr = { path = "../jxr", version = "=0.1.2" }
 thiserror.workspace = true
 
 [lints]

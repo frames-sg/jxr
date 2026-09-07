@@ -1,7 +1,7 @@
 [package]
 name = "jxr-mpsgraph"
 description = "Direct MPSGraph tensor adapter for Metal-resident JPEG XR batches"
-version.workspace = true
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,13 +13,13 @@ readme = "README.md"
 
 [dependencies]
 j2k-metal-support.workspace = true
-jxr = { path = "../jxr", version = "=0.1.1", features = ["metal"] }
-jxr-core = { path = "../jxr-core", version = "=0.1.0" }
-jxr-metal = { path = "../jxr-metal", version = "=0.1.1" }
+jxr = { path = "../jxr", version = "=0.1.2", features = ["metal"] }
+jxr-core = { path = "../jxr-core", version = "=0.1.1" }
+jxr-metal = { path = "../jxr-metal", version = "=0.1.2" }
 thiserror.workspace = true
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
-j2k-mpsgraph-support = { version = "=0.10.0", git = "https://github.com/frames-sg/j2k.git", rev = "5a0e238307079e6381095bf91b15c156569796d2" }
+j2k-mpsgraph-support = "=0.11.0"
 objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "std",

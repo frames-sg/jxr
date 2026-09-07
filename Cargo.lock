@@ -133,8 +133,9 @@ dependencies = [
 
 [[package]]
 name = "j2k-mpsgraph-support"
-version = "0.10.0"
-source = "git+https://github.com/frames-sg/j2k.git?rev=5a0e238307079e6381095bf91b15c156569796d2#5a0e238307079e6381095bf91b15c156569796d2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d5c5e7d85e8d540e586faadc80b793cb77dcaa1ef8439b6e281e9d701b368d3"
 dependencies = [
  "block2",
  "objc2",
@@ -145,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "jxr"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "jxr-core",
  "jxr-cuda",
@@ -157,14 +158,14 @@ dependencies = [
 
 [[package]]
 name = "jxr-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "j2k-core",
 ]
 
 [[package]]
 name = "jxr-cuda"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cudarc",
  "jxr-core",
@@ -174,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-image"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "jxr",
@@ -187,7 +188,7 @@ version = "0.1.0"
 
 [[package]]
 name = "jxr-metal"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "j2k-core",
  "j2k-metal-support",
@@ -201,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-mpsgraph"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "j2k-metal-support",
  "j2k-mpsgraph-support",
@@ -218,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-native"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fearless_simd",
  "jxr-core",
