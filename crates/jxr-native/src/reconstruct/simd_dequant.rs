@@ -1,6 +1,6 @@
 //! Checked capability-token SIMD for contiguous coefficient scaling.
 
-use fearless_simd::Simd;
+use fearless_simd::{Simd, SimdBase};
 use jxr_math::quantization::Quantizer;
 
 use crate::CpuCapabilities;
@@ -49,8 +49,24 @@ pub(super) fn scale_coefficients(
 }
 
 #[inline]
-fn scale_vectorized<S: Simd>(_simd: S, input: &[i32], output: &mut [i32], step: u32) {
-    scale_validated(input, output, step);
+fn scale_vectorized<S: Simd>(simd: S, input: &[i32], output: &mut [i32], step: u32) {
+    let multiplier = i32::from_ne_bytes(step.to_ne_bytes());
+    simd.vectorize(|| {
+        let lanes = S::i32s::LEN;
+        let vector_multiplier = S::i32s::splat(simd, multiplier);
+        let mut input_chunks = input.chunks_exact(lanes);
+        let mut output_chunks = output.chunks_exact_mut(lanes);
+        for (source, destination) in input_chunks.by_ref().zip(output_chunks.by_ref()) {
+            (S::i32s::from_slice(simd, source) * vector_multiplier).store_slice(destination);
+        }
+        for (&source, destination) in input_chunks
+            .remainder()
+            .iter()
+            .zip(output_chunks.into_remainder())
+        {
+            *destination = source.wrapping_mul(multiplier);
+        }
+    });
 }
 
 #[inline]
@@ -98,5 +114,18 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn coefficient_scaling_preserves_negative_values_and_tail() {
+        let input: Vec<_> = (-34..35).collect();
+        let quantizer = Quantizer::new(113).unwrap();
+        let mut output = vec![0; input.len()];
+        scale_coefficients(CpuCapabilities::detect(), quantizer, &input, &mut output).unwrap();
+        let expected: Vec<_> = input
+            .iter()
+            .map(|&value| quantizer.dequantize(value).unwrap())
+            .collect();
+        assert_eq!(output, expected);
     }
 }
