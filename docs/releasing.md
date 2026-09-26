@@ -54,6 +54,5 @@ Publish the changed packages and their exact-version dependents in this order:
 7. `jxr-mpsgraph` 0.1.1
 
 `jxr-math` remains at the already-published 0.1.0 version. The graph adapter
-uses the published `j2k-mpsgraph-support` 0.11.0 registry dependency. Its source
-matches the previous Git pin. The other J2K dependencies remain at 0.10.0;
-the graph owner does not depend on them.
+uses the published `j2k-mpsgraph-support` 0.11.1 registry dependency, and
+`j2k-core` plus `j2k-metal-support` are pinned to the matching 0.11.1 release.
