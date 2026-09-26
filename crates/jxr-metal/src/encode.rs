@@ -5,7 +5,7 @@ use jxr_core::device_plan::{SAMPLE_OFFSET, SURFACE_OFFSET};
 use j2k_metal_support::{
     checked_buffer_fill_bytes, checked_command_buffer, checked_compute_command_encoder,
     checked_event, checked_private_buffer, checked_shared_buffer_with_slice, dispatch_1d_pipeline,
-    dispatch_2d_pipeline, mtl_size, one_d_threads_per_group,
+    dispatch_2d_pipeline,
 };
 use jxr_core::{OverlapMode, SurfaceLayout};
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -525,6 +525,7 @@ fn encode_highpass(
     plane: JxrPlaneAbi,
     macroblock_count: usize,
 ) -> Result<(), MetalError> {
+    let threads = highpass_thread_count(macroblock_count, plane.block_columns, plane.block_rows)?;
     encoder.setComputePipelineState(&runtime.hp_transform);
     encoder.bind_buffer(0, &arena.packed, arena.packed_offset_bytes)?;
     encoder.bind_buffer(1, &arena.macroblocks, 0)?;
@@ -532,23 +533,23 @@ fn encode_highpass(
     encoder.bind_buffer(3, buffers.samples.buffer(), 0)?;
     encoder.bind_buffer(4, buffers.status.buffer(), 0)?;
     encoder.bind_bytes(5, &plane)?;
-    let width = (runtime.hp_transform.threadExecutionWidth() as u64).max(16);
-    if width > runtime.hp_transform.maxTotalThreadsPerThreadgroup() as u64 {
-        return Err(MetalError::InvalidPlan {
-            reason: "Metal pipeline cannot host one transform macroblock",
-        });
-    }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        mtl_size(
-            u64::try_from(macroblock_count).map_err(|_| MetalError::InvalidPlan {
-                reason: "macroblock threadgroup count exceeds u64",
-            })?,
-            1,
-            1,
-        ),
-        one_d_threads_per_group(width),
-    );
+    dispatch_1d_pipeline(encoder, &runtime.hp_transform, threads);
     Ok(())
+}
+
+/// Returns the one-thread-per-block grid width for the HP transform kernel.
+fn highpass_thread_count(
+    macroblock_count: usize,
+    block_columns: impl Into<u64>,
+    block_rows: impl Into<u64>,
+) -> Result<u64, MetalError> {
+    u64::try_from(macroblock_count)
+        .ok()
+        .and_then(|count| count.checked_mul(block_columns.into() * block_rows.into()))
+        .filter(|&threads| u32::try_from(threads).is_ok())
+        .ok_or(MetalError::InvalidPlan {
+            reason: "HP transform block count exceeds the Metal ABI",
+        })
 }
 
 fn encode_overlap_schedule(

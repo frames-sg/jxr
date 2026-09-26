@@ -327,20 +327,16 @@ fn encode_highpass_transforms(
     buffers: &BatchBuffers,
 ) -> Result<(), MetalError> {
     let plane_count = buffers.plane_inputs[0].len();
-    let width = (runtime.batch_hp_transform.threadExecutionWidth() as u64).max(16);
-    if width > runtime.batch_hp_transform.maxTotalThreadsPerThreadgroup() as u64 {
-        return Err(invalid(
-            "batch HP pipeline cannot host one transform macroblock",
-        ));
+    let mut work = 0;
+    for plane in buffers.plane_inputs.iter().flat_map(|planes| planes.iter()) {
+        work = work.max(super::highpass_thread_count(
+            plane.macroblock_count,
+            plane.block_columns,
+            plane.block_rows,
+        )?);
     }
-    let work = buffers
-        .plane_inputs
-        .iter()
-        .flat_map(|planes| planes.iter())
-        .map(|plane| plane.macroblock_count)
-        .max()
-        .unwrap_or(0);
     let batch = batch_dispatch(plans.len(), plane_count)?;
+    let width = runtime.batch_hp_transform.threadExecutionWidth() as u64;
     encoder.setComputePipelineState(&runtime.batch_hp_transform);
     encoder.bind_buffer(0, &buffers.packed, 0)?;
     encoder.bind_buffer(1, &buffers.macroblocks, 0)?;
@@ -349,9 +345,9 @@ fn encode_highpass_transforms(
     encoder.bind_buffer(4, buffers.status.buffer(), 0)?;
     encoder.bind_buffer(5, &buffers.planes, 0)?;
     encoder.bind_bytes(6, &batch)?;
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    encoder.dispatchThreads_threadsPerThreadgroup(
         mtl_size(
-            u64::try_from(work).map_err(|_| invalid("batch HP work exceeds u64"))?,
+            work,
             u64::from(batch.image_count),
             u64::from(batch.plane_count),
         ),

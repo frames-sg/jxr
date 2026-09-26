@@ -1,3 +1,17 @@
+// Accumulates one HP prediction chain in normative order: each block adds its
+// raw coefficient to the already-predicted value of its predecessor, so every
+// partial sum (and its overflow check) matches a serial macroblock traversal.
+inline int jxr_predicted_hp(device const int *coefficients, uint first_block, uint last_block,
+                            uint block_step, uint coefficient, thread bool &overflow) {
+    int value = coefficients[first_block * 16u + coefficient];
+    for (uint block = first_block + block_step; block <= last_block; block += block_step)
+        value = jxr_add(coefficients[block * 16u + coefficient], value, overflow);
+    return value;
+}
+
+// One thread reconstructs one 4x4 block. Consecutive threads cover the blocks
+// of consecutive macroblocks, so SIMD groups stay full for every chroma
+// layout and no threadgroup memory or barrier is needed.
 inline void jxr_highpass_second_transform_one(
     device const int *packed,
     device const JxrMacroblockAbi *macroblocks,
@@ -5,69 +19,56 @@ inline void jxr_highpass_second_transform_one(
     device int *samples,
     device atomic_uint *status,
     JxrPlaneAbi plane,
-    threadgroup int *high,
-    uint group_id,
-    uint tid,
-    uint threads) {
-    if (group_id >= plane.macroblock_count || jxr_failed(status)) return;
-    const uint metadata_index = plane.macroblock_offset + group_id;
-    const JxrMacroblockAbi metadata = macroblocks[metadata_index];
+    uint thread_index) {
     const uint block_count = plane.block_columns * plane.block_rows;
-    const uint coefficient_count = block_count * 16u;
-    for (uint index = tid; index < coefficient_count; index += threads) {
-        if (metadata.bands < 2u || (index & 15u) == 0u) {
-            high[index] = 0;
-        } else {
-            high[index] = packed[metadata.coefficient_offset + index];
+    const uint macroblock = thread_index / block_count;
+    const uint block = thread_index - macroblock * block_count;
+    if (macroblock >= plane.macroblock_count || jxr_failed(status)) return;
+    const JxrMacroblockAbi metadata = macroblocks[plane.macroblock_offset + macroblock];
+    const uint column = block % plane.block_columns;
+    const uint row = block / plane.block_columns;
+    int coefficients[16];
+    for (uint coefficient = 0; coefficient < 16; ++coefficient) coefficients[coefficient] = 0;
+    if (metadata.bands >= 2u) {
+        device const int *high = packed + metadata.coefficient_offset;
+        for (uint coefficient = 1; coefficient < 16; ++coefficient)
+            coefficients[coefficient] = high[block * 16u + coefficient];
+        bool prediction_overflow = false;
+        if (metadata.hp_prediction == 1u && column != 0u) {
+            for (uint coefficient = 4; coefficient <= 12; coefficient += 4)
+                coefficients[coefficient] = jxr_predicted_hp(
+                    high, block - column, block, 1u, coefficient, prediction_overflow);
+        } else if (metadata.hp_prediction == 2u && row != 0u) {
+            for (uint coefficient = 1; coefficient <= 3; ++coefficient)
+                coefficients[coefficient] = jxr_predicted_hp(
+                    high, column, block, plane.block_columns, coefficient, prediction_overflow);
+        }
+        if (prediction_overflow) {
+            jxr_fail(status, 3u);
+            return;
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u && metadata.bands >= 2u) {
-        if (metadata.hp_prediction == 1u) {
-            for (uint block = 1; block < block_count; ++block) {
-                if ((block % plane.block_columns) != 0u) {
-                    for (uint coefficient = 4; coefficient <= 12; coefficient += 4) {
-                        const uint destination = block * 16u + coefficient;
-                        int predicted;
-                        if (!jxr_add(high[destination], high[destination - 16u],
-                                     predicted, status, 3u)) break;
-                        high[destination] = predicted;
-                    }
-                }
-            }
-        } else if (metadata.hp_prediction == 2u) {
-            for (uint block = plane.block_columns; block < block_count; ++block) {
-                    for (uint coefficient = 1; coefficient <= 3; ++coefficient) {
-                        const uint destination = block * 16u + coefficient;
-                        const uint source = destination - plane.block_columns * 16u;
-                        int predicted;
-                        if (!jxr_add(high[destination], high[source], predicted, status, 3u)) break;
-                        high[destination] = predicted;
-                    }
-            }
-        }
+    bool overflow = false;
+    for (uint coefficient = 1; coefficient < 16; ++coefficient)
+        coefficients[coefficient] =
+            jxr_mul(coefficients[coefficient], metadata.quantizer_high_pass, overflow);
+    const uint local_x = metadata.coded_x - plane.macroblock_origin_x;
+    const uint local_y = metadata.coded_y - plane.macroblock_origin_y;
+    const uint low_x = local_x * plane.block_columns + column;
+    const uint low_y = local_y * plane.block_rows + row;
+    coefficients[0] = low_plane[plane.low_offset + low_y * plane.low_width + low_x];
+    jxr_inverse_transform(coefficients, overflow);
+    if (overflow) {
+        jxr_fail(status, 4u);
+        return;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
-    if (jxr_failed(status)) return;
-    for (uint block = tid; block < block_count; block += threads) {
-        int coefficients[16];
-        coefficients[0] = 0;
-        for (uint coefficient = 1; coefficient < 16; ++coefficient) {
-            if (!jxr_mul(high[block * 16u + coefficient], metadata.quantizer_high_pass,
-                         coefficients[coefficient], status, 4u)) return;
-        }
-        const uint local_x = metadata.coded_x - plane.macroblock_origin_x;
-        const uint local_y = metadata.coded_y - plane.macroblock_origin_y;
-        const uint low_x = local_x * plane.block_columns + block % plane.block_columns;
-        const uint low_y = local_y * plane.block_rows + block / plane.block_columns;
-        coefficients[0] = low_plane[plane.low_offset + low_y * plane.low_width + low_x];
-        if (!jxr_inverse_transform(coefficients, status, 4u)) return;
-        const uint output_x = local_x * plane.block_columns * 4u + (block % plane.block_columns) * 4u;
-        const uint output_y = local_y * plane.block_rows * 4u + (block / plane.block_columns) * 4u;
-        for (uint row = 0; row < 4; ++row)
-            for (uint column = 0; column < 4; ++column)
-                samples[plane.sample_offset + (output_y + row) * plane.sample_width + output_x + column] =
-                    coefficients[row * 4u + column];
+    const uint output_x = low_x * 4u;
+    const uint output_y = low_y * 4u;
+    for (uint y = 0; y < 4; ++y) {
+        device int4 *destination = reinterpret_cast<device int4 *>(
+            samples + plane.sample_offset + (output_y + y) * plane.sample_width + output_x);
+        *destination = int4(coefficients[y * 4u], coefficients[y * 4u + 1u],
+                            coefficients[y * 4u + 2u], coefficients[y * 4u + 3u]);
     }
 }
 
@@ -78,12 +79,9 @@ kernel void jxr_highpass_second_transform(
     device int *samples [[buffer(3)]],
     device atomic_uint *status [[buffer(4)]],
     constant JxrPlaneAbi &plane [[buffer(5)]],
-    uint group_id [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint threads [[threads_per_threadgroup]]) {
-    threadgroup int high[256];
+    uint gid [[thread_position_in_grid]]) {
     jxr_highpass_second_transform_one(
-        packed, macroblocks, low_plane, samples, status, plane, high, group_id, tid, threads);
+        packed, macroblocks, low_plane, samples, status, plane, gid);
 }
 
 kernel void jxr_highpass_second_transform_batch(
@@ -94,13 +92,9 @@ kernel void jxr_highpass_second_transform_batch(
     device atomic_uint *statuses [[buffer(4)]],
     device const JxrPlaneAbi *planes [[buffer(5)]],
     constant JxrBatchDispatchAbi &batch [[buffer(6)]],
-    uint3 group_id [[threadgroup_position_in_grid]],
-    uint3 tid [[thread_position_in_threadgroup]],
-    uint3 threads [[threads_per_threadgroup]]) {
-    if (group_id.y >= batch.image_count || group_id.z >= batch.plane_count) return;
-    threadgroup int high[256];
-    const JxrPlaneAbi plane = planes[group_id.y * batch.plane_count + group_id.z];
+    uint3 gid [[thread_position_in_grid]]) {
+    if (gid.y >= batch.image_count || gid.z >= batch.plane_count) return;
+    const JxrPlaneAbi plane = planes[gid.y * batch.plane_count + gid.z];
     jxr_highpass_second_transform_one(
-        packed, macroblocks, low_plane, samples, statuses + group_id.y,
-        plane, high, group_id.x, tid.x, threads.x);
+        packed, macroblocks, low_plane, samples, statuses + gid.y, plane, gid.x);
 }
