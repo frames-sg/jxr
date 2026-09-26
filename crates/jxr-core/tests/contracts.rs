@@ -115,8 +115,7 @@ fn surface_layout_rejects_overlapping_planar_destinations() {
 }
 
 #[test]
-fn core_uses_shared_backend_and_rect_contracts() {
-    assert_eq!(BackendKind::Cpu, BackendKind::Cpu);
+fn shared_rect_accepts_contained_region() {
     assert!(
         Rect {
             x: 1,

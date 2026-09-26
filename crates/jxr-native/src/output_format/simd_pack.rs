@@ -1,6 +1,6 @@
 //! Capability-token dispatch for common unsigned planar packing.
 
-use fearless_simd::{Level, Simd};
+use fearless_simd::{Bytes, Level, Simd, SimdBase, SimdNarrow};
 
 use super::OutputFormatError;
 
@@ -90,28 +90,94 @@ fn pack_accelerated(
 ) -> bool {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if let Some(avx2) = level.as_avx2() {
-        pack_vectorized(avx2, input, stride, start, dimensions, scaled, output);
-        return true;
+        return pack_vectorized(avx2, input, stride, start, dimensions, scaled, output);
     }
     #[cfg(target_arch = "aarch64")]
     if let Some(neon) = level.as_neon() {
-        pack_vectorized(neon, input, stride, start, dimensions, scaled, output);
-        return true;
+        return pack_vectorized(neon, input, stride, start, dimensions, scaled, output);
     }
     false
 }
 
 #[inline]
 fn pack_vectorized<S: Simd>(
-    _simd: S,
+    simd: S,
     input: &[i32],
     stride: usize,
     start: [usize; 2],
     dimensions: [usize; 2],
     scaled: bool,
     output: &mut [u8],
-) {
-    pack_rows(input, stride, start, dimensions, scaled, output);
+) -> bool {
+    let lanes = S::i32s::LEN;
+    let packed_lanes = S::u8s::LEN;
+    let [width, height] = dimensions;
+    if width < packed_lanes {
+        return false;
+    }
+
+    simd.vectorize(|| {
+        let bias = if scaled { 1_024 } else { 128 };
+        let rounding = if scaled { 3 } else { 0 };
+        let addition = bias + rounding;
+        let shift = if scaled { 3 } else { 0 };
+        let zero = S::i32s::splat(simd, 0);
+        let max = S::i32s::splat(simd, 255);
+        let vector_width = width / packed_lanes * packed_lanes;
+        for y in 0..height {
+            let source_start = (start[1] + y) * stride + start[0];
+            let source = &input[source_start..source_start + width];
+            let destination = &mut output[y * width..(y + 1) * width];
+            for (source, destination) in source[..vector_width]
+                .chunks_exact(packed_lanes)
+                .zip(destination[..vector_width].chunks_exact_mut(packed_lanes))
+            {
+                let first = pack_lanes(simd, &source[..lanes], addition, shift, zero, max);
+                let second =
+                    pack_lanes(simd, &source[lanes..2 * lanes], addition, shift, zero, max);
+                let third = pack_lanes(
+                    simd,
+                    &source[2 * lanes..3 * lanes],
+                    addition,
+                    shift,
+                    zero,
+                    max,
+                );
+                let fourth = pack_lanes(simd, &source[3 * lanes..], addition, shift, zero, max);
+                first
+                    .saturating_narrow(second)
+                    .saturating_narrow(third.saturating_narrow(fourth))
+                    .store_slice(destination);
+            }
+            for (destination, &sample) in destination[vector_width..]
+                .iter_mut()
+                .zip(&source[vector_width..])
+            {
+                *destination = u8::try_from(((sample + bias + rounding) >> shift).clamp(0, 255))
+                    .expect("sample is clipped to u8");
+            }
+        }
+    });
+    true
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "SIMD helper must inline into the target-feature vectorize context"
+)]
+#[inline(always)]
+fn pack_lanes<S: Simd>(
+    simd: S,
+    source: &[i32],
+    addition: i32,
+    shift: u32,
+    zero: S::i32s,
+    max: S::i32s,
+) -> S::u32s {
+    ((S::i32s::from_slice(simd, source) + addition) >> shift)
+        .max(zero)
+        .min(max)
+        .bitcast()
 }
 
 #[inline]
@@ -175,6 +241,46 @@ mod tests {
             let shift = if scaled { 3 } else { 0 };
             let expected: Vec<_> = (0..6)
                 .flat_map(|y| &input[(y + 1) * 24 + 2..(y + 1) * 24 + 22])
+                .map(|&sample| {
+                    u8::try_from(((sample + bias + rounding) >> shift).clamp(0, 255))
+                        .expect("sample is clipped to u8")
+                })
+                .collect();
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn packing_matches_scalar_at_row_tails_and_clamp_boundaries() {
+        let width = 37;
+        let height = 3;
+        let stride = 41;
+        let input: Vec<i32> = (0..stride * (height + 1))
+            .map(|index| match index % 5 {
+                0 => -2_000,
+                1 => -128,
+                2 => 0,
+                3 => 1_024,
+                _ => i32::MAX - 1_027,
+            })
+            .collect();
+        for scaled in [false, true] {
+            let mut output = Vec::new();
+            append_u8(
+                Level::new(),
+                &input,
+                stride,
+                [2, 1],
+                [width, height],
+                scaled,
+                &mut output,
+            )
+            .unwrap();
+            let bias = if scaled { 1_024 } else { 128 };
+            let rounding = if scaled { 3 } else { 0 };
+            let shift = if scaled { 3 } else { 0 };
+            let expected: Vec<_> = (1..=height)
+                .flat_map(|y| &input[y * stride + 2..y * stride + 2 + width])
                 .map(|&sample| {
                     u8::try_from(((sample + bias + rounding) >> shift).clamp(0, 255))
                         .expect("sample is clipped to u8")
