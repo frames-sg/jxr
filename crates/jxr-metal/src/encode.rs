@@ -2,6 +2,7 @@ use jxr_core::device_plan::{OUTPUT_PLANE, SURFACE_HEIGHT, SURFACE_WIDTH};
 use jxr_core::device_plan::{SAMPLE_OFFSET, SURFACE_OFFSET};
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use j2k_core::accelerator::GpuAbi;
 use j2k_metal_support::{
     checked_buffer_fill_bytes, checked_command_buffer, checked_compute_command_encoder,
     checked_event, checked_private_buffer, checked_shared_buffer_with_slice, dispatch_1d_pipeline,
@@ -19,9 +20,9 @@ use crate::{
     MetalDecodePlan, MetalError,
     abi::{JxrPlaneAbi, macroblock_abi_metadata},
     buffer_pool::{MetalBufferPools, PooledBuffer},
-    metal_types::JxrComputeEncoderExt,
+    metal_types::{JxrComputeEncoderExt, SET_BYTES_LIMIT},
     output_plan::{StorePipeline, build_output_dispatch},
-    overlap_plan::{OverlapSchedule, first_overlap_schedule, second_overlap_schedule},
+    overlap_plan::{OverlapPass, ResidentOverlapSchedule, ResidentWork},
     plan::{MetalCoefficientSource, MetalReconstructionInput},
     runtime::MetalRuntime,
 };
@@ -36,9 +37,13 @@ type EventHandle = Retained<ProtocolObject<dyn MTLEvent>>;
 type EncodingPair = (CommandHandle, ComputeEncoderHandle);
 
 // Compatible images share descriptor and scratch arenas within this bounded
-// command group. Keep the measured width explicit until batched final stores
-// remove the per-image output-dispatch serialization.
-const BATCH_IMAGES_PER_COMMAND: usize = 2;
+// command group. After the one-thread-per-block HP kernel and cached overlap
+// schedules, eight images per command measured ~10% higher 128-tile pipeline
+// throughput than two on the 16-core M4 Pro, with small batches unchanged.
+const BATCH_IMAGES_PER_COMMAND: usize = 8;
+// Dense batches share one tracked allocation on one queue, so wider command
+// groups trade no concurrency for fewer serialized command buffers.
+const DENSE_IMAGES_PER_COMMAND: usize = 16;
 
 struct ArenaBuffers {
     packed: BufferHandle,
@@ -88,15 +93,6 @@ pub(crate) fn encode_into(
     encode_with_output(runtime, plan, Some((output, 0)))
 }
 
-pub(crate) fn encode_into_at(
-    runtime: &MetalRuntime,
-    plan: &MetalDecodePlan,
-    output: BufferHandle,
-    output_offset: usize,
-) -> Result<EncodedMetalSubmission, MetalError> {
-    encode_with_output(runtime, plan, Some((output, output_offset)))
-}
-
 pub(crate) fn encode_batch(
     runtime: &MetalRuntime,
     plans: &[MetalDecodePlan],
@@ -114,13 +110,74 @@ pub(crate) fn encode_batch_into(
             reason: "Metal batch output count differs from plan count",
         });
     }
-    encode_batch_with_outputs(runtime, plans, Some(outputs))
+    let outputs: Vec<_> = outputs.iter().map(|output| (output.clone(), 0)).collect();
+    encode_batch_with_outputs(runtime, plans, Some(&outputs))
+}
+
+/// Encodes a dense batch into one allocation on the runtime's ordered queue.
+///
+/// Every image writes a disjoint range of the same tracked allocation, so
+/// Metal serializes command buffers that share it. Grouping images into
+/// concatenated-descriptor command buffers amortizes that serialization and
+/// runs each group's transforms as single batched dispatches.
+pub(crate) fn encode_dense_into(
+    runtime: &MetalRuntime,
+    plans: &[MetalDecodePlan],
+    output: &BufferHandle,
+    offsets: &[usize],
+) -> Result<Vec<EncodedMetalSubmission>, MetalError> {
+    if plans.len() != offsets.len() {
+        return Err(MetalError::InvalidPlan {
+            reason: "Metal dense batch offset count differs from plan count",
+        });
+    }
+    let mut submissions = Vec::with_capacity(plans.len());
+    let mut start = 0;
+    while start < plans.len() {
+        let end = dense_group_end(plans, start)?;
+        let group = &plans[start..end];
+        let outputs: Vec<_> = offsets[start..end]
+            .iter()
+            .map(|&offset| (output.clone(), offset))
+            .collect();
+        start = end;
+        if let Some(encoded) = batch::try_encode(runtime, &runtime.queue, group, Some(&outputs))? {
+            submissions.extend(encoded);
+            continue;
+        }
+        for (plan, (output, offset)) in group.iter().zip(outputs) {
+            submissions.push(encode_with_output(runtime, plan, Some((output, offset)))?);
+        }
+    }
+    Ok(submissions)
+}
+
+/// Extends a dense group while it stays within the image count and the shared
+/// scratch budget. An image larger than the budget forms its own group and is
+/// encoded without concatenated scratch.
+fn dense_group_end(plans: &[MetalDecodePlan], start: usize) -> Result<usize, MetalError> {
+    let mut end = start;
+    let mut scratch = 0_usize;
+    while end < plans.len() && end - start < DENSE_IMAGES_PER_COMMAND {
+        let next =
+            scratch
+                .checked_add(plans[end].scratch_bytes()?)
+                .ok_or(MetalError::InvalidPlan {
+                    reason: "Metal batch scratch byte count overflows usize",
+                })?;
+        if end > start && next > crate::session::BATCH_SCRATCH_BUDGET {
+            break;
+        }
+        scratch = next;
+        end += 1;
+    }
+    Ok(end)
 }
 
 fn encode_batch_with_outputs(
     runtime: &MetalRuntime,
     plans: &[MetalDecodePlan],
-    outputs: Option<&[BufferHandle]>,
+    outputs: Option<&[(BufferHandle, usize)]>,
 ) -> Result<Vec<EncodedMetalSubmission>, MetalError> {
     if plans.is_empty() {
         return Ok(Vec::new());
@@ -144,7 +201,7 @@ fn encode_batch_with_outputs(
                     runtime,
                     &encoder,
                     plan,
-                    group_outputs.map(|outputs| (outputs[offset].clone(), 0)),
+                    group_outputs.map(|outputs| outputs[offset].clone()),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -241,19 +298,14 @@ fn encode_low_pass(
 
     if input.overlap == OverlapMode::Two {
         for &plane in input.planes.iter() {
-            let schedule = first_overlap_schedule(
-                plane,
-                input.hard_tiles,
-                &input.tile_column_widths,
-                &input.tile_row_heights,
-            )?;
-            encode_overlap_schedule(
-                &runtime.queue.device(),
+            encode_overlap_pass(
+                runtime,
                 encoder,
-                &runtime.overlap_first,
+                OverlapPass::First,
+                plane,
+                input,
                 buffers.low.buffer(),
-                buffers.status.buffer(),
-                &schedule,
+                (buffers.status.buffer(), 0),
             )?;
         }
     }
@@ -282,19 +334,14 @@ fn encode_high_pass(
 
     if input.overlap != OverlapMode::None {
         for &plane in input.planes.iter() {
-            let schedule = second_overlap_schedule(
-                plane,
-                input.hard_tiles,
-                &input.tile_column_widths,
-                &input.tile_row_heights,
-            )?;
-            encode_overlap_schedule(
-                &runtime.queue.device(),
+            encode_overlap_pass(
+                runtime,
                 encoder,
-                &runtime.overlap_second,
+                OverlapPass::Second,
+                plane,
+                input,
                 buffers.samples.buffer(),
-                buffers.status.buffer(),
-                &schedule,
+                (buffers.status.buffer(), 0),
             )?;
         }
     }
@@ -353,8 +400,8 @@ fn encode_output_at(
                     reason: "batch output surface offset exceeds u32",
                 })?;
     }
-    let sample_planes = checked_shared_buffer_with_slice(&device, &output_dispatch.samples)?;
-    let surface_planes = checked_shared_buffer_with_slice(&device, &output_dispatch.surfaces)?;
+    let sample_planes = DescriptorBinding::new(&device, &output_dispatch.samples)?;
+    let surface_planes = DescriptorBinding::new(&device, &output_dispatch.surfaces)?;
     let pipeline = runtime.output_store.select(output_dispatch.pipeline);
     let dispatch_count = if output_dispatch.planar {
         output_dispatch.surfaces.len()
@@ -375,14 +422,44 @@ fn encode_output_at(
         };
         encoder.setComputePipelineState(pipeline);
         encoder.bind_buffer(0, samples, 0)?;
-        encoder.bind_buffer(1, &sample_planes, 0)?;
-        encoder.bind_buffer(2, &surface_planes, 0)?;
+        sample_planes.bind(encoder, 1)?;
+        surface_planes.bind(encoder, 2)?;
         encoder.bind_buffer(3, output, 0)?;
         encoder.bind_buffer(4, status, status_offset)?;
         encoder.bind_bytes(5, &params)?;
         dispatch_2d_pipeline(encoder, pipeline, dims);
     }
     Ok(())
+}
+
+/// Small per-dispatch descriptor arrays are copied inline with `setBytes`,
+/// avoiding one shared-buffer allocation per image; larger arrays fall back
+/// to an allocation.
+enum DescriptorBinding<'a, T: GpuAbi> {
+    Inline(&'a [T]),
+    Buffer(BufferHandle),
+}
+
+impl<'a, T: GpuAbi> DescriptorBinding<'a, T> {
+    fn new(device: &ProtocolObject<dyn MTLDevice>, values: &'a [T]) -> Result<Self, MetalError> {
+        if !values.is_empty() && core::mem::size_of_val(values) <= SET_BYTES_LIMIT {
+            return Ok(Self::Inline(values));
+        }
+        Ok(Self::Buffer(checked_shared_buffer_with_slice(
+            device, values,
+        )?))
+    }
+
+    fn bind(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        index: usize,
+    ) -> Result<(), MetalError> {
+        match self {
+            Self::Inline(values) => encoder.bind_slice_bytes(index, values),
+            Self::Buffer(buffer) => encoder.bind_buffer(index, buffer, 0),
+        }
+    }
 }
 
 fn finish_encoding(
@@ -552,61 +629,77 @@ fn highpass_thread_count(
         })
 }
 
-fn encode_overlap_schedule(
-    device: &ProtocolObject<dyn MTLDevice>,
+/// Encodes one plane's overlap pass from the runtime's resident schedule cache.
+pub(super) fn encode_overlap_pass(
+    runtime: &MetalRuntime,
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    pass: OverlapPass,
+    plane: crate::plan::MetalPlaneInput,
+    input: &MetalReconstructionInput,
     samples: BufferRef<'_>,
-    status: BufferRef<'_>,
-    schedule: &OverlapSchedule,
+    status: (BufferRef<'_>, usize),
 ) -> Result<(), MetalError> {
-    encode_overlap_schedule_at(device, encoder, pipeline, samples, status, 0, schedule)
+    let schedule = runtime.overlap_schedules.get_or_upload(
+        &runtime.queue.device(),
+        pass,
+        plane,
+        input.hard_tiles,
+        &input.tile_column_widths,
+        &input.tile_row_heights,
+    )?;
+    let (pipeline, base) = match pass {
+        OverlapPass::First => (&runtime.overlap_first, plane.low_offset),
+        OverlapPass::Second => (&runtime.overlap_second, plane.sample_offset),
+    };
+    encode_resident_overlap(
+        encoder,
+        pipeline,
+        samples,
+        status,
+        &schedule,
+        schedule.checked_base(base)?,
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn encode_overlap_schedule_at(
-    device: &ProtocolObject<dyn MTLDevice>,
+fn encode_resident_overlap(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     samples: BufferRef<'_>,
-    status: BufferRef<'_>,
-    status_offset: usize,
-    schedule: &OverlapSchedule,
+    status: (BufferRef<'_>, usize),
+    schedule: &ResidentOverlapSchedule,
+    base: u32,
 ) -> Result<(), MetalError> {
     let has_work =
-        !schedule.prefix.is_empty() || !schedule.filters.is_empty() || !schedule.suffix.is_empty();
+        schedule.prefix.is_some() || schedule.filters.is_some() || schedule.suffix.is_some();
     encode_overlap_list(
-        device,
         encoder,
         pipeline,
         samples,
         status,
-        status_offset,
-        &schedule.prefix,
+        schedule.prefix.as_ref(),
+        base,
     )?;
-    if !schedule.prefix.is_empty() {
+    if schedule.prefix.is_some() {
         barrier(encoder, samples);
     }
     encode_overlap_list(
-        device,
         encoder,
         pipeline,
         samples,
         status,
-        status_offset,
-        &schedule.filters,
+        schedule.filters.as_ref(),
+        base,
     )?;
-    if !schedule.filters.is_empty() && !schedule.suffix.is_empty() {
+    if schedule.filters.is_some() && schedule.suffix.is_some() {
         barrier(encoder, samples);
     }
     encode_overlap_list(
-        device,
         encoder,
         pipeline,
         samples,
         status,
-        status_offset,
-        &schedule.suffix,
+        schedule.suffix.as_ref(),
+        base,
     )?;
     if has_work {
         barrier(encoder, samples);
@@ -615,27 +708,23 @@ fn encode_overlap_schedule_at(
 }
 
 fn encode_overlap_list(
-    device: &ProtocolObject<dyn MTLDevice>,
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     samples: BufferRef<'_>,
-    status: BufferRef<'_>,
-    status_offset: usize,
-    work: &[crate::abi::JxrOverlapWorkAbi],
+    (status, status_offset): (BufferRef<'_>, usize),
+    work: Option<&ResidentWork>,
+    base: u32,
 ) -> Result<(), MetalError> {
-    if work.is_empty() {
+    let Some(work) = work else {
         return Ok(());
-    }
-    let work_buffer = checked_shared_buffer_with_slice(device, work)?;
-    let work_count = u32::try_from(work.len()).map_err(|_| MetalError::InvalidPlan {
-        reason: "overlap work count exceeds the Metal ABI",
-    })?;
+    };
     encoder.setComputePipelineState(pipeline);
     encoder.bind_buffer(0, samples, 0)?;
-    encoder.bind_buffer(1, &work_buffer, 0)?;
+    encoder.bind_buffer(1, &work.buffer, 0)?;
     encoder.bind_buffer(2, status, status_offset)?;
-    encoder.bind_bytes(3, &work_count)?;
-    dispatch_1d_pipeline(encoder, pipeline, u64::from(work_count));
+    encoder.bind_bytes(3, &work.count)?;
+    encoder.bind_bytes(4, &base)?;
+    dispatch_1d_pipeline(encoder, pipeline, u64::from(work.count));
     Ok(())
 }
 

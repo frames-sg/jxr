@@ -6,19 +6,19 @@ use j2k_metal_support::{
 };
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLComputePipelineState,
 };
 
 use super::{
     BufferHandle, EncodedMetalSubmission, barrier, begin_encoding_on_queue, encode_output_at,
-    encode_overlap_schedule_at,
+    encode_overlap_pass,
 };
 use crate::{
     MetalDecodePlan, MetalError,
     abi::{JxrBatchDispatchAbi, JxrPlaneAbi, macroblock_abi_metadata},
     metal_types::JxrComputeEncoderExt,
-    overlap_plan::{first_overlap_schedule, second_overlap_schedule},
+    overlap_plan::OverlapPass,
     plan::{MetalCoefficientSource, MetalPlaneInput},
     runtime::MetalRuntime,
 };
@@ -30,7 +30,7 @@ struct BatchBuffers {
     low: crate::buffer_pool::PooledBuffer,
     samples: crate::buffer_pool::PooledBuffer,
     status: crate::buffer_pool::PooledBuffer,
-    outputs: Vec<BufferHandle>,
+    outputs: Vec<(BufferHandle, usize)>,
     plane_inputs: Vec<Vec<MetalPlaneInput>>,
     sample_bases: Vec<u32>,
 }
@@ -49,7 +49,7 @@ pub(super) fn try_encode(
     runtime: &MetalRuntime,
     queue: &ProtocolObject<dyn MTLCommandQueue>,
     plans: &[MetalDecodePlan],
-    outputs: Option<&[BufferHandle]>,
+    outputs: Option<&[(BufferHandle, usize)]>,
 ) -> Result<Option<Vec<EncodedMetalSubmission>>, MetalError> {
     if plans.len() < 2 || !compatible(plans)? {
         return Ok(None);
@@ -62,6 +62,7 @@ pub(super) fn try_encode(
     encode_highpass_transforms(runtime, &encoder, plans, &buffers)?;
     encode_second_overlaps(runtime, &encoder, plans, &buffers)?;
     for (index, plan) in plans.iter().enumerate() {
+        let (output, output_offset) = &buffers.outputs[index];
         encode_output_at(
             runtime,
             &encoder,
@@ -69,8 +70,8 @@ pub(super) fn try_encode(
             buffers.samples.buffer(),
             buffers.status.buffer(),
             index * core::mem::size_of::<u32>(),
-            &buffers.outputs[index],
-            0,
+            output,
+            *output_offset,
             buffers.sample_bases[index],
         )?;
     }
@@ -119,7 +120,7 @@ fn compatible(plans: &[MetalDecodePlan]) -> Result<bool, MetalError> {
 fn build_buffers(
     runtime: &MetalRuntime,
     plans: &[MetalDecodePlan],
-    supplied_outputs: Option<&[BufferHandle]>,
+    supplied_outputs: Option<&[(BufferHandle, usize)]>,
 ) -> Result<BatchBuffers, MetalError> {
     let device = runtime.queue.device();
     let descriptors = build_descriptors(&device, plans)?;
@@ -143,11 +144,8 @@ fn build_buffers(
         .enumerate()
         .map(|(index, plan)| {
             supplied_outputs.map_or_else(
-                || {
-                    checked_private_buffer(&device, plan.output().byte_len)
-                        .map_err(MetalError::from)
-                },
-                |outputs| Ok(outputs[index].clone()),
+                || Ok((checked_private_buffer(&device, plan.output().byte_len)?, 0)),
+                |outputs| validated_output(&outputs[index], plan),
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -162,6 +160,21 @@ fn build_buffers(
         plane_inputs: descriptors.plane_inputs,
         sample_bases: descriptors.sample_bases,
     })
+}
+
+fn validated_output(
+    (output, offset): &(BufferHandle, usize),
+    plan: &MetalDecodePlan,
+) -> Result<(BufferHandle, usize), MetalError> {
+    if offset
+        .checked_add(plan.output().byte_len)
+        .is_none_or(|end| end > output.length())
+    {
+        return Err(MetalError::InvalidDestination {
+            reason: "external output allocation is too small",
+        });
+    }
+    Ok((output.clone(), *offset))
 }
 
 fn build_descriptors(
@@ -294,26 +307,38 @@ fn encode_first_overlaps(
     plans: &[MetalDecodePlan],
     buffers: &BatchBuffers,
 ) -> Result<(), MetalError> {
+    encode_overlaps(runtime, encoder, plans, buffers, OverlapPass::First)
+}
+
+fn encode_overlaps(
+    runtime: &MetalRuntime,
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    plans: &[MetalDecodePlan],
+    buffers: &BatchBuffers,
+    pass: OverlapPass,
+) -> Result<(), MetalError> {
+    let samples = match pass {
+        OverlapPass::First => buffers.low.buffer(),
+        OverlapPass::Second => buffers.samples.buffer(),
+    };
     for (image, plan) in plans.iter().enumerate() {
         let input = plan.reconstruction()?;
-        if input.overlap != jxr_core::OverlapMode::Two {
+        let enabled = match pass {
+            OverlapPass::First => input.overlap == jxr_core::OverlapMode::Two,
+            OverlapPass::Second => input.overlap != jxr_core::OverlapMode::None,
+        };
+        if !enabled {
             continue;
         }
         for &plane in &buffers.plane_inputs[image] {
-            let schedule = first_overlap_schedule(
-                plane,
-                input.hard_tiles,
-                &input.tile_column_widths,
-                &input.tile_row_heights,
-            )?;
-            encode_overlap_schedule_at(
-                &runtime.queue.device(),
+            encode_overlap_pass(
+                runtime,
                 encoder,
-                &runtime.overlap_first,
-                buffers.low.buffer(),
-                buffers.status.buffer(),
-                image * core::mem::size_of::<u32>(),
-                &schedule,
+                pass,
+                plane,
+                input,
+                samples,
+                (buffers.status.buffer(), image * core::mem::size_of::<u32>()),
             )?;
         }
     }
@@ -363,30 +388,7 @@ fn encode_second_overlaps(
     plans: &[MetalDecodePlan],
     buffers: &BatchBuffers,
 ) -> Result<(), MetalError> {
-    for (image, plan) in plans.iter().enumerate() {
-        let input = plan.reconstruction()?;
-        if input.overlap == jxr_core::OverlapMode::None {
-            continue;
-        }
-        for &plane in &buffers.plane_inputs[image] {
-            let schedule = second_overlap_schedule(
-                plane,
-                input.hard_tiles,
-                &input.tile_column_widths,
-                &input.tile_row_heights,
-            )?;
-            encode_overlap_schedule_at(
-                &runtime.queue.device(),
-                encoder,
-                &runtime.overlap_second,
-                buffers.samples.buffer(),
-                buffers.status.buffer(),
-                image * core::mem::size_of::<u32>(),
-                &schedule,
-            )?;
-        }
-    }
-    Ok(())
+    encode_overlaps(runtime, encoder, plans, buffers, OverlapPass::Second)
 }
 
 fn finish_batch(
@@ -404,7 +406,7 @@ fn finish_batch(
         .iter()
         .zip(buffers.outputs.drain(..))
         .enumerate()
-        .map(|(index, (plan, output))| EncodedMetalSubmission {
+        .map(|(index, (plan, (output, _)))| EncodedMetalSubmission {
             command: command.clone(),
             output,
             status: status.clone(),

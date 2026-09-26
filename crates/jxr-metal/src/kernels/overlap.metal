@@ -164,13 +164,16 @@ inline void jxr_apply_overlap(device int *samples, JxrOverlapWorkAbi work,
     }
 }
 
+// Work items are relative to one plane; `base` selects that plane's first
+// sample so cached schedules serve every image with the same geometry.
 kernel void jxr_first_overlap(
     device int *samples [[buffer(0)]],
     device const JxrOverlapWorkAbi *work [[buffer(1)]],
     device atomic_uint *status [[buffer(2)]],
     constant uint &work_count [[buffer(3)]],
+    constant uint &base [[buffer(4)]],
     uint gid [[thread_position_in_grid]]) {
-    if (gid < work_count && !jxr_failed(status)) jxr_apply_overlap(samples, work[gid], status);
+    if (gid < work_count && !jxr_failed(status)) jxr_apply_overlap(samples + base, work[gid], status);
 }
 
 kernel void jxr_second_overlap(
@@ -178,6 +181,7 @@ kernel void jxr_second_overlap(
     device const JxrOverlapWorkAbi *work [[buffer(1)]],
     device atomic_uint *status [[buffer(2)]],
     constant uint &work_count [[buffer(3)]],
+    constant uint &base [[buffer(4)]],
     uint gid [[thread_position_in_grid]]) {
-    if (gid < work_count && !jxr_failed(status)) jxr_apply_overlap(samples, work[gid], status);
+    if (gid < work_count && !jxr_failed(status)) jxr_apply_overlap(samples + base, work[gid], status);
 }
