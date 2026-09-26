@@ -54,5 +54,30 @@ Publish the changed packages and their exact-version dependents in this order:
 7. `jxr-mpsgraph` 0.1.1
 
 `jxr-math` remains at the already-published 0.1.0 version. The graph adapter
-uses the published `j2k-mpsgraph-support` 0.11.1 registry dependency, and
-`j2k-core` plus `j2k-metal-support` are pinned to the matching 0.11.1 release.
+uses the published `j2k-mpsgraph-support` 0.11.0 registry dependency. Its source
+matches the previous Git pin. The other J2K dependencies remain at 0.10.0;
+the graph owner does not depend on them.
+
+## 0.2.0 release
+
+This release moves the J2K dependencies to the 0.11 line, `jxr-native` to
+`fearless_simd` 1.0.0, and `jxr-cuda` to `cudarc` 0.19.10. `jxr-core` re-exports
+`j2k_core::{BackendKind, BackendRequest, Rect}`, so the J2K upgrade changes public
+types and every published crate that exposes them moves to 0.2.0. The
+`fearless_simd` upgrade is private to `jxr-native`.
+
+Before publishing, pin `j2k-core`, `j2k-metal-support`, and `j2k-mpsgraph-support`
+to the J2K release that downstream crates use. J2K crates pin each other exactly,
+so one dependency graph cannot hold two J2K 0.11 patch releases.
+
+Publish in this order:
+
+1. `jxr-core` 0.2.0
+2. `jxr-native` 0.2.0
+3. `jxr-metal` 0.2.0
+4. `jxr-cuda` 0.2.0
+5. `jxr` 0.2.0
+6. `jxr-image` 0.2.0
+7. `jxr-mpsgraph` 0.2.0
+
+`jxr-math` remains at the already-published 0.1.0 version.
