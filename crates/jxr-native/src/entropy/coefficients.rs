@@ -245,7 +245,7 @@ fn decode_abs_level(
     let index = vlc::decode(
         reader,
         "ABS_LEVEL_INDEX",
-        vlc::ABS_LEVEL[state.table_index()],
+        &vlc::ABS_LEVEL[state.table_index()],
     )?;
     observe_abs_level(state, index);
     if index < 6 {
@@ -279,7 +279,11 @@ fn decode_first_index(
     reader: &mut PacketBitReader<'_>,
     state: &mut AdaptiveVlc,
 ) -> Result<u8, EntropyError> {
-    let symbol = vlc::decode(reader, "FIRST_INDEX", vlc::FIRST_INDEX[state.table_index()])?;
+    let symbol = vlc::decode(
+        reader,
+        "FIRST_INDEX",
+        &vlc::FIRST_INDEX[state.table_index()],
+    )?;
     observe_first_index(state, symbol);
     Ok(symbol)
 }
@@ -291,11 +295,11 @@ fn decode_index(
 ) -> Result<u8, EntropyError> {
     match location.cmp(&15) {
         core::cmp::Ordering::Less => {
-            let symbol = vlc::decode(reader, "INDEX_A", vlc::INDEX_A[state.table_index()])?;
+            let symbol = vlc::decode(reader, "INDEX_A", &vlc::INDEX_A[state.table_index()])?;
             observe_index(state, symbol);
             Ok(symbol)
         }
-        core::cmp::Ordering::Equal => vlc::decode(reader, "INDEX_B", vlc::INDEX_B),
+        core::cmp::Ordering::Equal => vlc::decode(reader, "INDEX_B", &vlc::INDEX_B),
         core::cmp::Ordering::Greater => Ok(u8::from(reader.read_bit()?)),
     }
 }
@@ -310,14 +314,14 @@ fn decode_run(reader: &mut PacketBitReader<'_>, max_run: u8) -> Result<u8, Entro
     if max_run < 5 {
         return match max_run {
             1 => Ok(1),
-            2 => vlc::decode(reader, "RUN_VALUE", vlc::RUN_VALUE_2),
-            3 => vlc::decode(reader, "RUN_VALUE", vlc::RUN_VALUE_3),
-            4 => vlc::decode(reader, "RUN_VALUE", vlc::RUN_VALUE_4),
+            2 => vlc::decode(reader, "RUN_VALUE", &vlc::RUN_VALUE_2),
+            3 => vlc::decode(reader, "RUN_VALUE", &vlc::RUN_VALUE_3),
+            4 => vlc::decode(reader, "RUN_VALUE", &vlc::RUN_VALUE_4),
             _ => unreachable!(),
         };
     }
 
-    let run_index = vlc::decode(reader, "RUN_INDEX", vlc::RUN_INDEX)?;
+    let run_index = vlc::decode(reader, "RUN_INDEX", &vlc::RUN_INDEX)?;
     let table_index = i16::from(run_index) + 5 * i16::from(RUN_BIN[usize::from(max_run)]);
     let table_index = usize::try_from(table_index).map_err(|_| EntropyError::InvalidParameter {
         parameter: "run table index",
