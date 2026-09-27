@@ -2,11 +2,11 @@
 
 use jxr_core::ChromaSampling;
 
-use crate::entropy::PacketBitReader;
+use crate::entropy::{PacketBitReader, PrefixTable, decode_prefix};
 
 use super::TileDecodeError;
 
-const NUM_CODES: [[(u16, u8, u8); 5]; 2] = [
+const NUM_CODE_LISTS: [[(u16, u8, u8); 5]; 2] = [
     [
         (0b1, 1, 0),
         (0b01, 2, 1),
@@ -22,7 +22,7 @@ const NUM_CODES: [[(u16, u8, u8); 5]; 2] = [
         (0b011, 3, 4),
     ],
 ];
-const NUM_CODES_YUV: [[(u16, u8, u8); 9]; 2] = [
+const NUM_CODE_LISTS_YUV: [[(u16, u8, u8); 9]; 2] = [
     [
         (0b010, 3, 0),
         (0b00000, 5, 1),
@@ -46,10 +46,10 @@ const NUM_CODES_YUV: [[(u16, u8, u8); 9]; 2] = [
         (0b000_0001, 7, 8),
     ],
 ];
-const CHROMA_CODES: [(u16, u8, u8); 3] = [(0b1, 1, 0), (0b01, 2, 1), (0b00, 2, 2)];
-const CHROMA_BLOCK_CODES: [(u16, u8, u8); 4] =
+const CHROMA_CODE_LIST: [(u16, u8, u8); 3] = [(0b1, 1, 0), (0b01, 2, 1), (0b00, 2, 2)];
+const CHROMA_BLOCK_CODE_LIST: [(u16, u8, u8); 4] =
     [(0b1, 1, 0), (0b01, 2, 1), (0b000, 3, 2), (0b001, 3, 3)];
-const REF_TWO: [(u16, u8, u8); 6] = [
+const REF_TWO_CODE_LIST: [(u16, u8, u8); 6] = [
     (0b00, 2, 3),
     (0b01, 2, 5),
     (0b100, 3, 6),
@@ -57,6 +57,17 @@ const REF_TWO: [(u16, u8, u8); 6] = [
     (0b110, 3, 10),
     (0b111, 3, 12),
 ];
+static NUM_CODES: [PrefixTable; 2] = [
+    PrefixTable::new(&NUM_CODE_LISTS[0]),
+    PrefixTable::new(&NUM_CODE_LISTS[1]),
+];
+static NUM_CODES_YUV: [PrefixTable; 2] = [
+    PrefixTable::new(&NUM_CODE_LISTS_YUV[0]),
+    PrefixTable::new(&NUM_CODE_LISTS_YUV[1]),
+];
+static CHROMA_CODES: PrefixTable = PrefixTable::new(&CHROMA_CODE_LIST);
+static CHROMA_BLOCK_CODES: PrefixTable = PrefixTable::new(&CHROMA_BLOCK_CODE_LIST);
+static REF_TWO: PrefixTable = PrefixTable::new(&REF_TWO_CODE_LIST);
 const DELTA: [i8; 5] = [0, -1, 0, 1, 1];
 const DELTA_YUV: [i8; 9] = [2, 2, 1, 1, -1, -2, -2, -2, -3];
 const BLOCK_OUTPUT: [u16; 16] = [0, 15, 3, 12, 1, 2, 4, 8, 5, 6, 9, 10, 7, 11, 13, 14];
@@ -364,33 +375,31 @@ fn refine(reader: &mut PacketBitReader<'_>, count: u8) -> Result<u16, TileDecode
     }
 }
 
-fn read_code<const N: usize>(
+fn read_code(
     reader: &mut PacketBitReader<'_>,
-    table: &[(u16, u8, u8); N],
+    table: &PrefixTable,
     syntax: &'static str,
 ) -> Result<u8, TileDecodeError> {
-    let start = reader.bit_position();
-    let max_length = table.iter().map(|entry| entry.1).max().unwrap_or(0);
-    let mut bits = 0_u16;
-    for length in 1..=max_length {
-        bits = (bits << 1) | u16::from(reader.read_bit()?);
-        if let Some(entry) = table
-            .iter()
-            .find(|entry| entry.1 == length && entry.0 == bits)
-        {
-            return Ok(entry.2);
-        }
-    }
-    Err(crate::entropy::EntropyError::InvalidVlc {
-        syntax,
-        bit_position: start,
-    }
-    .into())
+    Ok(decode_prefix(reader, syntax, table)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cbphp_prefix_tables_match_serial_search() {
+        use crate::entropy::assert_matches_serial;
+        for codes in &NUM_CODE_LISTS {
+            assert_matches_serial("NUM_CBPHP", codes);
+        }
+        for codes in &NUM_CODE_LISTS_YUV {
+            assert_matches_serial("NUM_BLKCBPHP", codes);
+        }
+        assert_matches_serial("CHR_CBPHP", &CHROMA_CODE_LIST);
+        assert_matches_serial("NUM_CH_BLK", &CHROMA_BLOCK_CODE_LIST);
+        assert_matches_serial("REF_CBPHP1", &REF_TWO_CODE_LIST);
+    }
 
     #[test]
     fn initial_zero_residual_predicts_normative_checker_pattern() {

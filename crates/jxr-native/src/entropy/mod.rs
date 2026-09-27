@@ -20,3 +20,6 @@ pub use refinement::{
     decode_flex, decode_flex_block, decode_lp_refinement, decode_lp_refinement_at,
 };
 pub use scan::{AdaptiveHpScan, AdaptiveLpScan, HpScanDirection};
+#[cfg(test)]
+pub(crate) use vlc::tests::assert_matches_serial;
+pub(crate) use vlc::{PrefixTable, decode as decode_prefix};
