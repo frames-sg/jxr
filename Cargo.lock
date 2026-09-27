@@ -111,18 +111,18 @@ dependencies = [
 
 [[package]]
 name = "j2k-core"
-version = "0.11.1"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2974b4fc5d4123c1da4896fa105faff0fb85cabb3186b340e05f26cd5ac083a"
+checksum = "6fd9e94fb0e8c153c3429c1b612715a7c6c99ee2b03c9171daca9f50c9e1be43"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "j2k-metal-support"
-version = "0.11.1"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b9e59583abcb1124715684186b2f594a02a44ec6f6cf987e2da6360ddabbf40"
+checksum = "4ec44f782f04069159ea95142604d9133f8784aa4e2a1ea6705bb837db79a96f"
 dependencies = [
  "j2k-core",
  "log",
@@ -133,9 +133,9 @@ dependencies = [
 
 [[package]]
 name = "j2k-mpsgraph-support"
-version = "0.11.1"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac09b69302f098e07600c1417b1b20d9ddabb55928b244752a71942746b6bb07"
+checksum = "e345c62ca42cae3f7dee496ab7177fa14f59f51b8cd4031a700a6fe474e2ac9a"
 dependencies = [
  "block2",
  "objc2",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "jxr"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "jxr-core",
  "jxr-cuda",
@@ -158,14 +158,14 @@ dependencies = [
 
 [[package]]
 name = "jxr-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "j2k-core",
 ]
 
 [[package]]
 name = "jxr-cuda"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "cudarc",
  "jxr-core",
@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-image"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "image",
  "jxr",
@@ -188,7 +188,7 @@ version = "0.1.0"
 
 [[package]]
 name = "jxr-metal"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "j2k-core",
  "j2k-metal-support",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-mpsgraph"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "j2k-metal-support",
  "j2k-mpsgraph-support",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-native"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "fearless_simd",
  "jxr-core",

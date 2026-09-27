@@ -11,7 +11,7 @@ use super::{
         pack_rgb101010_into, pack_rgbe, pack_rgbe_into,
     },
     premultiply::{premultiply_output, premultiply_output_mut},
-    scaling::{float16_bits, float32_bits, scale_integer_component},
+    scaling::{ChannelScale, float16_bits, float32_bits, scale_integer_component},
     simd_pack::{append_u8, pack_u8_into},
     validate::validate_request,
 };
@@ -158,8 +158,9 @@ fn fill_direct_destination(
             Ok(false)
         }
         DecodedSamplesMut::I32(output) => {
+            let scaling = context.channel_scales();
             fill_ordered(context, output, |sample, component, alpha| {
-                context.scale_integer(sample, component, alpha)
+                scaling.apply(sample, component, alpha)
             })?;
             Ok(false)
         }
@@ -196,15 +197,17 @@ fn fill_u16(context: FormatContext<'_>, output: &mut [u16]) -> Result<(), Output
     } else {
         65_535
     };
+    let scaling = context.channel_scales();
     fill_ordered(context, output, |sample, component, alpha| {
-        let scaled = context.scale_integer(sample, component, alpha)?;
+        let scaled = scaling.apply(sample, component, alpha)?;
         Ok(u16::try_from(clamp_sample(scaled, 0, maximum)).expect("sample is clipped to u16"))
     })
 }
 
 fn fill_i16(context: FormatContext<'_>, output: &mut [i16]) -> Result<(), OutputFormatError> {
+    let scaling = context.channel_scales();
     fill_ordered(context, output, |sample, component, alpha| {
-        let scaled = context.scale_integer(sample, component, alpha)?;
+        let scaled = scaling.apply(sample, component, alpha)?;
         Ok(i16::try_from(clamp_sample(scaled, -32_768, 32_767)).expect("sample is clipped to i16"))
     })
 }
@@ -350,8 +353,9 @@ pub(crate) fn format_components_u8_into_with_cpu(
         );
     }
     let mut index = 0;
+    let scaling = context.channel_scales();
     for_each_ordered(context, |sample, component, alpha| {
-        let scaled = context.scale_integer(sample, component, alpha)?;
+        let scaled = scaling.apply(sample, component, alpha)?;
         output[index] =
             u8::try_from(clamp_sample(scaled, 0, 255)).expect("sample is clipped to u8");
         index += 1;
@@ -386,14 +390,9 @@ impl FormatContext<'_> {
             })
     }
 
-    fn scale_integer(
-        self,
-        sample: i32,
-        component: usize,
-        alpha: bool,
-    ) -> Result<i32, OutputFormatError> {
+    fn channel_scale(self, component: usize, alpha: bool) -> ChannelScale {
         if self.is_padding(component, alpha) {
-            return Ok(0);
+            return ChannelScale::Padding;
         }
         let (color, depth, scaled) = if alpha {
             let format = self.alpha_format();
@@ -405,7 +404,7 @@ impl FormatContext<'_> {
                 self.request.scaled,
             )
         };
-        scale_integer_component(sample, component, color, depth, scaled)
+        ChannelScale::resolve(component, color, depth, scaled)
     }
 
     fn is_padding(self, component: usize, alpha: bool) -> bool {
@@ -428,66 +427,164 @@ impl FormatContext<'_> {
         let source_y = usize::try_from(self.request.crop.y)
             .map_err(|_| OutputFormatError::arithmetic("converting crop y"))?
             + y;
+        self.color_components_at(source_x, source_y, self.color_shape())
+    }
+
+    /// Visits every cropped pixel's converted color components in raster order.
+    pub(super) fn for_each_color(
+        self,
+        mut visit: impl FnMut([i32; 4]) -> Result<(), OutputFormatError>,
+    ) -> Result<(), OutputFormatError> {
+        if self.width == 0 || self.height == 0 {
+            return Ok(());
+        }
+        let crop_x = usize::try_from(self.request.crop.x)
+            .map_err(|_| OutputFormatError::arithmetic("converting crop x"))?;
+        let crop_y = usize::try_from(self.request.crop.y)
+            .map_err(|_| OutputFormatError::arithmetic("converting crop y"))?;
+        let shape = self.color_shape();
+        for source_y in crop_y..crop_y + self.height {
+            for source_x in crop_x..crop_x + self.width {
+                visit(self.color_components_at(source_x, source_y, shape)?)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Converts one pixel at a crop-adjusted source position.
+    #[inline]
+    fn color_components_at(
+        self,
+        source_x: usize,
+        source_y: usize,
+        shape: ColorShape,
+    ) -> Result<[i32; 4], OutputFormatError> {
         let mut input = [0; 4];
         for (component, plane) in self.planes.iter().take(4).enumerate() {
             input[component] = plane.sample(source_x, source_y);
         }
-        if is_direct(self.request.internal_color, self.request.output_color) {
+        if shape.direct {
             return Ok(input);
         }
         convert(
             self.request.internal_color,
             self.request.output_color,
             &input,
-            matches!(
-                self.request.bit_depth,
-                OutputBitDepth::Rgb555 | OutputBitDepth::Rgb565 | OutputBitDepth::Rgb101010
-            ),
+            shape.packed_rgb,
             self.request.red_blue_not_swapped,
         )
     }
 
-    fn ordered_components(
-        self,
-        x: usize,
-        y: usize,
-    ) -> Result<([i32; 5], usize), OutputFormatError> {
-        let converted = self.color_components(x, y)?;
+    /// Resolves the per-image color-conversion decisions.
+    fn color_shape(self) -> ColorShape {
+        ColorShape {
+            direct: is_direct(self.request.internal_color, self.request.output_color),
+            packed_rgb: matches!(
+                self.request.bit_depth,
+                OutputBitDepth::Rgb555 | OutputBitDepth::Rgb565 | OutputBitDepth::Rgb101010
+            ),
+        }
+    }
+
+    /// Resolves the per-image layout decisions made for every ordered pixel.
+    fn pixel_shape(self) -> PixelShape {
         let layout = layout(self.request.pixel_format);
-        let mut ordered = [0; 5];
-        let primary = match layout {
-            ChannelLayout::Bgr | ChannelLayout::Bgrx | ChannelLayout::Bgra => {
-                [converted[2], converted[1], converted[0], 0]
-            }
-            _ => converted,
-        };
-        let primary_count = match layout {
-            ChannelLayout::Luma => 1,
-            ChannelLayout::Yuv(_) | ChannelLayout::Rgb | ChannelLayout::Bgr => 3,
-            ChannelLayout::Rgbx
-            | ChannelLayout::Bgrx
-            | ChannelLayout::Cmyk
-            | ChannelLayout::Cmyka => 4,
-            ChannelLayout::NComponent(_) | ChannelLayout::NComponentAlpha(_) => {
-                self.component_count
-            }
-            ChannelLayout::LumaAlpha
-            | ChannelLayout::Yuva(_)
-            | ChannelLayout::Rgba
-            | ChannelLayout::Bgra => layout.channel_count() as usize - 1,
-        };
-        ordered[..primary_count].copy_from_slice(&primary[..primary_count]);
-        if let Some(alpha) = self.alpha {
-            let source_x = usize::try_from(self.request.crop.x)
-                .map_err(|_| OutputFormatError::arithmetic("converting alpha crop x"))?
-                + x;
-            let source_y = usize::try_from(self.request.crop.y)
-                .map_err(|_| OutputFormatError::arithmetic("converting alpha crop y"))?
-                + y;
-            ordered[primary_count] = alpha.sample(source_x, source_y);
-            Ok((ordered, primary_count + 1))
+        PixelShape {
+            color: self.color_shape(),
+            reverse_primaries: matches!(
+                layout,
+                ChannelLayout::Bgr | ChannelLayout::Bgrx | ChannelLayout::Bgra
+            ),
+            primary_count: match layout {
+                ChannelLayout::Luma => 1,
+                ChannelLayout::Yuv(_) | ChannelLayout::Rgb | ChannelLayout::Bgr => 3,
+                ChannelLayout::Rgbx
+                | ChannelLayout::Bgrx
+                | ChannelLayout::Cmyk
+                | ChannelLayout::Cmyka => 4,
+                ChannelLayout::NComponent(_) | ChannelLayout::NComponentAlpha(_) => {
+                    self.component_count
+                }
+                ChannelLayout::LumaAlpha
+                | ChannelLayout::Yuva(_)
+                | ChannelLayout::Rgba
+                | ChannelLayout::Bgra => layout.channel_count() as usize - 1,
+            },
+        }
+    }
+
+    #[inline]
+    fn ordered_components_at(
+        self,
+        source_x: usize,
+        source_y: usize,
+        shape: PixelShape,
+    ) -> Result<([i32; 5], usize), OutputFormatError> {
+        let converted = self.color_components_at(source_x, source_y, shape.color)?;
+        let primary = if shape.reverse_primaries {
+            [converted[2], converted[1], converted[0], 0]
         } else {
-            Ok((ordered, primary_count))
+            converted
+        };
+        // Only the first `primary_count` entries (plus alpha) are consumed.
+        let mut ordered = [primary[0], primary[1], primary[2], primary[3], 0];
+        match self.alpha {
+            Some(alpha) => {
+                ordered[shape.primary_count] = alpha.sample(source_x, source_y);
+                Ok((ordered, shape.primary_count + 1))
+            }
+            None => Ok((ordered, shape.primary_count)),
+        }
+    }
+}
+
+impl<'a> FormatContext<'a> {
+    /// Resolves every channel's integer scaling once per image.
+    fn channel_scales(self) -> ChannelScales<'a> {
+        // Ordered pixels carry at most four primaries plus alpha; N-component
+        // output carries one entry per plane plus alpha.
+        let count = self.planes.len().max(4) + 1;
+        ChannelScales {
+            primary: (0..count)
+                .map(|component| self.channel_scale(component, false))
+                .collect(),
+            alpha: (0..count)
+                .map(|component| self.channel_scale(component, true))
+                .collect(),
+            context: self,
+        }
+    }
+}
+
+/// Color-conversion decisions shared by every pixel of one output.
+#[derive(Clone, Copy)]
+struct ColorShape {
+    direct: bool,
+    packed_rgb: bool,
+}
+
+/// Layout decisions shared by every pixel of one ordered output.
+#[derive(Clone, Copy)]
+struct PixelShape {
+    color: ColorShape,
+    reverse_primaries: bool,
+    primary_count: usize,
+}
+
+/// Per-image channel scaling resolved before the pixel loop.
+struct ChannelScales<'a> {
+    primary: Vec<ChannelScale>,
+    alpha: Vec<ChannelScale>,
+    context: FormatContext<'a>,
+}
+
+impl ChannelScales<'_> {
+    #[inline]
+    fn apply(&self, sample: i32, component: usize, alpha: bool) -> Result<i32, OutputFormatError> {
+        let table = if alpha { &self.alpha } else { &self.primary };
+        match table.get(component) {
+            Some(scale) => scale.apply(sample),
+            None => self.context.channel_scale(component, alpha).apply(sample),
         }
     }
 }
@@ -549,8 +646,9 @@ fn pack_u8(
         return Ok((DecodedSamples::U8(output), used_simd));
     }
     let mut output = Vec::with_capacity(elements);
+    let scaling = context.channel_scales();
     for_each_ordered(context, |sample, component, alpha| {
-        let scaled = context.scale_integer(sample, component, alpha)?;
+        let scaled = scaling.apply(sample, component, alpha)?;
         output.push(u8::try_from(clamp_sample(scaled, 0, 255)).expect("sample is clipped to u8"));
         Ok(())
     })?;
@@ -562,13 +660,14 @@ fn pack_u16(
     elements: usize,
 ) -> Result<DecodedSamples, OutputFormatError> {
     let mut output = Vec::with_capacity(elements);
+    let scaling = context.channel_scales();
+    let maximum = if matches!(context.request.bit_depth, OutputBitDepth::U10) {
+        1_023
+    } else {
+        65_535
+    };
     for_each_ordered(context, |sample, component, alpha| {
-        let scaled = context.scale_integer(sample, component, alpha)?;
-        let maximum = if matches!(context.request.bit_depth, OutputBitDepth::U10) {
-            1_023
-        } else {
-            65_535
-        };
+        let scaled = scaling.apply(sample, component, alpha)?;
         output.push(
             u16::try_from(clamp_sample(scaled, 0, maximum)).expect("sample is clipped to u16"),
         );
@@ -582,8 +681,9 @@ fn pack_i16(
     elements: usize,
 ) -> Result<DecodedSamples, OutputFormatError> {
     let mut output = Vec::with_capacity(elements);
+    let scaling = context.channel_scales();
     for_each_ordered(context, |sample, component, alpha| {
-        let scaled = context.scale_integer(sample, component, alpha)?;
+        let scaled = scaling.apply(sample, component, alpha)?;
         output.push(
             i16::try_from(clamp_sample(scaled, -32_768, 32_767)).expect("sample is clipped to i16"),
         );
@@ -597,8 +697,9 @@ fn pack_i32(
     elements: usize,
 ) -> Result<DecodedSamples, OutputFormatError> {
     let mut output = Vec::with_capacity(elements);
+    let scaling = context.channel_scales();
     for_each_ordered(context, |sample, component, alpha| {
-        output.push(context.scale_integer(sample, component, alpha)?);
+        output.push(scaling.apply(sample, component, alpha)?);
         Ok(())
     })?;
     Ok(DecodedSamples::I32(output))
@@ -667,30 +768,37 @@ fn for_each_ordered(
     context: FormatContext<'_>,
     mut format: impl FnMut(i32, usize, bool) -> Result<(), OutputFormatError>,
 ) -> Result<(), OutputFormatError> {
-    for y in 0..context.height {
-        for x in 0..context.width {
-            if matches!(context.request.output_color, ColorFormat::NComponent(_)) {
-                let source_x = usize::try_from(context.request.crop.x)
-                    .map_err(|_| OutputFormatError::arithmetic("converting N-component crop x"))?
-                    + x;
-                let source_y = usize::try_from(context.request.crop.y)
-                    .map_err(|_| OutputFormatError::arithmetic("converting N-component crop y"))?
-                    + y;
+    if context.width == 0 || context.height == 0 {
+        return Ok(());
+    }
+    if matches!(context.request.output_color, ColorFormat::NComponent(_)) {
+        let crop_x = usize::try_from(context.request.crop.x)
+            .map_err(|_| OutputFormatError::arithmetic("converting N-component crop x"))?;
+        let crop_y = usize::try_from(context.request.crop.y)
+            .map_err(|_| OutputFormatError::arithmetic("converting N-component crop y"))?;
+        for source_y in crop_y..crop_y + context.height {
+            for source_x in crop_x..crop_x + context.width {
                 for (component, plane) in context.planes.iter().enumerate() {
                     format(plane.sample(source_x, source_y), component, false)?;
                 }
                 if let Some(alpha) = context.alpha {
                     format(alpha.sample(source_x, source_y), context.planes.len(), true)?;
                 }
-                continue;
             }
-            let (samples, count) = context.ordered_components(x, y)?;
+        }
+        return Ok(());
+    }
+    let crop_x = usize::try_from(context.request.crop.x)
+        .map_err(|_| OutputFormatError::arithmetic("converting crop x"))?;
+    let crop_y = usize::try_from(context.request.crop.y)
+        .map_err(|_| OutputFormatError::arithmetic("converting crop y"))?;
+    let shape = context.pixel_shape();
+    let has_alpha = context.alpha.is_some();
+    for source_y in crop_y..crop_y + context.height {
+        for source_x in crop_x..crop_x + context.width {
+            let (samples, count) = context.ordered_components_at(source_x, source_y, shape)?;
             for (component, &sample) in samples[..count].iter().enumerate() {
-                format(
-                    sample,
-                    component,
-                    context.alpha.is_some() && component + 1 == count,
-                )?;
+                format(sample, component, has_alpha && component + 1 == count)?;
             }
         }
     }

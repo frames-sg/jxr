@@ -122,6 +122,12 @@ impl JxrPlaneAbi {
         let u32_value = |value: usize, reason| {
             u32::try_from(value).map_err(|_| MetalError::InvalidPlan { reason })
         };
+        // The HP kernel stores each 4x4 block row as one aligned `int4`.
+        if !plane.sample_offset.is_multiple_of(4) || !plane.sample_width.is_multiple_of(4) {
+            return Err(MetalError::InvalidPlan {
+                reason: "sample plane is not aligned for four-sample block rows",
+            });
+        }
         Ok(Self {
             macroblock_offset: u32_value(
                 plane.macroblock_offset,

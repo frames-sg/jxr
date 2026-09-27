@@ -6,6 +6,9 @@ use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLResource};
 
 use crate::MetalError;
 
+/// Largest descriptor payload passed inline; Metal recommends `setBytes` below 4 KiB.
+pub(crate) const SET_BYTES_LIMIT: usize = 4096;
+
 pub(crate) trait JxrComputeEncoderExt {
     fn bind_buffer(
         &self,
@@ -15,6 +18,9 @@ pub(crate) trait JxrComputeEncoderExt {
     ) -> Result<(), MetalError>;
 
     fn bind_bytes<T: GpuAbi>(&self, index: usize, value: &T) -> Result<(), MetalError>;
+
+    /// Copies a small descriptor array into the encoder with `setBytes`.
+    fn bind_slice_bytes<T: GpuAbi>(&self, index: usize, values: &[T]) -> Result<(), MetalError>;
 
     fn memory_barrier(&self, buffers: &[&ProtocolObject<dyn MTLBuffer>]);
 }
@@ -54,6 +60,26 @@ impl JxrComputeEncoderExt for ProtocolObject<dyn MTLComputeCommandEncoder> {
         // SAFETY: `GpuAbi` proves that every byte is initialized and has the
         // shader-visible layout. Metal copies `setBytes` data during encoding,
         // so the borrowed value need not outlive this call.
+        unsafe { self.setBytes_length_atIndex(pointer, bytes.len(), index) };
+        Ok(())
+    }
+
+    fn bind_slice_bytes<T: GpuAbi>(&self, index: usize, values: &[T]) -> Result<(), MetalError> {
+        if index >= 31 {
+            return Err(MetalError::InvalidPlan {
+                reason: "Metal byte binding index exceeds the compute table",
+            });
+        }
+        let bytes = T::slice_as_bytes(values);
+        if bytes.is_empty() || bytes.len() > SET_BYTES_LIMIT {
+            return Err(MetalError::InvalidPlan {
+                reason: "Metal inline descriptor bytes must be non-empty and at most 4 KiB",
+            });
+        }
+        let pointer = NonNull::from(bytes).cast::<c_void>();
+        // SAFETY: `GpuAbi` proves every byte is initialized with the shader
+        // layout, the non-empty length is checked, and Metal copies the bytes
+        // during encoding so the borrow need not outlive this call.
         unsafe { self.setBytes_length_atIndex(pointer, bytes.len(), index) };
         Ok(())
     }

@@ -7,7 +7,7 @@ use crate::{
 };
 use jxr_core::DecodedImage;
 #[cfg(target_os = "macos")]
-use jxr_core::{DecodedSamples, PlaneDescriptor, StorageKind};
+use jxr_core::{DecodeReport, DecodedSamples, PlaneDescriptor, StorageKind};
 
 #[cfg(target_os = "macos")]
 use j2k_metal_support::{
@@ -19,13 +19,15 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 #[cfg(target_os = "macos")]
 use objc2_metal::MTLGPUFamily;
 #[cfg(target_os = "macos")]
-use objc2_metal::{MTLBlitCommandEncoder, MTLCommandEncoder, MTLCommandQueue, MTLDevice};
+use objc2_metal::{
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandEncoder, MTLCommandQueue, MTLDevice,
+};
 
 #[cfg(target_os = "macos")]
 use crate::runtime::MetalRuntime;
 
 #[cfg(target_os = "macos")]
-const BATCH_SCRATCH_BUDGET: usize = 256 * 1024 * 1024;
+pub(crate) const BATCH_SCRATCH_BUDGET: usize = 256 * 1024 * 1024;
 
 /// Reusable Metal runtime session.
 #[derive(Clone)]
@@ -34,6 +36,10 @@ pub struct MetalDecoderSession {
     runtime: j2k_metal_support::MetalRuntimeSession<MetalRuntime, String>,
     #[cfg(target_os = "macos")]
     command_queue: Option<Retained<ProtocolObject<dyn MTLCommandQueue>>>,
+    /// Queue for resident-to-host copies, created on first readback and shared
+    /// by clones instead of creating a command queue per copy.
+    #[cfg(target_os = "macos")]
+    readback_queue: std::rc::Rc<std::cell::OnceCell<Retained<ProtocolObject<dyn MTLCommandQueue>>>>,
 }
 
 impl core::fmt::Debug for MetalDecoderSession {
@@ -45,6 +51,15 @@ impl core::fmt::Debug for MetalDecoderSession {
 }
 
 impl MetalDecoderSession {
+    #[cfg(target_os = "macos")]
+    fn readback_queue(&self) -> Result<&ProtocolObject<dyn MTLCommandQueue>, MetalError> {
+        if let Some(queue) = self.readback_queue.get() {
+            return Ok(queue);
+        }
+        let queue = checked_command_queue(self.runtime.device())?;
+        Ok(self.readback_queue.get_or_init(|| queue))
+    }
+
     #[cfg(target_os = "macos")]
     fn initialized_runtime(&self) -> Result<&MetalRuntime, MetalError> {
         let queue = self.command_queue.clone();
@@ -66,6 +81,7 @@ impl MetalDecoderSession {
             Ok(Self {
                 runtime,
                 command_queue: None,
+                readback_queue: std::rc::Rc::default(),
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -98,6 +114,7 @@ impl MetalDecoderSession {
         Self {
             runtime: j2k_metal_support::MetalRuntimeSession::new(device),
             command_queue: None,
+            readback_queue: std::rc::Rc::default(),
         }
     }
 
@@ -115,6 +132,7 @@ impl MetalDecoderSession {
         Ok(Self {
             runtime: j2k_metal_support::MetalRuntimeSession::new(device),
             command_queue: Some(command_queue),
+            readback_queue: std::rc::Rc::default(),
         })
     }
 
@@ -322,15 +340,7 @@ impl MetalDecoderSession {
         {
             let runtime = self.initialized_runtime()?;
             let output = checked_private_buffer(self.runtime.device(), layout.byte_len())?;
-            let mut submissions = Vec::with_capacity(plans.len());
-            let mut reports = Vec::with_capacity(plans.len());
-            for (image, plan) in plans.iter().enumerate() {
-                let offset = layout.image_offset(image)?;
-                let encoded = crate::encode::encode_into_at(runtime, plan, output.clone(), offset)?;
-                let report = plan.decode_report(false);
-                submissions.push(MetalSubmission::submitted(encoded, report.clone()));
-                reports.push(report);
-            }
+            let (submissions, reports) = submit_dense(runtime, plans, &output, &layout)?;
             Ok(MetalResidentBatchSubmission::new(
                 submissions,
                 output,
@@ -396,15 +406,8 @@ impl MetalDecoderSession {
             destination.validate_device(self.runtime.device())?;
             let runtime = self.initialized_runtime()?;
             let output = destination.buffer_handle();
-            let mut submissions = Vec::with_capacity(plans.len());
-            let mut reports = Vec::with_capacity(plans.len());
-            for (image, plan) in plans.iter().enumerate() {
-                let offset = destination.layout().image_offset(image)?;
-                let encoded = crate::encode::encode_into_at(runtime, plan, output.clone(), offset)?;
-                let report = plan.decode_report(false);
-                submissions.push(MetalSubmission::submitted(encoded, report.clone()));
-                reports.push(report);
-            }
+            let (submissions, reports) =
+                submit_dense(runtime, plans, &output, destination.layout())?;
             Ok(MetalBatchDestinationSubmission::new(
                 submissions,
                 destination,
@@ -485,8 +488,7 @@ impl MetalDecoderSession {
             image.validate_device(self.runtime.device())?;
             let byte_len = image.layout().byte_len;
             let shared = checked_shared_buffer(self.runtime.device(), byte_len)?;
-            let queue = checked_command_queue(self.runtime.device())?;
-            let command = checked_command_buffer(&queue)?;
+            let command = checked_command_buffer(self.readback_queue()?)?;
             let blit = checked_blit_command_encoder(&command)?;
             // SAFETY: `ResidentMetalImage` exposes an immutable, completed
             // allocation. The blit only reads it, and this command retains the
@@ -522,8 +524,7 @@ impl MetalDecoderSession {
             let byte_len = batch.layout().image_stride();
             let source_offset = batch.layout().image_offset(image)?;
             let shared = checked_shared_buffer(self.runtime.device(), byte_len)?;
-            let queue = checked_command_queue(self.runtime.device())?;
-            let command = checked_command_buffer(&queue)?;
+            let command = checked_command_buffer(self.readback_queue()?)?;
             let blit = checked_blit_command_encoder(&command)?;
             // SAFETY: `batch` is completed and immutable, the checked source
             // range identifies one image, and the command retains both buffers.
@@ -547,6 +548,26 @@ impl MetalDecoderSession {
             Err(MetalError::Unavailable)
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn submit_dense(
+    runtime: &MetalRuntime,
+    plans: &[MetalDecodePlan],
+    output: &Retained<ProtocolObject<dyn MTLBuffer>>,
+    layout: &crate::DenseMetalBatchLayout,
+) -> Result<(Vec<MetalSubmission>, Vec<DecodeReport>), MetalError> {
+    let offsets = (0..plans.len())
+        .map(|image| layout.image_offset(image))
+        .collect::<Result<Vec<_>, _>>()?;
+    let encoded = crate::encode::encode_dense_into(runtime, plans, output, &offsets)?;
+    let reports: Vec<_> = plans.iter().map(|plan| plan.decode_report(false)).collect();
+    let submissions = encoded
+        .into_iter()
+        .zip(&reports)
+        .map(|(encoded, report)| MetalSubmission::submitted(encoded, report.clone()))
+        .collect();
+    Ok((submissions, reports))
 }
 
 #[cfg(target_os = "macos")]
@@ -574,8 +595,10 @@ fn append_host_batch_group(
     let mut shared = Vec::with_capacity(plans.len());
     append_shared_batch_group(runtime, plans, &mut shared)?;
     for (plan, image) in plans.iter().zip(shared) {
-        let bytes = image.with_bytes(<[u8]>::to_vec)?;
-        decoded.push(decoded_image(plan, bytes)?);
+        // Convert straight from the mapped shared allocation: one copy into
+        // the typed owner instead of a byte copy followed by a typed copy.
+        let samples = image.with_bytes(|bytes| decoded_samples(plan.output().format, bytes))??;
+        decoded.push(decoded_image(plan, samples)?);
     }
     Ok(())
 }
@@ -659,14 +682,16 @@ fn batch_groups(plans: &[MetalDecodePlan]) -> Result<Vec<core::ops::Range<usize>
 }
 
 #[cfg(target_os = "macos")]
-fn decoded_image(plan: &MetalDecodePlan, bytes: Vec<u8>) -> Result<DecodedImage, MetalError> {
+fn decoded_image(
+    plan: &MetalDecodePlan,
+    samples: DecodedSamples,
+) -> Result<DecodedImage, MetalError> {
     let info = plan.info().ok_or(MetalError::InvalidPlan {
         reason: "metadata-only plan cannot produce a decoded image",
     })?;
     let decoded_region = plan.output_region().ok_or(MetalError::InvalidPlan {
         reason: "metadata-only plan omits its output region",
     })?;
-    let samples = decoded_samples(plan.output().format, bytes)?;
     let decoded = DecodedImage {
         info: info.clone(),
         decoded_region,
@@ -697,38 +722,37 @@ fn decoded_image(plan: &MetalDecodePlan, bytes: Vec<u8>) -> Result<DecodedImage,
 #[cfg(target_os = "macos")]
 fn decoded_samples(
     format: jxr_core::PixelFormat,
-    bytes: Vec<u8>,
+    bytes: &[u8],
 ) -> Result<DecodedSamples, MetalError> {
     match format.storage_kind() {
-        StorageKind::BitPacked => Ok(DecodedSamples::BitPacked(bytes)),
-        StorageKind::U8 => Ok(DecodedSamples::U8(bytes)),
-        StorageKind::U16 => Ok(DecodedSamples::U16(read_u16(&bytes)?)),
-        StorageKind::I16 => Ok(DecodedSamples::I16(
-            read_u16(&bytes)?
-                .into_iter()
-                .map(|value| i16::from_ne_bytes(value.to_ne_bytes()))
-                .collect(),
-        )),
-        StorageKind::I32 => Ok(DecodedSamples::I32(
-            read_u32(&bytes)?
-                .into_iter()
-                .map(|value| i32::from_ne_bytes(value.to_ne_bytes()))
-                .collect(),
-        )),
-        StorageKind::F16Bits => Ok(DecodedSamples::F16(read_u16(&bytes)?)),
-        StorageKind::F32 => Ok(DecodedSamples::F32(
-            read_u32(&bytes)?.into_iter().map(f32::from_bits).collect(),
-        )),
+        StorageKind::BitPacked => Ok(DecodedSamples::BitPacked(bytes.to_vec())),
+        StorageKind::U8 => Ok(DecodedSamples::U8(bytes.to_vec())),
+        StorageKind::U16 => Ok(DecodedSamples::U16(read_words(bytes, u16::from_ne_bytes)?)),
+        StorageKind::I16 => Ok(DecodedSamples::I16(read_words(bytes, i16::from_ne_bytes)?)),
+        StorageKind::I32 => Ok(DecodedSamples::I32(read_words(bytes, i32::from_ne_bytes)?)),
+        StorageKind::F16Bits => Ok(DecodedSamples::F16(read_words(bytes, u16::from_ne_bytes)?)),
+        StorageKind::F32 => Ok(DecodedSamples::F32(read_words(bytes, f32::from_ne_bytes)?)),
         StorageKind::PackedU16 => match format {
-            jxr_core::PixelFormat::Rgb555 => Ok(DecodedSamples::Rgb555(read_u16(&bytes)?)),
-            jxr_core::PixelFormat::Rgb565 => Ok(DecodedSamples::Rgb565(read_u16(&bytes)?)),
+            jxr_core::PixelFormat::Rgb555 => Ok(DecodedSamples::Rgb555(read_words(
+                bytes,
+                u16::from_ne_bytes,
+            )?)),
+            jxr_core::PixelFormat::Rgb565 => Ok(DecodedSamples::Rgb565(read_words(
+                bytes,
+                u16::from_ne_bytes,
+            )?)),
             _ => Err(MetalError::InvalidPlan {
                 reason: "unknown packed 16-bit output",
             }),
         },
         StorageKind::PackedU32 => match format {
-            jxr_core::PixelFormat::Rgb101010 => Ok(DecodedSamples::Rgb101010(read_u32(&bytes)?)),
-            jxr_core::PixelFormat::Rgbe => Ok(DecodedSamples::Rgbe(read_u32(&bytes)?)),
+            jxr_core::PixelFormat::Rgb101010 => Ok(DecodedSamples::Rgb101010(read_words(
+                bytes,
+                u32::from_ne_bytes,
+            )?)),
+            jxr_core::PixelFormat::Rgbe => {
+                Ok(DecodedSamples::Rgbe(read_words(bytes, u32::from_ne_bytes)?))
+            }
             _ => Err(MetalError::InvalidPlan {
                 reason: "unknown packed 32-bit output",
             }),
@@ -736,28 +760,17 @@ fn decoded_samples(
     }
 }
 
+/// Decodes native-endian words from host-visible output bytes.
 #[cfg(target_os = "macos")]
-fn read_u16(bytes: &[u8]) -> Result<Vec<u16>, MetalError> {
-    let chunks = bytes.chunks_exact(2);
-    if !chunks.remainder().is_empty() {
+fn read_words<T, const N: usize>(
+    bytes: &[u8],
+    from_bytes: fn([u8; N]) -> T,
+) -> Result<Vec<T>, MetalError> {
+    let (words, remainder) = bytes.as_chunks::<N>();
+    if !remainder.is_empty() {
         return Err(MetalError::InvalidPlan {
-            reason: "16-bit host readback has a trailing byte",
+            reason: "host readback length is not a whole number of samples",
         });
     }
-    Ok(chunks
-        .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
-        .collect())
-}
-
-#[cfg(target_os = "macos")]
-fn read_u32(bytes: &[u8]) -> Result<Vec<u32>, MetalError> {
-    let chunks = bytes.chunks_exact(4);
-    if !chunks.remainder().is_empty() {
-        return Err(MetalError::InvalidPlan {
-            reason: "32-bit host readback has trailing bytes",
-        });
-    }
-    Ok(chunks
-        .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect())
+    Ok(words.iter().map(|&word| from_bytes(word)).collect())
 }

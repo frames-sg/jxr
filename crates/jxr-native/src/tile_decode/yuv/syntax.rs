@@ -3,8 +3,9 @@
 use jxr_core::{ChromaSampling, PredictionMode};
 
 use crate::entropy::{
-    ColourModel, ComponentClass, FrequencyBand, PacketBitReader, TileEntropyState, decode_ac_block,
-    decode_dc_coefficient, decode_lp_refinement, decode_lp_refinement_at,
+    ColourModel, ComponentClass, FrequencyBand, PacketBitReader, PrefixTable, TileEntropyState,
+    decode_ac_block, decode_dc_coefficient, decode_lp_refinement, decode_lp_refinement_at,
+    decode_prefix,
 };
 
 use super::super::{
@@ -15,7 +16,7 @@ use super::super::{
     },
 };
 
-const DC_PATTERN: [(u16, u8, u8); 8] = [
+const DC_PATTERN_CODES: [(u16, u8, u8); 8] = [
     (0b10, 2, 0),
     (0b001, 3, 1),
     (0b00001, 5, 2),
@@ -25,7 +26,7 @@ const DC_PATTERN: [(u16, u8, u8); 8] = [
     (0b00000, 5, 6),
     (0b011, 3, 7),
 ];
-const LP_PATTERN: [(u16, u8, u8); 8] = [
+const LP_PATTERN_CODES: [(u16, u8, u8); 8] = [
     (0b0, 1, 0),
     (0b100, 3, 1),
     (0b1010, 4, 2),
@@ -35,8 +36,12 @@ const LP_PATTERN: [(u16, u8, u8); 8] = [
     (0b1110, 4, 6),
     (0b1111, 4, 7),
 ];
-const LP_PATTERN_SUBSAMPLED: [(u16, u8, u8); 4] =
+const LP_PATTERN_SUBSAMPLED_CODES: [(u16, u8, u8); 4] =
     [(0b0, 1, 0), (0b10, 2, 1), (0b110, 3, 2), (0b111, 3, 3)];
+
+static DC_PATTERN: PrefixTable = PrefixTable::new(&DC_PATTERN_CODES);
+static LP_PATTERN: PrefixTable = PrefixTable::new(&LP_PATTERN_CODES);
+static LP_PATTERN_SUBSAMPLED: PrefixTable = PrefixTable::new(&LP_PATTERN_SUBSAMPLED_CODES);
 
 pub(in crate::tile_decode) struct CbplpState {
     sampling: ChromaSampling,
@@ -421,33 +426,25 @@ fn predict_subsampled_chroma(
     Ok(())
 }
 
-fn read_code<const N: usize>(
+fn read_code(
     reader: &mut PacketBitReader<'_>,
-    table: &[(u16, u8, u8); N],
+    table: &PrefixTable,
     syntax: &'static str,
 ) -> Result<u8, TileDecodeError> {
-    let start = reader.bit_position();
-    let max = table.iter().map(|entry| entry.1).max().unwrap_or(0);
-    let mut bits = 0_u16;
-    for length in 1..=max {
-        bits = (bits << 1) | u16::from(reader.read_bit()?);
-        if let Some(entry) = table
-            .iter()
-            .find(|entry| entry.1 == length && entry.0 == bits)
-        {
-            return Ok(entry.2);
-        }
-    }
-    Err(crate::entropy::EntropyError::InvalidVlc {
-        syntax,
-        bit_position: start,
-    }
-    .into())
+    Ok(decode_prefix(reader, syntax, table)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn yuv_pattern_prefix_tables_match_serial_search() {
+        use crate::entropy::assert_matches_serial;
+        assert_matches_serial("VAL_DC_YUV", &DC_PATTERN_CODES);
+        assert_matches_serial("CBPLP_YUV1", &LP_PATTERN_CODES);
+        assert_matches_serial("CBPLP_YUV1", &LP_PATTERN_SUBSAMPLED_CODES);
+    }
 
     #[test]
     fn fixed_length_cbplp_does_not_apply_vlc_inversion() {
