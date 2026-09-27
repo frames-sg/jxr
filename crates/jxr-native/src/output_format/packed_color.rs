@@ -3,9 +3,7 @@
 use jxr_core::{ColorFormat, DecodedSamples};
 use jxr_math::rgbe::{pack_rgbe as pack_rgbe_word, postscale_rgbe};
 
-use super::{
-    OutputBitDepth, OutputFormatError, packing::FormatContext, scaling::scale_integer_component,
-};
+use super::{OutputBitDepth, OutputFormatError, packing::FormatContext, scaling::ChannelScale};
 
 pub(super) fn pack_rgb555(
     context: FormatContext<'_>,
@@ -20,8 +18,9 @@ pub(super) fn pack_rgb555_into(
     context: FormatContext<'_>,
     output: &mut [u16],
 ) -> Result<(), OutputFormatError> {
+    let scaling = rgb_scales(context);
     fill_pixels(context, output, |components| {
-        let values = scale_rgb(context, components)?;
+        let values = scale_rgb(context, &scaling, components)?;
         Ok(
             u16::try_from(values[2] | (values[1] << 5) | (values[0] << 10))
                 .expect("RGB555 occupies 15 bits"),
@@ -42,8 +41,9 @@ pub(super) fn pack_rgb565_into(
     context: FormatContext<'_>,
     output: &mut [u16],
 ) -> Result<(), OutputFormatError> {
+    let scaling = rgb_scales(context);
     fill_pixels(context, output, |components| {
-        let values = scale_rgb(context, components)?;
+        let values = scale_rgb(context, &scaling, components)?;
         Ok(
             u16::try_from(values[2] | (values[1] << 5) | (values[0] << 11))
                 .expect("RGB565 occupies 16 bits"),
@@ -64,8 +64,9 @@ pub(super) fn pack_rgb101010_into(
     context: FormatContext<'_>,
     output: &mut [u32],
 ) -> Result<(), OutputFormatError> {
+    let scaling = rgb_scales(context);
     fill_pixels(context, output, |components| {
-        let values = scale_rgb(context, components)?;
+        let values = scale_rgb(context, &scaling, components)?;
         Ok(values[2] | (values[1] << 10) | (values[0] << 20))
     })
 }
@@ -83,34 +84,43 @@ pub(super) fn pack_rgbe_into(
     context: FormatContext<'_>,
     output: &mut [u32],
 ) -> Result<(), OutputFormatError> {
+    let scaling: [ChannelScale; 3] = core::array::from_fn(|component| {
+        ChannelScale::resolve(
+            component,
+            ColorFormat::Rgbe,
+            OutputBitDepth::U8,
+            context.request.scaled,
+        )
+    });
     fill_pixels(context, output, |components| {
         let mut scaled = [0; 3];
         for component in 0..3 {
-            scaled[component] = scale_integer_component(
-                components[component],
-                component,
-                ColorFormat::Rgbe,
-                OutputBitDepth::U8,
-                context.request.scaled,
-            )?;
+            scaled[component] = scaling[component].apply(components[component])?;
         }
         Ok(pack_rgbe_word(postscale_rgbe(scaled)))
     })
 }
 
-fn scale_rgb(
-    context: FormatContext<'_>,
-    components: [i32; 4],
-) -> Result<[u32; 3], OutputFormatError> {
-    let mut values = [0; 3];
-    for component in 0..3 {
-        let scaled = scale_integer_component(
-            components[component],
+/// Resolves the three packed-RGB channel scales once per image.
+fn rgb_scales(context: FormatContext<'_>) -> [ChannelScale; 3] {
+    core::array::from_fn(|component| {
+        ChannelScale::resolve(
             component,
             ColorFormat::Rgb,
             context.request.bit_depth,
             context.request.scaled,
-        )?;
+        )
+    })
+}
+
+fn scale_rgb(
+    context: FormatContext<'_>,
+    scaling: &[ChannelScale; 3],
+    components: [i32; 4],
+) -> Result<[u32; 3], OutputFormatError> {
+    let mut values = [0; 3];
+    for component in 0..3 {
+        let scaled = scaling[component].apply(components[component])?;
         values[component] = clip(
             scaled,
             match context.request.bit_depth {
@@ -134,11 +144,9 @@ fn fill_pixels<T>(
     mut format: impl FnMut([i32; 4]) -> Result<T, OutputFormatError>,
 ) -> Result<(), OutputFormatError> {
     let mut index = 0;
-    for y in 0..context.height {
-        for x in 0..context.width {
-            output[index] = format(context.color_components(x, y)?)?;
-            index += 1;
-        }
-    }
-    Ok(())
+    context.for_each_color(|components| {
+        output[index] = format(components)?;
+        index += 1;
+        Ok(())
+    })
 }

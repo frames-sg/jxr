@@ -5,6 +5,7 @@ use jxr_math::arithmetic::checked_add;
 
 use super::{OutputBitDepth, OutputFormatError};
 
+#[inline]
 pub(crate) fn scale_integer_component(
     sample: i32,
     component: usize,
@@ -12,40 +13,101 @@ pub(crate) fn scale_integer_component(
     depth: OutputBitDepth,
     scaled: bool,
 ) -> Result<i32, OutputFormatError> {
-    let bias = bias(depth)?;
-    let component_bias = match output_color {
-        ColorFormat::Cmyk if component < 3 => bias >> 1,
-        ColorFormat::Cmyk => -(bias >> 1),
-        ColorFormat::Rgbe => 0,
-        _ => bias,
-    };
-    let scale = u32::from(scaled) * 3;
-    let shifted_bias = checked_shift_left(component_bias, scale, "scaling sample bias")?;
-    let biased = checked_add(sample, shifted_bias)
-        .map_err(|_| OutputFormatError::arithmetic("adding output bias"))?;
-    let rounding = if scaled {
-        match depth {
-            OutputBitDepth::Bit1White | OutputBitDepth::Bit1Black | OutputBitDepth::U16 { .. } => 4,
-            _ => 3,
+    ChannelScale::resolve(component, output_color, depth, scaled).apply(sample)
+}
+
+/// Bias, rounding, and postscaling for one output channel, resolved once so
+/// per-sample packing performs only the checked arithmetic.
+///
+/// Resolution failures are retained and reported by the first `apply`, which
+/// keeps error behavior identical to resolving per sample.
+#[derive(Clone, Debug)]
+pub(crate) enum ChannelScale {
+    /// RGBX/BGRX padding, which always stores zero.
+    Padding,
+    Integer {
+        shifted_bias: i32,
+        rounding: i32,
+        shift: u32,
+        post_shift: Option<u32>,
+    },
+    Invalid(OutputFormatError),
+}
+
+impl ChannelScale {
+    #[inline]
+    pub(crate) fn resolve(
+        component: usize,
+        output_color: ColorFormat,
+        depth: OutputBitDepth,
+        scaled: bool,
+    ) -> Self {
+        let bias = match bias(depth) {
+            Ok(bias) => bias,
+            Err(error) => return Self::Invalid(error),
+        };
+        let component_bias = match output_color {
+            ColorFormat::Cmyk if component < 3 => bias >> 1,
+            ColorFormat::Cmyk => -(bias >> 1),
+            ColorFormat::Rgbe => 0,
+            _ => bias,
+        };
+        let scale = u32::from(scaled) * 3;
+        let shifted_bias = match checked_shift_left(component_bias, scale, "scaling sample bias") {
+            Ok(shifted_bias) => shifted_bias,
+            Err(error) => return Self::Invalid(error),
+        };
+        let rounding = if scaled {
+            match depth {
+                OutputBitDepth::Bit1White
+                | OutputBitDepth::Bit1Black
+                | OutputBitDepth::U16 { .. } => 4,
+                _ => 3,
+            }
+        } else {
+            0
+        };
+        let shift = if matches!(depth, OutputBitDepth::Rgb565) && component != 1 {
+            scale + 1
+        } else {
+            scale
+        };
+        let post_shift = match depth {
+            OutputBitDepth::U16 { shift_bits }
+            | OutputBitDepth::I16 { shift_bits }
+            | OutputBitDepth::I32 { shift_bits } => Some(u32::from(shift_bits)),
+            _ => None,
+        };
+        Self::Integer {
+            shifted_bias,
+            rounding,
+            shift,
+            post_shift,
         }
-    } else {
-        0
-    };
-    let component_scale = if matches!(depth, OutputBitDepth::Rgb565) && component != 1 {
-        scale + 1
-    } else {
-        scale
-    };
-    let scaled_sample = checked_add(biased, rounding)
-        .map_err(|_| OutputFormatError::arithmetic("adding scaled-stream rounding"))?
-        >> component_scale;
-    match depth {
-        OutputBitDepth::U16 { shift_bits }
-        | OutputBitDepth::I16 { shift_bits }
-        | OutputBitDepth::I32 { shift_bits } => {
-            checked_shift_left(scaled_sample, u32::from(shift_bits), "integer postscaling")
+    }
+
+    #[inline]
+    pub(crate) fn apply(&self, sample: i32) -> Result<i32, OutputFormatError> {
+        match *self {
+            Self::Padding => Ok(0),
+            Self::Invalid(ref error) => Err(error.clone()),
+            Self::Integer {
+                shifted_bias,
+                rounding,
+                shift,
+                post_shift,
+            } => {
+                let biased = checked_add(sample, shifted_bias)
+                    .map_err(|_| OutputFormatError::arithmetic("adding output bias"))?;
+                let scaled_sample = checked_add(biased, rounding)
+                    .map_err(|_| OutputFormatError::arithmetic("adding scaled-stream rounding"))?
+                    >> shift;
+                match post_shift {
+                    Some(bits) => checked_shift_left(scaled_sample, bits, "integer postscaling"),
+                    None => Ok(scaled_sample),
+                }
+            }
         }
-        _ => Ok(scaled_sample),
     }
 }
 
