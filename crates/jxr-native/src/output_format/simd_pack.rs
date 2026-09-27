@@ -53,50 +53,91 @@ pub(super) fn pack_u8_into(
             combination: "SIMD U8 destination length differs from the output contract",
         });
     }
-    let addition = if scaled { 1_027 } else { 128 };
-    for y in 0..height {
-        let row_start = (start[1] + y)
-            .checked_mul(stride)
+    if height > 0 {
+        // Row starts increase with `y`, so bounding the final row bounds every row.
+        let last_row_end = start[1]
+            .checked_add(height - 1)
+            .and_then(|row| row.checked_mul(stride))
             .and_then(|row| row.checked_add(start[0]))
+            .and_then(|row| row.checked_add(width))
             .ok_or_else(|| OutputFormatError::arithmetic("calculating SIMD input row"))?;
-        let row =
-            input
-                .get(row_start..row_start + width)
-                .ok_or(OutputFormatError::InvalidPlane {
-                    component: None,
-                    reason: "SIMD input row exceeds component plane",
-                })?;
-        if row.iter().any(|&sample| sample > i32::MAX - addition) {
-            return Err(OutputFormatError::arithmetic("adding output bias"));
+        if last_row_end > input.len() {
+            return Err(OutputFormatError::InvalidPlane {
+                component: None,
+                reason: "SIMD input row exceeds component plane",
+            });
         }
     }
-    if count >= MIN_VECTOR_SAMPLES
-        && pack_accelerated(level, input, stride, start, dimensions, scaled, output)
-    {
-        return Ok(true);
+    let bias = PackBias::new(scaled);
+    let (used_simd, maximum) =
+        match pack_accelerated(level, input, stride, start, dimensions, bias, output) {
+            Some(maximum) => (true, maximum),
+            None => (
+                false,
+                pack_scalar(input, stride, start, dimensions, bias, output),
+            ),
+        };
+    // Validation is fused into the packing pass; output written for an
+    // overflowing sample is never observed because the call fails.
+    if maximum > i32::MAX - bias.addition {
+        return Err(OutputFormatError::arithmetic("adding output bias"));
     }
-    pack_scalar(input, stride, start, dimensions, scaled, output);
-    Ok(false)
+    Ok(used_simd)
 }
 
+#[derive(Clone, Copy)]
+struct PackBias {
+    /// Output bias plus rounding, added before the down-shift.
+    addition: i32,
+    shift: u32,
+}
+
+impl PackBias {
+    const fn new(scaled: bool) -> Self {
+        if scaled {
+            Self {
+                addition: 1_024 + 3,
+                shift: 3,
+            }
+        } else {
+            Self {
+                addition: 128,
+                shift: 0,
+            }
+        }
+    }
+
+    /// Packs one sample. Saturation only differs from the checked result for
+    /// samples that the caller rejects after the pass.
+    #[inline]
+    fn pack(self, sample: i32) -> u8 {
+        u8::try_from((sample.saturating_add(self.addition) >> self.shift).clamp(0, 255))
+            .expect("sample is clipped to u8")
+    }
+}
+
+/// Returns the maximum input sample when a vector implementation packed the output.
 fn pack_accelerated(
     level: Level,
     input: &[i32],
     stride: usize,
     start: [usize; 2],
     dimensions: [usize; 2],
-    scaled: bool,
+    bias: PackBias,
     output: &mut [u8],
-) -> bool {
+) -> Option<i32> {
+    if output.len() < MIN_VECTOR_SAMPLES {
+        return None;
+    }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if let Some(avx2) = level.as_avx2() {
-        return pack_vectorized(avx2, input, stride, start, dimensions, scaled, output);
+        return pack_vectorized(avx2, input, stride, start, dimensions, bias, output);
     }
     #[cfg(target_arch = "aarch64")]
     if let Some(neon) = level.as_neon() {
-        return pack_vectorized(neon, input, stride, start, dimensions, scaled, output);
+        return pack_vectorized(neon, input, stride, start, dimensions, bias, output);
     }
-    false
+    None
 }
 
 #[inline]
@@ -106,23 +147,22 @@ fn pack_vectorized<S: Simd>(
     stride: usize,
     start: [usize; 2],
     dimensions: [usize; 2],
-    scaled: bool,
+    bias: PackBias,
     output: &mut [u8],
-) -> bool {
+) -> Option<i32> {
     let lanes = S::i32s::LEN;
     let packed_lanes = S::u8s::LEN;
     let [width, height] = dimensions;
     if width < packed_lanes {
-        return false;
+        return None;
     }
 
-    simd.vectorize(|| {
-        let bias = if scaled { 1_024 } else { 128 };
-        let rounding = if scaled { 3 } else { 0 };
-        let addition = bias + rounding;
-        let shift = if scaled { 3 } else { 0 };
+    Some(simd.vectorize(|| {
+        let addition = S::i32s::splat(simd, bias.addition);
         let zero = S::i32s::splat(simd, 0);
         let max = S::i32s::splat(simd, 255);
+        let mut peak = S::i32s::splat(simd, i32::MIN);
+        let mut tail_peak = i32::MIN;
         let vector_width = width / packed_lanes * packed_lanes;
         for y in 0..height {
             let source_start = (start[1] + y) * stride + start[0];
@@ -132,76 +172,43 @@ fn pack_vectorized<S: Simd>(
                 .chunks_exact(packed_lanes)
                 .zip(destination[..vector_width].chunks_exact_mut(packed_lanes))
             {
-                let first = pack_lanes(simd, &source[..lanes], addition, shift, zero, max);
-                let second =
-                    pack_lanes(simd, &source[lanes..2 * lanes], addition, shift, zero, max);
-                let third = pack_lanes(
-                    simd,
-                    &source[2 * lanes..3 * lanes],
-                    addition,
-                    shift,
-                    zero,
-                    max,
-                );
-                let fourth = pack_lanes(simd, &source[3 * lanes..], addition, shift, zero, max);
+                let mut quarter = |index: usize| {
+                    let samples =
+                        S::i32s::from_slice(simd, &source[index * lanes..(index + 1) * lanes]);
+                    peak = peak.max(samples);
+                    ((samples + addition) >> bias.shift)
+                        .max(zero)
+                        .min(max)
+                        .bitcast::<S::u32s>()
+                };
+                let first = quarter(0);
+                let second = quarter(1);
+                let third = quarter(2);
+                let fourth = quarter(3);
                 first
                     .saturating_narrow(second)
                     .saturating_narrow(third.saturating_narrow(fourth))
                     .store_slice(destination);
             }
-            for (destination, &sample) in destination[vector_width..]
-                .iter_mut()
-                .zip(&source[vector_width..])
-            {
-                *destination = u8::try_from(((sample + bias + rounding) >> shift).clamp(0, 255))
-                    .expect("sample is clipped to u8");
-            }
+            tail_peak = tail_peak.max(pack_row(
+                &source[vector_width..],
+                &mut destination[vector_width..],
+                bias,
+            ));
         }
-    });
-    true
+        peak.reduce_max().max(tail_peak)
+    }))
 }
 
-#[expect(
-    clippy::inline_always,
-    reason = "SIMD helper must inline into the target-feature vectorize context"
-)]
-#[inline(always)]
-fn pack_lanes<S: Simd>(
-    simd: S,
-    source: &[i32],
-    addition: i32,
-    shift: u32,
-    zero: S::i32s,
-    max: S::i32s,
-) -> S::u32s {
-    ((S::i32s::from_slice(simd, source) + addition) >> shift)
-        .max(zero)
-        .min(max)
-        .bitcast()
-}
-
+/// Packs one row and returns its maximum input sample.
 #[inline]
-fn pack_rows(
-    input: &[i32],
-    stride: usize,
-    start: [usize; 2],
-    dimensions: [usize; 2],
-    scaled: bool,
-    output: &mut [u8],
-) {
-    let [width, height] = dimensions;
-    let bias = if scaled { 1_024 } else { 128 };
-    let rounding = if scaled { 3 } else { 0 };
-    let shift = if scaled { 3 } else { 0 };
-    for y in 0..height {
-        let source_start = (start[1] + y) * stride + start[0];
-        let source = &input[source_start..source_start + width];
-        let destination = &mut output[y * width..(y + 1) * width];
-        for (destination, &sample) in destination.iter_mut().zip(source) {
-            *destination = u8::try_from(((sample + bias + rounding) >> shift).clamp(0, 255))
-                .expect("sample is clipped to u8");
-        }
+fn pack_row(source: &[i32], destination: &mut [u8], bias: PackBias) -> i32 {
+    let mut peak = i32::MIN;
+    for (destination, &sample) in destination.iter_mut().zip(source) {
+        peak = peak.max(sample);
+        *destination = bias.pack(sample);
     }
+    peak
 }
 
 fn pack_scalar(
@@ -209,10 +216,20 @@ fn pack_scalar(
     stride: usize,
     start: [usize; 2],
     dimensions: [usize; 2],
-    scaled: bool,
+    bias: PackBias,
     output: &mut [u8],
-) {
-    pack_rows(input, stride, start, dimensions, scaled, output);
+) -> i32 {
+    let [width, height] = dimensions;
+    let mut peak = i32::MIN;
+    for y in 0..height {
+        let source_start = (start[1] + y) * stride + start[0];
+        peak = peak.max(pack_row(
+            &input[source_start..source_start + width],
+            &mut output[y * width..(y + 1) * width],
+            bias,
+        ));
+    }
+    peak
 }
 
 #[cfg(test)]
@@ -248,6 +265,60 @@ mod tests {
                 .collect();
             assert_eq!(output, expected);
         }
+    }
+
+    #[test]
+    fn fused_bias_check_rejects_overflow_on_vector_and_scalar_paths() {
+        for (width, height) in [(64, 2), (7, 3)] {
+            for scaled in [false, true] {
+                let addition = if scaled { 1_027 } else { 128 };
+                for (sample, accepted) in [
+                    (i32::MAX - addition, true),
+                    (i32::MAX - addition + 1, false),
+                ] {
+                    for position in [0, width * height - 1] {
+                        let mut input = vec![0; width * height];
+                        input[position] = sample;
+                        let mut output = Vec::new();
+                        let result = append_u8(
+                            Level::new(),
+                            &input,
+                            width,
+                            [0, 0],
+                            [width, height],
+                            scaled,
+                            &mut output,
+                        );
+                        assert_eq!(
+                            result.is_ok(),
+                            accepted,
+                            "{width}x{height} {scaled} {sample}"
+                        );
+                        if accepted {
+                            assert_eq!(output[position], 255);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_rows_beyond_the_component_plane() {
+        let input = vec![0; 99];
+        let mut output = Vec::new();
+        assert!(
+            append_u8(
+                Level::new(),
+                &input,
+                10,
+                [0, 0],
+                [10, 10],
+                false,
+                &mut output
+            )
+            .is_err()
+        );
     }
 
     #[test]
