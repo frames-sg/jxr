@@ -19,6 +19,6 @@ for JPEG XR reconstruction are outside this crate's v1 scope.
 
 The adapter uses `j2k-mpsgraph-support` for graph execution, callback/error ownership,
 and input lifetime. JXR preparation, queue/device validation, codec completion and
-report assembly remain here. The dependency uses the published 0.11.0 crate
+report assembly remain here. The dependency uses the published 0.11.1 crate
 from crates.io, so standalone builds need no Git dependency or sibling source
 overlay for the graph owner.

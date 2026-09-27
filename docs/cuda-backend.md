@@ -50,11 +50,11 @@ pixel-to-codestream encoder is introduced.
 
 ## Dependency decision (September 2026)
 
-`jxr-cuda` pins `cudarc` 0.19.9 with only `std`, `driver`, `nvrtc`,
+`jxr-cuda` pins `cudarc` 0.19.10 with only `std`, `driver`, `nvrtc`,
 `dynamic-loading`, and the CUDA 11.4 ABI baseline enabled. The decision is based
 on the following primary project and vendor documentation:
 
-- [`cudarc` 0.19.9 API documentation](https://docs.rs/cudarc/0.19.9/cudarc/)
+- [`cudarc` 0.19.10 API documentation](https://docs.rs/cudarc/0.19.10/cudarc/)
   documents safe context, stream, event, slice, Driver API, and NVRTC wrappers;
   its dynamic-loading mode requires no CUDA libraries at build time. The project
   is MIT OR Apache-2.0 and its

@@ -9,7 +9,7 @@ must retain the applicable BSD-3-Clause copyright and disclaimer here.
 `fearless_simd` 1.0.0 is used through its safe capability-token API and is
 available under MIT or Apache-2.0 licensing.
 
-`cudarc` 0.19.9 provides dynamically loaded CUDA Driver API and NVRTC bindings
+`cudarc` 0.19.10 provides dynamically loaded CUDA Driver API and NVRTC bindings
 for the optional `jxr-cuda` crate and is available under MIT or Apache-2.0
 licensing. No NVIDIA toolkit code or headers are distributed by this repository.
 Its dynamic loader dependency, `libloading` 0.9.0, is available under the ISC

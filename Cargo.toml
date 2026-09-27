@@ -23,10 +23,10 @@ keywords = ["jpeg", "jpeg-xr", "jxr", "gpu", "decoder"]
 categories = ["multimedia::images", "compression"]
 
 [workspace.dependencies]
-j2k-core = "=0.10.0"
-j2k-metal-support = "=0.10.0"
+j2k-core = "=0.11.1"
+j2k-metal-support = "=0.11.1"
 fearless_simd = "=1.0.0"
-cudarc = { version = "=0.19.9", default-features = false, features = [
+cudarc = { version = "=0.19.10", default-features = false, features = [
     "std",
     "driver",
     "nvrtc",
