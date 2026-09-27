@@ -151,11 +151,21 @@ impl<'a> JxrDecoder<'a> {
         session: &jxr_metal::MetalDecoderSession,
     ) -> Result<jxr_metal::MetalDecodePlan, JxrError> {
         let plan = self.prepare(request)?;
-        let coefficient_count = self.metal_coefficient_count_for_plan(&plan)?;
+        self.prepare_metal_from_plan(request, &plan, session)
+    }
+
+    #[cfg(feature = "metal")]
+    fn prepare_metal_from_plan(
+        &self,
+        request: &DecodeRequest,
+        plan: &PreparedPlan,
+        session: &jxr_metal::MetalDecoderSession,
+    ) -> Result<jxr_metal::MetalDecodePlan, JxrError> {
+        let coefficient_count = self.metal_coefficient_count_for_plan(plan)?;
         let staging = session
             .coefficient_staging(coefficient_count)
             .map_err(|error| map_metal_error(&error))?;
-        self.prepare_metal_plan_with_staging(request, &plan, staging)
+        self.prepare_metal_plan_with_staging(request, plan, staging)
     }
 
     /// Return the exact primary coefficient count for direct Metal staging.
@@ -262,7 +272,9 @@ impl<'a> JxrDecoder<'a> {
                 match jxr_metal::plan_metal_route(request.backend, work, session.is_usable(), false)
                 {
                     Ok(jxr_metal::MetalRouteDecision::Metal) => {
-                        let metal_plan = self.prepare_metal(request, session)?;
+                        // Reuse the routing plan instead of planning the request twice.
+                        let metal_plan =
+                            self.prepare_metal_from_plan(request, &prepared, session)?;
                         return session
                             .decode_to_host(&metal_plan)
                             .map_err(|error| map_metal_error(&error));
@@ -289,7 +301,10 @@ impl<'a> JxrDecoder<'a> {
                 let work = prepared.reconstructed_coefficients()?;
                 match jxr_cuda::plan_cuda_route(request.backend, work, session.is_usable(), false) {
                     Ok(jxr_cuda::CudaRouteDecision::Cuda) => {
-                        let cuda_plan = self.prepare_cuda(request)?;
+                        let cuda_plan = self
+                            .prepare_reconstruction_from_plan(request, prepared)?
+                            .cuda_plan()
+                            .map_err(|error| map_cuda_error(&error))?;
                         return session
                             .decode_to_host(&cuda_plan)
                             .map_err(|error| map_cuda_error(&error));
