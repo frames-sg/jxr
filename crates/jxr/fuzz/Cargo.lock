@@ -91,9 +91,9 @@ dependencies = [
 
 [[package]]
 name = "j2k-core"
-version = "0.11.1"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2974b4fc5d4123c1da4896fa105faff0fb85cabb3186b340e05f26cd5ac083a"
+checksum = "6fd9e94fb0e8c153c3429c1b612715a7c6c99ee2b03c9171daca9f50c9e1be43"
 dependencies = [
  "thiserror",
 ]

@@ -66,8 +66,8 @@ This release moves the J2K dependencies to the 0.11 line, `jxr-native` to
 types and every published crate that exposes them moves to 0.2.0. The
 `fearless_simd` upgrade is private to `jxr-native`.
 
-Before publishing, pin `j2k-core`, `j2k-metal-support`, and `j2k-mpsgraph-support`
-to the J2K release that downstream crates use. J2K crates pin each other exactly,
+`j2k-core`, `j2k-metal-support`, and `j2k-mpsgraph-support` are pinned to
+0.11.2, the J2K release used by the downstream WSI crates. J2K crates pin each other exactly,
 so one dependency graph cannot hold two J2K 0.11 patch releases.
 
 Publish in this order:
