@@ -91,9 +91,9 @@ dependencies = [
 
 [[package]]
 name = "j2k-core"
-version = "0.11.2"
+version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fd9e94fb0e8c153c3429c1b612715a7c6c99ee2b03c9171daca9f50c9e1be43"
+checksum = "ae969eb19e9b3a8d65c4342f9921717be407571cc0fbc44e4379daa0b588d01c"
 dependencies = [
  "thiserror",
 ]
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "jxr"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "jxr-core",
  "jxr-cuda",
@@ -121,14 +121,14 @@ dependencies = [
 
 [[package]]
 name = "jxr-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "j2k-core",
 ]
 
 [[package]]
 name = "jxr-cuda"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cudarc",
  "jxr-core",
@@ -151,7 +151,7 @@ version = "0.1.0"
 
 [[package]]
 name = "jxr-native"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "fearless_simd",
  "jxr-core",
