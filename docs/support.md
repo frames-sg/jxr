@@ -5,9 +5,11 @@ Main-profile syntax, validated Annex-A serialization around existing raw
 codestreams. Annex-F/HEIF sequence storage, T.832 codestream encoding, and
 transcoding are out of scope.
 
-The current CPU route byte-matches T.835 for all 517 T.834 cases classified as
-in-scope Main syntax. The remaining 179 corpus entries are explicitly skipped
-because they use Advanced-only output syntax or a JPEG 2000 `.jpx` wrapper.
+For published [JXR 0.2.0](https://github.com/frames-sg/jxr/releases/tag/v0.2.0),
+the CPU, Metal, and CUDA routes byte-match T.835 for all 517 T.834 cases
+classified as in-scope Main syntax. The Annex-A writer comparison also passes
+those 517 cases. The remaining 179 corpus entries are explicitly skipped because
+they use Advanced-only output syntax or a JPEG 2000 `.jpx` wrapper.
 
 ## Implemented now
 
@@ -72,14 +74,15 @@ because they use Advanced-only output syntax or a JPEG 2000 `.jpx` wrapper.
   CPU differential suite, a serialized self-hosted NVIDIA workflow, and a
   phase-separated pathology benchmark. The NVIDIA workflow passed all 517
   in-scope T.834/T.835 cases, CPU/ROI comparisons, lifecycle tests, and benchmark
-  checksums on 2026-09-05; see the [CUDA workflow](https://github.com/frames-sg/jxr/actions/runs/33953370733).
+  checks for release 0.2.0; see the [CUDA workflow](https://github.com/frames-sg/jxr/actions/runs/36360508404).
 
 ## Explicitly incomplete
 
-- A wider device performance corpus. CPU passes all 517 in-scope T.834/T.835
-  differential cases; the affected Metal output-format categories also pass
-  byte-for-byte. The hardware commands pass locally on Apple silicon; GitHub
-  Metal dispatch remains queued pending a matching labeled runner.
+- A wider device performance corpus. CPU, Metal, and CUDA pass all 517
+  in-scope T.834/T.835 differential cases in the published release reports.
+  The [Metal hardware workflow](https://github.com/frames-sg/jxr/actions/runs/36359668987)
+  and NVIDIA workflow are both operational, but these conformance fixtures do
+  not establish performance across a representative application corpus.
 - Native reduced-resolution decode for spatially interleaved packets and for
   Metal or CUDA reconstruction. The implemented frequency-mode CPU route is genuinely
   band-limited and does not label full decode plus resampling as native reduction.

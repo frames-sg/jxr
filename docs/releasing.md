@@ -10,8 +10,10 @@ Run the CI checks from `.github/workflows/ci.yml`, then the external CPU oracle:
 cargo run -p jxr-test-support --bin jxr-t834 -- --backend cpu
 ```
 
-Publish in dependency order, first using `cargo publish -p NAME --dry-run` and
-then `cargo publish -p NAME` after reviewing the package contents:
+Publish only changed packages and their exact-version dependents. Do not
+republish unchanged package versions that already exist on crates.io. Use this
+dependency order, first running `cargo publish -p NAME --dry-run` and then
+`cargo publish -p NAME` after reviewing the package contents:
 
 1. jxr-math
 2. jxr-core
@@ -60,6 +62,16 @@ the graph owner does not depend on them.
 
 ## 0.2.0 release
 
+[Version 0.2.0](https://github.com/frames-sg/jxr/releases/tag/v0.2.0) is published
+on crates.io for all seven packages below. The
+[hosted checks](https://github.com/frames-sg/jxr/actions/runs/36360496727),
+[Metal hardware validation](https://github.com/frames-sg/jxr/actions/runs/36359668987),
+and [CUDA hardware validation](https://github.com/frames-sg/jxr/actions/runs/36360508404)
+passed. CPU, Annex-A writer, Metal, and CUDA reference comparisons each passed
+517 in-scope cases, with 179 declared out-of-scope cases and no failures. The
+reports are attached to the release. Metal tested the reviewed PR source; its
+tree is identical to the release merge used by CUDA.
+
 This release moves the J2K dependencies to the 0.11 line, `jxr-native` to
 `fearless_simd` 1.0.0, and `jxr-cuda` to `cudarc` 0.19.10. `jxr-core` re-exports
 `j2k_core::{BackendKind, BackendRequest, Rect}`, so the J2K upgrade changes public
@@ -67,10 +79,10 @@ types and every published crate that exposes them moves to 0.2.0. The
 `fearless_simd` upgrade is private to `jxr-native`.
 
 `j2k-core`, `j2k-metal-support`, and `j2k-mpsgraph-support` are pinned to
-0.11.2, the J2K release used by the downstream WSI crates. J2K crates pin each other exactly,
-so one dependency graph cannot hold two J2K 0.11 patch releases.
+0.11.2, the J2K release used by the downstream WSI crates. J2K crates pin each
+other exactly, so one dependency graph cannot hold two J2K 0.11 patch releases.
 
-Publish in this order:
+The packages were published in this order:
 
 1. `jxr-core` 0.2.0
 2. `jxr-native` 0.2.0
