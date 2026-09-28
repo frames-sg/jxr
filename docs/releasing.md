@@ -94,13 +94,21 @@ The packages were published in this order:
 
 `jxr-math` remains at the already-published 0.1.0 version.
 
-## 0.2.1 release candidate
+## 0.2.1 release
 
 This dependency-only patch aligns the exact J2K dependencies with 0.11.3 so
 applications can use the native JPEG 2000 tag-tree fix alongside JPEG XR.
 The published 0.2.0 packages pin J2K 0.11.2 and cannot resolve with J2K 0.11.3
 in one dependency graph. Decoder source and public signatures are unchanged.
 
-Publish `jxr-core`, `jxr-native`, `jxr-metal`, `jxr-cuda`, `jxr`, `jxr-image`,
-and `jxr-mpsgraph` at 0.2.1 in the dependency order above after validation.
+Published `jxr-core`, `jxr-native`, `jxr-metal`, `jxr-cuda`, `jxr`, `jxr-image`,
+and `jxr-mpsgraph` at 0.2.1 in the dependency order above.
 `jxr-math` remains at 0.1.0.
+
+The [hosted checks](https://github.com/frames-sg/jxr/actions/runs/36435652621),
+[Metal hardware validation](https://github.com/frames-sg/jxr/actions/runs/36435651913),
+and [CUDA hardware validation](https://github.com/frames-sg/jxr/actions/runs/36435655712)
+passed for the tagged source. CPU, Annex-A writer, Metal, and CUDA reference
+comparisons each passed 517 in-scope cases, with 179 declared out of scope and
+no failures. The reports are attached to the
+[0.2.1 release](https://github.com/frames-sg/jxr/releases/tag/v0.2.1).

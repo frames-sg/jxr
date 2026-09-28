@@ -1,9 +1,9 @@
 # JXR
 
-**Release status:** [JXR 0.2.0](https://crates.io/crates/jxr/0.2.0) is published,
-with J2K dependencies pinned to the published 0.11.2 release. Release notes and
+**Release status:** [JXR 0.2.1](https://crates.io/crates/jxr/0.2.1) is published,
+with J2K dependencies pinned to the published 0.11.3 release. Release notes and
 CPU, Metal, and CUDA reports are attached to the
-[GitHub release](https://github.com/frames-sg/jxr/releases/tag/v0.2.0).
+[GitHub release](https://github.com/frames-sg/jxr/releases/tag/v0.2.1).
 
 JXR is a JPEG XR implementation with a safe Rust CPU decoder, optional Metal or
 CUDA reconstruction, and a validated Annex-A still-image container writer.
@@ -31,9 +31,9 @@ upload caches, asynchronous and resident output, checked caller-owned device
 destinations, homogeneous dense batches, and all typed/packed store paths. It is
 compiled through dynamically loaded Driver API/NVRTC bindings, so an all-feature
 build does not need a CUDA toolkit or NVIDIA driver. The self-hosted NVIDIA
-workflow passed for release 0.2.0, including all 517 in-scope T.834/T.835
+workflow passed for release 0.2.1, including all 517 in-scope T.834/T.835
 comparisons, CPU/ROI differential tests, and the configured benchmark. See the
-[passing CUDA workflow](https://github.com/frames-sg/jxr/actions/runs/36360508404) and
+[passing CUDA workflow](https://github.com/frames-sg/jxr/actions/runs/36435655712) and
 [CUDA backend decision and validation boundary](docs/cuda-backend.md).
 
 ## Current usable slice
