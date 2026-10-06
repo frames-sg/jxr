@@ -112,3 +112,15 @@ passed for the tagged source. CPU, Annex-A writer, Metal, and CUDA reference
 comparisons each passed 517 in-scope cases, with 179 declared out of scope and
 no failures. The reports are attached to the
 [0.2.1 release](https://github.com/frames-sg/jxr/releases/tag/v0.2.1).
+
+## 0.3.0 release line
+
+This release aligns JXR with J2K 0.12.0 and requires Rust 1.99.0.
+Public J2K types now come from the 0.12 line, so downstream applications
+must update their direct J2K dependencies at the same time. The entropy
+decoder adds inlining hints and places highpass coefficients directly into
+their adaptive scan destinations, avoiding a temporary run/level block.
+Malformed input still returns a typed error and discards the failed tile.
+
+Publish `jxr-math` 0.1.1, then the other seven libraries at 0.3.0 in the
+order above after hosted, CPU-oracle, Metal, and CUDA validation pass.

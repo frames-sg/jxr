@@ -111,18 +111,18 @@ dependencies = [
 
 [[package]]
 name = "j2k-core"
-version = "0.11.3"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae969eb19e9b3a8d65c4342f9921717be407571cc0fbc44e4379daa0b588d01c"
+checksum = "e95fe1ed3855b263af459102af993bddc5d8f0689df7b38867831c7bdbd28848"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "j2k-metal-support"
-version = "0.11.3"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ca6e6f9a9ec28efc37ce2ed62c97b43eb9d41ad929541a4bad772f8f85d6ed5"
+checksum = "275aee7758e936c03c6a8929a7c48480f5181f7aa1834195cdca9ec43c53e93d"
 dependencies = [
  "j2k-core",
  "log",
@@ -133,9 +133,9 @@ dependencies = [
 
 [[package]]
 name = "j2k-mpsgraph-support"
-version = "0.11.3"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27fdb19fbe7f89c9d49cad134387f7e4d4cec0b9054b2d10c811b25d81706e75"
+checksum = "d3fbf1068e428c88a9e7295f3e4b37f5cfe6a05a2c13573cdb30db1e6966bf7a"
 dependencies = [
  "block2",
  "objc2",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "jxr"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "jxr-core",
  "jxr-cuda",
@@ -158,14 +158,14 @@ dependencies = [
 
 [[package]]
 name = "jxr-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "j2k-core",
 ]
 
 [[package]]
 name = "jxr-cuda"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "cudarc",
  "jxr-core",
@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-image"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "image",
  "jxr",
@@ -184,11 +184,11 @@ dependencies = [
 
 [[package]]
 name = "jxr-math"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "jxr-metal"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "j2k-core",
  "j2k-metal-support",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-mpsgraph"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "j2k-metal-support",
  "j2k-mpsgraph-support",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-native"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "fearless_simd",
  "jxr-core",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-test-support"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "jxr",
  "jxr-native",

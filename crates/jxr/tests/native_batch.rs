@@ -96,7 +96,7 @@ fn prepared_cpu_batch_is_reusable_and_matches_individual_decode() {
 
     for _ in 0..2 {
         let batch = decoder.decode_prepared(&prepared).unwrap();
-        assert!(batch.errors().is_empty());
+        assert_eq!(batch.errors(), []);
         assert_eq!(batch.groups().len(), 1);
         let group = &batch.groups()[0];
         assert_eq!(group.source_indices(), &[0, 1]);
@@ -264,7 +264,7 @@ fn caller_owned_cpu_destination_receives_dense_images() {
         .decode_prepared_group_into(&prepared.groups()[0], CpuBatchDestination::U8(&mut output))
         .unwrap();
 
-    assert!(result.errors().is_empty());
+    assert_eq!(result.errors(), []);
     assert_eq!(result.source_indices(), &[0, 1]);
     assert_eq!(&output[..256], &output[256..]);
     assert_ne!(output, vec![0xa5; 512]);
@@ -313,7 +313,7 @@ fn separate_alpha_batch_writes_directly_into_the_dense_destination() {
 
     for _ in 0..2 {
         let batch = decoder.decode_prepared(&prepared).unwrap();
-        assert!(batch.errors().is_empty());
+        assert_eq!(batch.errors(), []);
         assert_eq!(batch.groups().len(), 1);
         let CpuBatchSamples::U8(actual) = batch.groups()[0].samples() else {
             panic!("expected U8 batch output");
@@ -383,7 +383,7 @@ fn nchw_u16_batch_writes_directly_into_the_dense_destination() {
 
     for _ in 0..2 {
         let batch = decoder.decode_prepared(&prepared).unwrap();
-        assert!(batch.errors().is_empty());
+        assert_eq!(batch.errors(), []);
         let CpuBatchSamples::U16(actual) = batch.groups()[0].samples() else {
             panic!("expected U16 batch output");
         };
@@ -431,7 +431,7 @@ fn metal_batch_consumes_shared_preparation_and_keeps_resident_outputs() {
     }
     let batch = decoder.decode_prepared(&prepared).unwrap();
 
-    assert!(batch.errors().is_empty());
+    assert_eq!(batch.errors(), []);
     assert!(batch.group_errors().is_empty());
     assert_eq!(batch.groups().len(), 1);
     let group = &batch.groups()[0];
@@ -463,14 +463,14 @@ fn metal_batch_exposes_nonblocking_and_single_allocation_groups() {
     let submitted = decoder.submit_prepared(&prepared).unwrap();
     assert_eq!(submitted.pending_group_count(), 1);
     let resident = submitted.wait();
-    assert!(resident.errors().is_empty());
+    assert_eq!(resident.errors(), []);
     assert!(resident.group_errors().is_empty());
     assert_eq!(resident.groups()[0].images().len(), 2);
 
     let submitted = decoder.submit_prepared_dense(&prepared).unwrap();
     assert_eq!(submitted.pending_group_count(), 1);
     let dense = submitted.wait();
-    assert!(dense.errors().is_empty());
+    assert_eq!(dense.errors(), []);
     assert!(dense.group_errors().is_empty());
     let group = &dense.groups()[0];
     assert_eq!(group.batch().layout().image_count(), 2);

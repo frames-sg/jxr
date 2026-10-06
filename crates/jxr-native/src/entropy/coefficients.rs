@@ -146,6 +146,53 @@ pub fn decode_ac_block(
     start_location: u8,
     state: &mut AcVlcState,
 ) -> Result<DecodedBlock, EntropyError> {
+    let mut output = DecodedBlock {
+        entries: [RunLevel::default(); 15],
+        len: 0,
+        start_location,
+    };
+    decode_ac_coefficients(
+        reader,
+        band,
+        class,
+        start_location,
+        state,
+        |run, _, level| output.push(run, level),
+    )?;
+    Ok(output)
+}
+
+/// Decodes HP coefficients directly into their adaptive scan destinations.
+///
+/// On error, the caller must discard the partial output and scan state along
+/// with the failed tile. The public run/level decoder retains its original
+/// behavior and does not modify a scan until the entire block has decoded.
+pub(crate) fn decode_hp_block(
+    reader: &mut PacketBitReader<'_>,
+    class: ComponentClass,
+    state: &mut AcVlcState,
+    scan: &mut AdaptiveHpScan,
+    direction: HpScanDirection,
+    output: &mut [i32; 16],
+) -> Result<u8, EntropyError> {
+    decode_ac_coefficients(
+        reader,
+        FrequencyBand::Highpass,
+        class,
+        1,
+        state,
+        |_, index, level| scan.place(direction, output, index, level),
+    )
+}
+
+fn decode_ac_coefficients(
+    reader: &mut PacketBitReader<'_>,
+    band: FrequencyBand,
+    class: ComponentClass,
+    start_location: u8,
+    state: &mut AcVlcState,
+    mut emit: impl FnMut(u8, u8, i32) -> Result<(), EntropyError>,
+) -> Result<u8, EntropyError> {
     if band == FrequencyBand::Dc {
         return Err(EntropyError::InvalidParameter {
             parameter: "AC frequency band",
@@ -166,11 +213,7 @@ pub fn decode_ac_block(
     let mut successors = first >> 2;
     let mut context = (first & 1 != 0) && (successors & 1 != 0);
     let mut location = start_location;
-    let mut output = DecodedBlock {
-        entries: [RunLevel::default(); 15],
-        len: 0,
-        start_location,
-    };
+    let mut non_zero = 0;
 
     let magnitude = if first & 2 != 0 {
         decode_abs_level(reader, state.abs_level(context))?
@@ -183,7 +226,8 @@ pub fn decode_ac_block(
         0
     };
     location = advance_location(location, run)?;
-    output.push(run, signed(magnitude, sign)?)?;
+    emit(run, location - 1, signed(magnitude, sign)?)?;
+    non_zero += 1;
 
     while successors != 0 {
         zero_run = successors & 1 == 0;
@@ -202,9 +246,10 @@ pub fn decode_ac_block(
         } else {
             1
         };
-        output.push(run, signed(magnitude, sign)?)?;
+        emit(run, location - 1, signed(magnitude, sign)?)?;
+        non_zero += 1;
     }
-    Ok(output)
+    Ok(non_zero)
 }
 
 impl DecodedBlock {
@@ -353,6 +398,76 @@ fn apply_sign(reader: &mut PacketBitReader<'_>, value: i32) -> Result<i32, Entro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_hp_scan_matches_materialized_blocks_and_errors() {
+        let mut random = 0x75ad_0482_9763_1bcd_u64;
+        let mut state = AcVlcState::new();
+        let mut scan = AdaptiveHpScan::new();
+        let mut successes = 0;
+        let mut failures = 0;
+        for iteration in 0..4096 {
+            let mut bytes = [0; 32];
+            for byte in &mut bytes {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                *byte = random.to_le_bytes()[0];
+            }
+            let class = if iteration & 1 == 0 {
+                ComponentClass::Luma
+            } else {
+                ComponentClass::Chroma
+            };
+            let direction = if iteration & 2 == 0 {
+                HpScanDirection::Horizontal
+            } else {
+                HpScanDirection::Vertical
+            };
+            // Exercise empty, truncated, malformed, and complete blocks while
+            // carrying adaptive history across successful and failed packets.
+            let bit_length = iteration % 257;
+            let mut reader = PacketBitReader::with_bit_length(&bytes, bit_length).unwrap();
+            let mut direct_reader = reader.clone();
+            let mut direct_state = state.clone();
+            let mut direct_scan = scan.clone();
+            let mut expected = [0; 16];
+            let mut actual = [0; 16];
+            let block = decode_ac_block(&mut reader, FrequencyBand::Highpass, class, 1, &mut state);
+            let direct = decode_hp_block(
+                &mut direct_reader,
+                class,
+                &mut direct_state,
+                &mut direct_scan,
+                direction,
+                &mut actual,
+            );
+            assert_eq!(reader.bit_position(), direct_reader.bit_position());
+            assert_eq!(state, direct_state);
+            match block {
+                Ok(block) => {
+                    block
+                        .inverse_scan_hp(&mut scan, direction, &mut expected)
+                        .unwrap();
+                    assert_eq!(direct, Ok(block.non_zero_count()));
+                    assert_eq!(actual, expected);
+                    assert_eq!(direct_scan, scan);
+                    successes += 1;
+                }
+                Err(error) => {
+                    assert_eq!(direct, Err(error));
+                    // A failed tile discards the partially updated direct scan.
+                    failures += 1;
+                }
+            }
+            state.adapt();
+            if iteration % 16 == 15 {
+                scan.reset_totals();
+            }
+        }
+        assert!(successes > 1000, "successful blocks: {successes}");
+        assert!(failures > 100, "failed blocks: {failures}");
+    }
 
     #[test]
     fn dc_without_abs_level_uses_refinement_and_sign() {

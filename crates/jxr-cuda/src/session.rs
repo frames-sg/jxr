@@ -377,25 +377,27 @@ fn decoded_samples(
 }
 
 fn read_u16(bytes: &[u8]) -> Result<Vec<u16>, CudaError> {
-    let chunks = bytes.chunks_exact(2);
-    if !chunks.remainder().is_empty() {
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
         return Err(CudaError::InvalidPlan {
             reason: "16-bit CUDA host readback has a trailing byte",
         });
     }
     Ok(chunks
-        .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
+        .iter()
+        .map(|chunk| u16::from_ne_bytes(*chunk))
         .collect())
 }
 
 fn read_u32(bytes: &[u8]) -> Result<Vec<u32>, CudaError> {
-    let chunks = bytes.chunks_exact(4);
-    if !chunks.remainder().is_empty() {
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
         return Err(CudaError::InvalidPlan {
             reason: "32-bit CUDA host readback has trailing bytes",
         });
     }
     Ok(chunks
-        .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .iter()
+        .map(|chunk| u32::from_ne_bytes(*chunk))
         .collect())
 }

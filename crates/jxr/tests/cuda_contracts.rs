@@ -174,7 +174,7 @@ fn high_level_cuda_batch_preserves_native_groups_and_resident_outputs() {
         .submit_prepared(&decoder.prepare(inputs).unwrap())
         .unwrap();
     let completed = submitted.wait();
-    assert!(completed.errors().is_empty());
+    assert_eq!(completed.errors(), []);
     assert!(completed.group_errors().is_empty());
     assert_eq!(completed.groups().len(), 1);
     assert_eq!(

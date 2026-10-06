@@ -304,7 +304,7 @@ fn quant_map(qp: u8, scaled: bool, scaled_shift: u32) -> Result<u32, TileDecodeE
     } else if qp < 32 {
         ((qp + 3) >> 2, 0)
     } else if qp < 48 {
-        ((17 + qp % 16) >> 1, (qp >> 4) - 2)
+        (u32::midpoint(17, qp % 16), (qp >> 4) - 2)
     } else {
         (16 + qp % 16, (qp >> 4) - 3)
     };

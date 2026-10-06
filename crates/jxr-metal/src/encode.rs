@@ -1015,8 +1015,10 @@ mod tests {
         };
         assert!(
             external
-                .chunks_exact(4)
-                .all(|pixel| pixel == [128, 130, 128, 129])
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == [128, 130, 128, 129])
         );
     }
 
@@ -1034,8 +1036,10 @@ mod tests {
             .with_bytes(|bytes| {
                 assert!(
                     bytes
-                        .chunks_exact(4)
-                        .all(|pixel| pixel == [128, 130, 128, 129])
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|pixel| *pixel == [128, 130, 128, 129])
                 );
             })
             .unwrap();
@@ -1534,7 +1538,7 @@ mod tests {
             &[16, 32, 48, 64, 80],
         );
         assert!(
-            matches!(ncomponent, DecodedSamples::U8(values) if values.chunks_exact(5).all(|pixel| pixel == [129, 130, 131, 132, 133]))
+            matches!(ncomponent, DecodedSamples::U8(values) if values.as_chunks::<5>().0.iter().all(|pixel| *pixel == [129, 130, 131, 132, 133]))
         );
     }
 
@@ -1629,10 +1633,9 @@ mod tests {
             panic!("expected U8 Metal output");
         };
         assert_eq!(samples.len(), 16 * 16 * 4);
+        let pixels = samples.as_chunks::<4>().0;
         assert!(
-            samples
-                .chunks_exact(4)
-                .all(|pixel| pixel == [128, 130, 128, 129]),
+            pixels.iter().all(|pixel| *pixel == [128, 130, 128, 129]),
             "unexpected first pixels: {:?}",
             &samples[..32]
         );
@@ -1687,10 +1690,11 @@ mod tests {
         let resident = batch.wait().unwrap();
         assert_eq!(resident.len(), 2);
         let rgba_bytes = session.readback(&resident[0]).unwrap();
+        let rgba_pixels = rgba_bytes.as_chunks::<4>().0;
         assert!(
-            rgba_bytes
-                .chunks_exact(4)
-                .all(|pixel| pixel == [128, 130, 128, 129])
+            rgba_pixels
+                .iter()
+                .all(|pixel| *pixel == [128, 130, 128, 129])
         );
         assert_eq!(session.readback(&resident[1]).unwrap(), planar);
 
@@ -1701,7 +1705,7 @@ mod tests {
         assert!(matches!(
             &host_batch[0].samples,
             DecodedSamples::U8(values)
-                if values.chunks_exact(4).all(|pixel| pixel == [128, 130, 128, 129])
+                if values.as_chunks::<4>().0.iter().all(|pixel| *pixel == [128, 130, 128, 129])
         ));
         assert_eq!(host_batch[1].samples, DecodedSamples::U8(planar.clone()));
 
@@ -1789,6 +1793,12 @@ mod tests {
         let DecodedSamples::U8(samples) = image.samples else {
             panic!("expected U8 Metal output");
         };
-        assert!(samples.chunks_exact(2).all(|pixel| pixel == [129, 130]));
+        assert!(
+            samples
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == [129, 130])
+        );
     }
 }

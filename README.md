@@ -1,9 +1,11 @@
 # JXR
 
-**Release status:** [JXR 0.2.1](https://crates.io/crates/jxr/0.2.1) is published,
-with J2K dependencies pinned to the published 0.11.3 release. Release notes and
-CPU, Metal, and CUDA reports are attached to the
-[GitHub release](https://github.com/frames-sg/jxr/releases/tag/v0.2.1).
+JXR 0.3.0 uses J2K 0.12.0 and requires Rust 1.99.0.
+See [the release instructions](docs/releasing.md) for validation and migration.
+
+Published packages are available on [crates.io](https://crates.io/crates/jxr).
+Release notes and CPU, Metal, and CUDA reports are attached to the
+[GitHub releases](https://github.com/frames-sg/jxr/releases).
 
 JXR is a JPEG XR implementation with a safe Rust CPU decoder, optional Metal or
 CUDA reconstruction, and a validated Annex-A still-image container writer.

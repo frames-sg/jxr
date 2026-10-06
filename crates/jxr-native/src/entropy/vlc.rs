@@ -49,6 +49,7 @@ impl PrefixTable {
 /// A truncated packet reports `UnexpectedEnd` at the bit where a serial
 /// decoder would stop, and an unmatched full-length prefix reports
 /// `InvalidVlc` at the code start. Neither error consumes input.
+#[inline]
 pub(crate) fn decode(
     reader: &mut PacketBitReader<'_>,
     syntax: &'static str,

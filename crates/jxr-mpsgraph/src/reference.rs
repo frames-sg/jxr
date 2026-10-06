@@ -30,7 +30,7 @@ pub fn rgb8_nhwc_reference_cpu(
         .ok_or(Error::TensorShapeOverflow)?;
     let mut output = Vec::with_capacity(batch);
     for image in pixels.chunks_exact(image_samples) {
-        let sum = image.chunks_exact(3).fold(0.0_f32, |sum, rgb| {
+        let sum = image.as_chunks::<3>().0.iter().fold(0.0_f32, |sum, rgb| {
             sum + f32::from(rgb[0]) * RGB8_REFERENCE_CHANNEL_WEIGHTS[0]
                 + f32::from(rgb[1]) * RGB8_REFERENCE_CHANNEL_WEIGHTS[1]
                 + f32::from(rgb[2]) * RGB8_REFERENCE_CHANNEL_WEIGHTS[2]

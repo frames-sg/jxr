@@ -11,6 +11,7 @@ mod vlc;
 
 pub use adaptive::{AcVlcState, DcVlcState, TileEntropyState};
 pub use bit_reader::PacketBitReader;
+pub(crate) use coefficients::decode_hp_block;
 pub use coefficients::{
     ComponentClass, DecodedBlock, FrequencyBand, RunLevel, decode_ac_block, decode_dc_coefficient,
 };

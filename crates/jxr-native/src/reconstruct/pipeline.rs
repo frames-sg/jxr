@@ -681,10 +681,13 @@ fn transform_macroblock(
     low: &[i32; 16],
     block_count: usize,
 ) -> Result<(), ReconstructionError> {
-    for (coefficients, &dc) in high.chunks_exact_mut(16).zip(low).take(block_count) {
-        let coefficients: &mut [i32; 16] = coefficients
-            .try_into()
-            .expect("a transform block contains sixteen coefficients");
+    for (coefficients, &dc) in high
+        .as_chunks_mut::<16>()
+        .0
+        .iter_mut()
+        .zip(low)
+        .take(block_count)
+    {
         coefficients[0] = dc;
         inverse_core_transform(coefficients)?;
     }

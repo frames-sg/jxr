@@ -13,9 +13,9 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.99.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/frames-sg/jxr"
 homepage = "https://github.com/frames-sg/jxr"
@@ -23,8 +23,8 @@ keywords = ["jpeg", "jpeg-xr", "jxr", "gpu", "decoder"]
 categories = ["multimedia::images", "compression"]
 
 [workspace.dependencies]
-j2k-core = "=0.11.3"
-j2k-metal-support = "=0.11.3"
+j2k-core = "=0.12.0"
+j2k-metal-support = "=0.12.0"
 fearless_simd = "=1.0.0"
 cudarc = { version = "=0.19.10", default-features = false, features = [
     "std",

@@ -3,8 +3,8 @@
 use jxr_core::{ChromaSampling, PredictionMode};
 
 use crate::entropy::{
-    ColourModel, ComponentClass, FrequencyBand, HpScanDirection, PacketBitReader, TileEntropyState,
-    decode_ac_block, decode_flex_block,
+    ColourModel, ComponentClass, HpScanDirection, PacketBitReader, TileEntropyState,
+    decode_flex_block, decode_hp_block,
 };
 
 use super::{TileDecodeError, cbphp::CbphpState, spatial::MacroblockPosition};
@@ -120,15 +120,14 @@ pub(super) fn decode_vlc(
     for block_map in HIERARCHICAL_BLOCK_ORDER {
         let mut vlc = [0_i32; 16];
         if coded_blocks & 1 != 0 {
-            let block = decode_ac_block(
+            non_zero += i32::from(decode_hp_block(
                 reader,
-                FrequencyBand::Highpass,
                 ComponentClass::Luma,
-                1,
                 &mut entropy.hp_vlc,
-            )?;
-            non_zero += i32::from(block.non_zero_count());
-            block.inverse_scan_hp(&mut entropy.hp_scan, direction, &mut vlc)?;
+                &mut entropy.hp_scan,
+                direction,
+                &mut vlc,
+            )?);
         }
         finish_block(
             reader,
@@ -190,15 +189,14 @@ pub(super) fn decode_yuv(
             };
             let mut vlc = [0_i32; 16];
             if coded_blocks[component] & 1 != 0 {
-                let block = decode_ac_block(
+                lap_mean[class_index] += i32::from(decode_hp_block(
                     reader,
-                    FrequencyBand::Highpass,
                     class,
-                    1,
                     &mut entropy.hp_vlc,
-                )?;
-                lap_mean[class_index] += i32::from(block.non_zero_count());
-                block.inverse_scan_hp(&mut entropy.hp_scan, direction, &mut vlc)?;
+                    &mut entropy.hp_scan,
+                    direction,
+                    &mut vlc,
+                )?);
             }
             finish_block(
                 reader,
@@ -259,15 +257,14 @@ pub(super) fn decode_components(
         for block_map in HIERARCHICAL_BLOCK_ORDER {
             let mut vlc = [0_i32; 16];
             if coded_blocks & 1 != 0 {
-                let block = decode_ac_block(
+                lap_mean[class_index] += i32::from(decode_hp_block(
                     reader,
-                    FrequencyBand::Highpass,
                     class,
-                    1,
                     &mut entropy.hp_vlc,
-                )?;
-                lap_mean[class_index] += i32::from(block.non_zero_count());
-                block.inverse_scan_hp(&mut entropy.hp_scan, direction, &mut vlc)?;
+                    &mut entropy.hp_scan,
+                    direction,
+                    &mut vlc,
+                )?);
             }
             finish_block(
                 reader,

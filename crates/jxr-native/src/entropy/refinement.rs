@@ -5,6 +5,7 @@ use super::{EntropyError, PacketBitReader};
 const TRANSPOSE: [usize; 16] = [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
 
 /// Decode one HP flexbits value as specified by T.832 Table 85.
+#[inline]
 pub fn decode_flex(
     reader: &mut PacketBitReader<'_>,
     vlc_coefficient: i32,
