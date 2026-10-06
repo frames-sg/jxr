@@ -1,7 +1,8 @@
 # JXR
 
-JXR 0.3.0 uses J2K 0.12.0 and requires Rust 1.99.0.
-See [the release instructions](docs/releasing.md) for validation and migration.
+**Release status:** [JXR 0.3.0](https://crates.io/crates/jxr/0.3.0) is published,
+with J2K dependencies pinned to 0.12.0 and Rust 1.99.0 required. See
+[the release notes](docs/releasing.md#030-release-line) for validation and migration.
 
 Published packages are available on [crates.io](https://crates.io/crates/jxr).
 Release notes and CPU, Metal, and CUDA reports are attached to the

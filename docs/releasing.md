@@ -122,5 +122,11 @@ decoder adds inlining hints and places highpass coefficients directly into
 their adaptive scan destinations, avoiding a temporary run/level block.
 Malformed input still returns a typed error and discards the failed tile.
 
-Publish `jxr-math` 0.1.1, then the other seven libraries at 0.3.0 in the
-order above after hosted, CPU-oracle, Metal, and CUDA validation pass.
+Published `jxr-math` 0.1.1 and the other seven libraries at 0.3.0 in the
+order above. The [hosted checks](https://github.com/frames-sg/jxr/actions/runs/37444721162),
+[Metal hardware validation](https://github.com/frames-sg/jxr/actions/runs/37444774439),
+and [CUDA hardware validation](https://github.com/frames-sg/jxr/actions/runs/37444777485)
+passed for the tagged source. CPU, Annex-A writer, Metal, and CUDA reference
+comparisons each passed 517 in-scope cases, with 179 declared scope exclusions
+and no failures. The reports and hardware benchmark results are attached to
+the [0.3.0 release](https://github.com/frames-sg/jxr/releases/tag/v0.3.0).
