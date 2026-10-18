@@ -8,17 +8,17 @@ use crate::{
         ColourModel, ComponentClass, PacketBitReader, TileEntropyState, decode_dc_coefficient,
         decode_lp_block, decode_lp_refinement,
     },
-    reconstruct::QuantizedMacroblock,
 };
 
 use super::{
-    DecodedTile, TileDecodeError,
+    TileDecodeError,
     cbphp::CbphpState,
     high_pass::{self, HighpassPayload},
+    output::{MacroblockRecord, PlaneWriter},
     quantizer::TileQuantizers,
     spatial::{
-        MacroblockPosition, SpatialMacroblock, checked_add, consume_byte_alignment,
-        parse_packet_prefix, predict_low_pass, read_u8, spatial_macroblock,
+        MacroblockPosition, PredictionNeighbour, PredictionRecord, checked_add,
+        consume_byte_alignment, parse_packet_prefix, predict_low_pass, read_u8, spatial_macroblock,
     },
 };
 
@@ -28,7 +28,8 @@ pub(super) fn decode_spatial_tile(
     bands: BandPresence,
     tile_width: u32,
     tile_height: u32,
-) -> Result<DecodedTile, TileDecodeError> {
+    output: &mut [PlaneWriter<'_>],
+) -> Result<(), TileDecodeError> {
     let plane = &parsed.headers.primary;
     let (width, height, count) = tile_geometry(tile_width, tile_height)?;
     let mut reader = PacketBitReader::new(packet);
@@ -48,11 +49,10 @@ pub(super) fn decode_spatial_tile(
     )?;
     for y in 0..height {
         for x in 0..width {
-            decoder.decode_macroblock(&mut reader, MacroblockPosition { width, x, y })?;
+            decoder.decode_macroblock(&mut reader, MacroblockPosition { width, x, y }, output)?;
         }
     }
-    consume_byte_alignment(&mut reader)?;
-    Ok(decoder.finish())
+    consume_byte_alignment(&mut reader)
 }
 
 struct TileSyntax<'a> {
@@ -64,7 +64,7 @@ struct TileSyntax<'a> {
 
 pub(super) struct SpatialDecoder<'a> {
     syntax: TileSyntax<'a>,
-    decoded: Vec<Vec<SpatialMacroblock>>,
+    history: Vec<Vec<PredictionRecord>>,
     entropy: TileEntropyState,
     cbphp: CbphpState,
 }
@@ -88,7 +88,7 @@ impl<'a> SpatialDecoder<'a> {
                 bands,
                 trim,
             },
-            decoded: (0..components)
+            history: (0..components)
                 .map(|_| Vec::with_capacity(capacity))
                 .collect(),
             entropy,
@@ -100,7 +100,11 @@ impl<'a> SpatialDecoder<'a> {
         &mut self,
         reader: &mut PacketBitReader<'_>,
         position: MacroblockPosition,
+        output: &mut [PlaneWriter<'_>],
     ) -> Result<(), TileDecodeError> {
+        if output.len() != self.history.len() {
+            return Err(TileDecodeError::InvalidPlan("decoded component count"));
+        }
         if position.x.is_multiple_of(16) {
             self.entropy.reset_scan_totals();
         }
@@ -109,8 +113,9 @@ impl<'a> SpatialDecoder<'a> {
             &mut self.entropy,
             &mut self.cbphp,
             &self.syntax,
-            &mut self.decoded,
+            &mut self.history,
             position,
+            output,
         )?;
         if position.x + 1 == position.width || position.x.is_multiple_of(16) {
             self.entropy.dc_vlc.adapt();
@@ -120,12 +125,6 @@ impl<'a> SpatialDecoder<'a> {
         }
         Ok(())
     }
-
-    pub(super) fn finish(self) -> DecodedTile {
-        DecodedTile {
-            components: self.decoded,
-        }
-    }
 }
 
 fn decode_macroblock(
@@ -133,8 +132,9 @@ fn decode_macroblock(
     entropy: &mut TileEntropyState,
     cbphp: &mut CbphpState,
     syntax: &TileSyntax<'_>,
-    decoded: &mut [Vec<SpatialMacroblock>],
+    decoded: &mut [Vec<PredictionRecord>],
     position: MacroblockPosition,
+    output: &mut [PlaneWriter<'_>],
 ) -> Result<(), TileDecodeError> {
     let qp_indices = syntax.quantizers.indices(reader)?;
     let (dc, dc_mode) = decode_dc(reader, entropy, decoded, position, syntax.plane)?;
@@ -179,30 +179,33 @@ fn decode_macroblock(
     } else {
         vec![[0_i32; 256]; decoded.len()]
     };
-    for component in 0..decoded.len() {
-        decoded[component].push(SpatialMacroblock {
-            coefficients: QuantizedMacroblock {
-                dc_low_pass: low[component],
-                high_pass: high[component],
+    for (component, output) in output.iter_mut().enumerate() {
+        output.push(
+            &low[component],
+            &high[component],
+            MacroblockRecord {
                 quantizers: syntax.quantizers.reconstruction_steps_for(
                     component,
                     qp_indices,
                     syntax.plane.scaled,
                 )?,
                 bands: syntax.bands,
+                prediction: dc_mode,
+                hp_prediction: hp_mode,
             },
-            prediction: dc_mode,
-            hp_prediction: hp_mode,
+        )?;
+        decoded[component].push(PredictionRecord {
+            dc_low_pass: low[component],
             lp_qp_index: qp_indices.lp,
         });
     }
     Ok(())
 }
 
-pub(super) fn decode_dc(
+pub(super) fn decode_dc<M: PredictionNeighbour>(
     reader: &mut PacketBitReader<'_>,
     entropy: &mut TileEntropyState,
-    decoded: &[Vec<SpatialMacroblock>],
+    decoded: &[Vec<M>],
     position: MacroblockPosition,
     plane: &ImagePlaneHeader,
 ) -> Result<(Vec<i32>, PredictionMode), TileDecodeError> {
@@ -233,10 +236,10 @@ pub(super) fn decode_dc(
     Ok((residuals, mode))
 }
 
-pub(super) fn decode_low_pass(
+pub(super) fn decode_low_pass<M: PredictionNeighbour>(
     reader: &mut PacketBitReader<'_>,
     entropy: &mut TileEntropyState,
-    decoded: &[Vec<SpatialMacroblock>],
+    decoded: &[Vec<M>],
     position: MacroblockPosition,
     qp_index: u8,
     dc_mode: PredictionMode,
@@ -281,8 +284,8 @@ pub(super) fn decode_low_pass(
     Ok(())
 }
 
-fn dc_prediction_mode(
-    decoded: &[Vec<SpatialMacroblock>],
+fn dc_prediction_mode<M: PredictionNeighbour>(
+    decoded: &[Vec<M>],
     position: MacroblockPosition,
     yuvk: bool,
 ) -> Result<PredictionMode, TileDecodeError> {
@@ -317,9 +320,9 @@ fn dc_prediction_mode(
     })
 }
 
-fn predict_dc_value(
+fn predict_dc_value<M: PredictionNeighbour>(
     residual: i32,
-    decoded: &[SpatialMacroblock],
+    decoded: &[M],
     position: MacroblockPosition,
     mode: PredictionMode,
 ) -> Result<i32, TileDecodeError> {
@@ -346,15 +349,13 @@ fn predict_dc_value(
     }
 }
 
-fn dc_at(
-    decoded: &[SpatialMacroblock],
+fn dc_at<M: PredictionNeighbour>(
+    decoded: &[M],
     width: usize,
     x: usize,
     y: usize,
 ) -> Result<i32, TileDecodeError> {
-    Ok(spatial_macroblock(decoded, width, x, y)?
-        .coefficients
-        .dc_low_pass[0])
+    Ok(spatial_macroblock(decoded, width, x, y)?.dc_low_pass()[0])
 }
 
 fn validate_plane(plane: &ImagePlaneHeader) -> Result<usize, TileDecodeError> {

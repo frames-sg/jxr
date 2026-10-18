@@ -15,6 +15,7 @@ use super::{
     TileDecodeError,
     cbphp::CbphpState,
     high_pass::{self, HighpassPayload},
+    output::{MacroblockRecord, PlaneWriter},
     quantizer::TileQuantizers,
 };
 
@@ -27,6 +28,43 @@ pub(super) struct SpatialMacroblock {
     pub(super) lp_qp_index: u8,
 }
 
+/// Decoded state of an earlier macroblock read by DC and LP prediction.
+///
+/// Spatial traversals keep only [`PredictionRecord`]s because their
+/// coefficients are stored as each macroblock completes; frequency traversals
+/// keep whole [`SpatialMacroblock`]s until every band is decoded.
+pub(in crate::tile_decode) trait PredictionNeighbour {
+    fn dc_low_pass(&self) -> &[i32; 16];
+    fn lp_qp_index(&self) -> u8;
+}
+
+impl PredictionNeighbour for SpatialMacroblock {
+    fn dc_low_pass(&self) -> &[i32; 16] {
+        &self.coefficients.dc_low_pass
+    }
+
+    fn lp_qp_index(&self) -> u8 {
+        self.lp_qp_index
+    }
+}
+
+/// Prediction-resolved DC/LP values and LP quantizer index of one macroblock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tile_decode) struct PredictionRecord {
+    pub(in crate::tile_decode) dc_low_pass: [i32; 16],
+    pub(in crate::tile_decode) lp_qp_index: u8,
+}
+
+impl PredictionNeighbour for PredictionRecord {
+    fn dc_low_pass(&self) -> &[i32; 16] {
+        &self.dc_low_pass
+    }
+
+    fn lp_qp_index(&self) -> u8 {
+        self.lp_qp_index
+    }
+}
+
 pub(super) fn decode_spatial_packet(
     packet: &[u8],
     plane: &ImagePlaneHeader,
@@ -34,7 +72,8 @@ pub(super) fn decode_spatial_packet(
     tile_width: u32,
     tile_height: u32,
     trim_flexbits_present: bool,
-) -> Result<Vec<SpatialMacroblock>, TileDecodeError> {
+    output: &mut PlaneWriter<'_>,
+) -> Result<(), TileDecodeError> {
     validate_y_only(plane)?;
     let mut reader = PacketBitReader::new(packet);
     parse_packet_prefix(&mut reader)?;
@@ -81,22 +120,25 @@ pub(super) fn decode_spatial_packet(
                 trim_flexbits,
             )?;
             let steps = quantizers.reconstruction_steps(qp_indices, plane.scaled)?;
-            decoded.push(SpatialMacroblock {
-                coefficients: QuantizedMacroblock {
-                    dc_low_pass: low,
-                    high_pass: high,
+            output.push(
+                &low,
+                &high,
+                MacroblockRecord {
                     quantizers: steps,
                     bands,
+                    prediction,
+                    hp_prediction: hp_mode,
                 },
-                prediction,
-                hp_prediction: hp_mode,
+            )?;
+            decoded.push(PredictionRecord {
+                dc_low_pass: low,
                 lp_qp_index: qp_indices.lp,
             });
             adapt_at_boundary(&mut entropy, &mut cbphp, x, width);
         }
     }
     consume_byte_alignment(&mut reader)?;
-    Ok(decoded)
+    Ok(())
 }
 
 pub(super) fn validate_y_only(plane: &ImagePlaneHeader) -> Result<(), TileDecodeError> {
@@ -119,10 +161,10 @@ pub(super) fn parse_packet_prefix(reader: &mut PacketBitReader<'_>) -> Result<()
     Ok(())
 }
 
-pub(super) fn decode_low_bands(
+pub(super) fn decode_low_bands<M: PredictionNeighbour>(
     reader: &mut PacketBitReader<'_>,
     entropy: &mut TileEntropyState,
-    decoded: &[SpatialMacroblock],
+    decoded: &[M],
     position: MacroblockPosition,
     lp_qp_index: u8,
     bands: BandPresence,
@@ -137,10 +179,10 @@ pub(super) fn decode_low_bands(
     Ok((low, prediction.mode))
 }
 
-pub(super) fn decode_dc_band(
+pub(super) fn decode_dc_band<M: PredictionNeighbour>(
     reader: &mut PacketBitReader<'_>,
     entropy: &mut TileEntropyState,
-    decoded: &[SpatialMacroblock],
+    decoded: &[M],
     position: MacroblockPosition,
 ) -> Result<DcPrediction, TileDecodeError> {
     let has_abs_level = reader.read_bit()?;
@@ -170,9 +212,9 @@ pub(super) struct MacroblockPosition {
     pub(super) y: usize,
 }
 
-pub(super) fn predict_dc(
+pub(super) fn predict_dc<M: PredictionNeighbour>(
     value: i32,
-    decoded: &[SpatialMacroblock],
+    decoded: &[M],
     width: usize,
     x: usize,
     y: usize,
@@ -182,9 +224,9 @@ pub(super) fn predict_dc(
         (true, false) => PredictionMode::FromTop,
         (false, true) => PredictionMode::FromLeft,
         (false, false) => {
-            let left = macroblock(decoded, width, x - 1, y)?.dc_low_pass[0];
-            let top = macroblock(decoded, width, x, y - 1)?.dc_low_pass[0];
-            let top_left = macroblock(decoded, width, x - 1, y - 1)?.dc_low_pass[0];
+            let left = low_pass_at(decoded, width, x - 1, y)?[0];
+            let top = low_pass_at(decoded, width, x, y - 1)?[0];
+            let top_left = low_pass_at(decoded, width, x - 1, y - 1)?[0];
             let horizontal = top_left.abs_diff(left);
             let vertical = top_left.abs_diff(top);
             if horizontal.saturating_mul(4) < vertical {
@@ -200,17 +242,17 @@ pub(super) fn predict_dc(
         PredictionMode::None => value,
         PredictionMode::FromLeft => checked_add(
             value,
-            macroblock(decoded, width, x - 1, y)?.dc_low_pass[0],
+            low_pass_at(decoded, width, x - 1, y)?[0],
             "left DC prediction",
         )?,
         PredictionMode::FromTop => checked_add(
             value,
-            macroblock(decoded, width, x, y - 1)?.dc_low_pass[0],
+            low_pass_at(decoded, width, x, y - 1)?[0],
             "top DC prediction",
         )?,
         PredictionMode::FromTopLeft => {
-            let left = macroblock(decoded, width, x - 1, y)?.dc_low_pass[0];
-            let top = macroblock(decoded, width, x, y - 1)?.dc_low_pass[0];
+            let left = low_pass_at(decoded, width, x - 1, y)?[0];
+            let top = low_pass_at(decoded, width, x, y - 1)?[0];
             let average = (i64::from(left) + i64::from(top)) >> 1;
             let average = i32::try_from(average)
                 .map_err(|_| TileDecodeError::ArithmeticOverflow("DC prediction average"))?;
@@ -248,9 +290,9 @@ pub(super) fn decode_low_pass(
     Ok(())
 }
 
-pub(super) fn predict_low_pass(
+pub(super) fn predict_low_pass<M: PredictionNeighbour>(
     current: &mut [i32; 16],
-    decoded: &[SpatialMacroblock],
+    decoded: &[M],
     position: MacroblockPosition,
     dc_mode: PredictionMode,
     lp_qp_index: u8,
@@ -259,13 +301,13 @@ pub(super) fn predict_low_pass(
     let MacroblockPosition { width, x, y } = position;
     match mode {
         PredictionMode::FromLeft => {
-            let left = &macroblock(decoded, width, x - 1, y)?.dc_low_pass;
+            let left = low_pass_at(decoded, width, x - 1, y)?;
             for index in [4, 8, 12] {
                 current[index] = checked_add(current[index], left[index], "left LP prediction")?;
             }
         }
         PredictionMode::FromTop => {
-            let top = &macroblock(decoded, width, x, y - 1)?.dc_low_pass;
+            let top = low_pass_at(decoded, width, x, y - 1)?;
             for index in 1..=3 {
                 current[index] = checked_add(current[index], top[index], "top LP prediction")?;
             }
@@ -275,8 +317,8 @@ pub(super) fn predict_low_pass(
     Ok(())
 }
 
-pub(in crate::tile_decode) fn low_pass_prediction_mode(
-    decoded: &[SpatialMacroblock],
+pub(in crate::tile_decode) fn low_pass_prediction_mode<M: PredictionNeighbour>(
+    decoded: &[M],
     position: MacroblockPosition,
     dc_mode: PredictionMode,
     lp_qp_index: u8,
@@ -284,12 +326,12 @@ pub(in crate::tile_decode) fn low_pass_prediction_mode(
     let MacroblockPosition { width, x, y } = position;
     Ok(match dc_mode {
         PredictionMode::FromLeft
-            if spatial_macroblock(decoded, width, x - 1, y)?.lp_qp_index == lp_qp_index =>
+            if spatial_macroblock(decoded, width, x - 1, y)?.lp_qp_index() == lp_qp_index =>
         {
             PredictionMode::FromLeft
         }
         PredictionMode::FromTop
-            if spatial_macroblock(decoded, width, x, y - 1)?.lp_qp_index == lp_qp_index =>
+            if spatial_macroblock(decoded, width, x, y - 1)?.lp_qp_index() == lp_qp_index =>
         {
             PredictionMode::FromTop
         }
@@ -346,24 +388,21 @@ pub(super) fn consume_byte_alignment(
     Ok(())
 }
 
-fn macroblock(
-    decoded: &[SpatialMacroblock],
+fn low_pass_at<M: PredictionNeighbour>(
+    decoded: &[M],
     width: usize,
     x: usize,
     y: usize,
-) -> Result<&QuantizedMacroblock, TileDecodeError> {
-    decoded
-        .get(y.saturating_mul(width).saturating_add(x))
-        .map(|entry| &entry.coefficients)
-        .ok_or(TileDecodeError::InvalidPlan("prediction neighbour"))
+) -> Result<&[i32; 16], TileDecodeError> {
+    spatial_macroblock(decoded, width, x, y).map(PredictionNeighbour::dc_low_pass)
 }
 
-pub(in crate::tile_decode) fn spatial_macroblock(
-    decoded: &[SpatialMacroblock],
+pub(in crate::tile_decode) fn spatial_macroblock<M: PredictionNeighbour>(
+    decoded: &[M],
     width: usize,
     x: usize,
     y: usize,
-) -> Result<&SpatialMacroblock, TileDecodeError> {
+) -> Result<&M, TileDecodeError> {
     decoded
         .get(y.saturating_mul(width).saturating_add(x))
         .ok_or(TileDecodeError::InvalidPlan("prediction neighbour"))

@@ -9,6 +9,7 @@ mod integrated_alpha;
 mod integrated_alpha_frequency;
 mod multicomponent;
 mod multicomponent_frequency;
+mod output;
 mod quantizer;
 mod spatial;
 mod yuv;
@@ -33,28 +34,22 @@ pub fn decode_tiles(
     plan: &PreparedPlan,
 ) -> Result<CoefficientArena, TileDecodeError> {
     validate_decode_scope(parsed)?;
-    let grid = &plan.info.tiles;
-    let expected_tiles = grid
-        .column_widths
-        .len()
-        .checked_mul(grid.row_heights.len())
-        .ok_or(TileDecodeError::ArithmeticOverflow("tile count"))?;
-    if plan.tiles.len() != expected_tiles {
-        return Err(TileDecodeError::InvalidPlan("tile count"));
-    }
-    let primary_components = usize::from(parsed.headers.primary.components);
-    let component_count = primary_components + usize::from(parsed.headers.alpha.is_some());
-    let mut arena = allocate_arena(plan, component_count, primary_components)?;
-    let locations = tile_locations(parsed, plan, expected_tiles)?;
-    let decoded = dispatch::decode_packets(source, parsed, plan, &locations)?;
-    append_planes(
+    validate_tile_count(plan)?;
+    let layouts = plane_layouts(parsed, plan);
+    let (coefficient_count, macroblock_count) = arena_capacity(plan, &layouts)?;
+    let mut arena = CoefficientArena {
+        coefficients: vec![0; coefficient_count],
+        macroblocks: macroblock_metadata(macroblock_count),
+        planes: Vec::with_capacity(layouts.len()),
+    };
+    decode_planes(
+        source,
+        parsed,
+        plan,
+        &layouts,
         &mut arena.coefficients,
         &mut arena.macroblocks,
         &mut arena.planes,
-        decoded,
-        component_count,
-        primary_components,
-        plan.info.primary.color_format,
     )?;
     arena
         .validate()
@@ -70,33 +65,21 @@ pub fn decode_tiles_reusing(
     arena: &mut CoefficientArena,
 ) -> Result<bool, TileDecodeError> {
     validate_decode_scope(parsed)?;
-    let grid = &plan.info.tiles;
-    let expected_tiles = grid
-        .column_widths
-        .len()
-        .checked_mul(grid.row_heights.len())
-        .ok_or(TileDecodeError::ArithmeticOverflow("tile count"))?;
-    if plan.tiles.len() != expected_tiles {
-        return Err(TileDecodeError::InvalidPlan("tile count"));
-    }
-    let primary_components = usize::from(parsed.headers.primary.components);
-    let component_count = primary_components + usize::from(parsed.headers.alpha.is_some());
-    let (coefficient_count, macroblock_count) =
-        arena_capacity(plan, component_count, primary_components)?;
+    validate_tile_count(plan)?;
+    let layouts = plane_layouts(parsed, plan);
+    let (coefficient_count, macroblock_count) = arena_capacity(plan, &layouts)?;
     let reused = arena.coefficients.capacity() >= coefficient_count
-        && arena.planes.capacity() >= component_count
+        && arena.planes.capacity() >= layouts.len()
         && macroblock_capacity(&arena.macroblocks) >= macroblock_count;
-    prepare_reusable_arena(arena, coefficient_count, macroblock_count, component_count);
-    let locations = tile_locations(parsed, plan, expected_tiles)?;
-    let decoded = dispatch::decode_packets(source, parsed, plan, &locations)?;
-    append_planes(
+    prepare_reusable_arena(arena, coefficient_count, macroblock_count, layouts.len());
+    decode_planes(
+        source,
+        parsed,
+        plan,
+        &layouts,
         &mut arena.coefficients,
         &mut arena.macroblocks,
         &mut arena.planes,
-        decoded,
-        component_count,
-        primary_components,
-        plan.info.primary.color_format,
     )?;
     arena
         .validate()
@@ -112,43 +95,25 @@ pub fn decode_tiles_into(
     destination: &mut [i32],
 ) -> Result<CoefficientArenaDescriptor, TileDecodeError> {
     validate_decode_scope(parsed)?;
-    let grid = &plan.info.tiles;
-    let expected_tiles = grid
-        .column_widths
-        .len()
-        .checked_mul(grid.row_heights.len())
-        .ok_or(TileDecodeError::ArithmeticOverflow("tile count"))?;
-    if plan.tiles.len() != expected_tiles {
-        return Err(TileDecodeError::InvalidPlan("tile count"));
-    }
-    let primary_components = usize::from(parsed.headers.primary.components);
-    let component_count = primary_components + usize::from(parsed.headers.alpha.is_some());
-    let (coefficient_count, macroblock_count) =
-        arena_capacity(plan, component_count, primary_components)?;
+    validate_tile_count(plan)?;
+    let layouts = plane_layouts(parsed, plan);
+    let (coefficient_count, macroblock_count) = arena_capacity(plan, &layouts)?;
     if destination.len() != coefficient_count {
         return Err(TileDecodeError::InvalidPlan(
             "external coefficient storage length",
         ));
     }
-    let locations = tile_locations(parsed, plan, expected_tiles)?;
-    let decoded = dispatch::decode_packets(source, parsed, plan, &locations)?;
-    let mut target = SliceTarget::new(destination);
     let mut macroblocks = macroblock_metadata(macroblock_count);
-    let mut planes = Vec::with_capacity(component_count);
-    append_planes(
-        &mut target,
+    let mut planes = Vec::with_capacity(layouts.len());
+    decode_planes(
+        source,
+        parsed,
+        plan,
+        &layouts,
+        destination,
         &mut macroblocks,
         &mut planes,
-        decoded,
-        component_count,
-        primary_components,
-        plan.info.primary.color_format,
     )?;
-    if target.len() != coefficient_count {
-        return Err(TileDecodeError::InvalidPlan(
-            "external coefficient storage fill length",
-        ));
-    }
     let descriptor = CoefficientArenaDescriptor {
         coefficient_count,
         macroblocks,
@@ -165,47 +130,53 @@ pub fn coefficient_count(
     parsed: &ParsedCodestream,
     plan: &PreparedPlan,
 ) -> Result<usize, TileDecodeError> {
+    arena_capacity(plan, &plane_layouts(parsed, plan)).map(|(coefficients, _)| coefficients)
+}
+
+/// Decode every selected tile directly into its plane-major coefficient
+/// windows, then append the macroblock metadata in arena order.
+fn decode_planes(
+    source: &[u8],
+    parsed: &ParsedCodestream,
+    plan: &PreparedPlan,
+    layouts: &[output::PlaneLayout],
+    coefficients: &mut [i32],
+    macroblocks: &mut MacroblockMetadata,
+    planes: &mut Vec<CoefficientPlane>,
+) -> Result<(), TileDecodeError> {
+    let locations = tile_locations(parsed, plan, plan.tiles.len())?;
+    let coefficient_count = coefficients.len();
+    let writers = output::split_planes(coefficients, layouts, &plan.tiles)?;
+    let decoded = dispatch::decode_packets(source, parsed, plan, &locations, writers)?;
+    let written = output::append_metadata(macroblocks, planes, &decoded, layouts)?;
+    if written != coefficient_count {
+        return Err(TileDecodeError::InvalidPlan(
+            "external coefficient storage fill length",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tile_count(plan: &PreparedPlan) -> Result<(), TileDecodeError> {
+    let grid = &plan.info.tiles;
+    let expected_tiles = grid
+        .column_widths
+        .len()
+        .checked_mul(grid.row_heights.len())
+        .ok_or(TileDecodeError::ArithmeticOverflow("tile count"))?;
+    if plan.tiles.len() != expected_tiles {
+        return Err(TileDecodeError::InvalidPlan("tile count"));
+    }
+    Ok(())
+}
+
+/// Per-component coefficient geometry: primary components, then an
+/// integrated alpha plane when present.
+fn plane_layouts(parsed: &ParsedCodestream, plan: &PreparedPlan) -> Vec<output::PlaneLayout> {
     let primary_components = usize::from(parsed.headers.primary.components);
     let component_count = primary_components + usize::from(parsed.headers.alpha.is_some());
-    arena_capacity(plan, component_count, primary_components).map(|(coefficients, _)| coefficients)
-}
-
-fn allocate_arena(
-    plan: &PreparedPlan,
-    component_count: usize,
-    primary_components: usize,
-) -> Result<CoefficientArena, TileDecodeError> {
-    let (coefficient_count, total_macroblocks) =
-        arena_capacity(plan, component_count, primary_components)?;
-    Ok(CoefficientArena {
-        coefficients: Vec::with_capacity(coefficient_count),
-        macroblocks: macroblock_metadata(total_macroblocks),
-        planes: Vec::with_capacity(component_count),
-    })
-}
-
-fn arena_capacity(
-    plan: &PreparedPlan,
-    component_count: usize,
-    primary_components: usize,
-) -> Result<(usize, usize), TileDecodeError> {
-    let plane_macroblocks = plan
-        .tiles
-        .iter()
-        .filter(|tile| tile.required_for_reconstruction)
-        .try_fold(0_usize, |total, tile| {
-            usize::try_from(tile.macroblock_count)
-                .ok()
-                .and_then(|count| total.checked_add(count))
-        })
-        .ok_or(TileDecodeError::ArithmeticOverflow(
-            "plane macroblock count",
-        ))?;
-    let total_macroblocks = plane_macroblocks.checked_mul(component_count).ok_or(
-        TileDecodeError::ArithmeticOverflow("component macroblock count"),
-    )?;
-    let coefficients_per_macroblock =
-        (0..component_count).try_fold(0_usize, |total, component| {
+    (0..component_count)
+        .map(|component| {
             let geometry = if component < primary_components {
                 component_geometry(plan.info.primary.color_format, component)
             } else {
@@ -222,15 +193,44 @@ fn arena_capacity(
                     .as_ref()
                     .map_or(plan.info.primary.bands, |alpha| alpha.bands)
             };
-            total
-                .checked_add(coefficients_per_macroblock(
+            output::PlaneLayout {
+                geometry,
+                coefficients_per_macroblock: coefficients_per_macroblock(
                     plan.scale.retained_bands(available_bands),
                     geometry.block_count(),
-                ))
-                .ok_or(TileDecodeError::ArithmeticOverflow(
-                    "coefficient arena size",
-                ))
-        })?;
+                ),
+            }
+        })
+        .collect()
+}
+
+fn arena_capacity(
+    plan: &PreparedPlan,
+    layouts: &[output::PlaneLayout],
+) -> Result<(usize, usize), TileDecodeError> {
+    let plane_macroblocks = plan
+        .tiles
+        .iter()
+        .filter(|tile| tile.required_for_reconstruction)
+        .try_fold(0_usize, |total, tile| {
+            usize::try_from(tile.macroblock_count)
+                .ok()
+                .and_then(|count| total.checked_add(count))
+        })
+        .ok_or(TileDecodeError::ArithmeticOverflow(
+            "plane macroblock count",
+        ))?;
+    let total_macroblocks =
+        plane_macroblocks
+            .checked_mul(layouts.len())
+            .ok_or(TileDecodeError::ArithmeticOverflow(
+                "component macroblock count",
+            ))?;
+    let coefficients_per_macroblock = layouts.iter().try_fold(0_usize, |total, layout| {
+        total.checked_add(layout.coefficients_per_macroblock).ok_or(
+            TileDecodeError::ArithmeticOverflow("coefficient arena size"),
+        )
+    })?;
     let coefficient_count = plane_macroblocks
         .checked_mul(coefficients_per_macroblock)
         .ok_or(TileDecodeError::ArithmeticOverflow(
@@ -278,9 +278,12 @@ fn prepare_reusable_arena(
     macroblock_count: usize,
     component_count: usize,
 ) {
-    arena.coefficients.clear();
+    // Tile decoders overwrite every element, so retained values are never
+    // read and reused storage is resized without clearing it first.
     if arena.coefficients.capacity() < coefficient_count {
-        arena.coefficients.reserve(coefficient_count);
+        arena.coefficients = vec![0; coefficient_count];
+    } else {
+        arena.coefficients.resize(coefficient_count, 0);
     }
     arena.planes.clear();
     if arena.planes.capacity() < component_count {
@@ -393,80 +396,9 @@ struct TileLocation {
     margin_top: u32,
 }
 
+/// Macroblocks of a frequency-mode traversal, stored once the tile completes.
 pub(in crate::tile_decode) struct DecodedTile {
     pub(in crate::tile_decode) components: Vec<Vec<spatial::SpatialMacroblock>>,
-}
-
-trait CoefficientTarget {
-    fn len(&self) -> usize;
-    fn push(&mut self, value: i32) -> Result<(), TileDecodeError>;
-    fn extend_from_slice(&mut self, values: &[i32]) -> Result<(), TileDecodeError>;
-}
-
-impl CoefficientTarget for Vec<i32> {
-    fn len(&self) -> usize {
-        Vec::len(self)
-    }
-
-    fn push(&mut self, value: i32) -> Result<(), TileDecodeError> {
-        Vec::push(self, value);
-        Ok(())
-    }
-
-    fn extend_from_slice(&mut self, values: &[i32]) -> Result<(), TileDecodeError> {
-        Vec::extend_from_slice(self, values);
-        Ok(())
-    }
-}
-
-struct SliceTarget<'a> {
-    destination: &'a mut [i32],
-    written: usize,
-}
-
-impl<'a> SliceTarget<'a> {
-    const fn new(destination: &'a mut [i32]) -> Self {
-        Self {
-            destination,
-            written: 0,
-        }
-    }
-}
-
-impl CoefficientTarget for SliceTarget<'_> {
-    fn len(&self) -> usize {
-        self.written
-    }
-
-    fn push(&mut self, value: i32) -> Result<(), TileDecodeError> {
-        let slot = self
-            .destination
-            .get_mut(self.written)
-            .ok_or(TileDecodeError::InvalidPlan(
-                "external coefficient storage overflow",
-            ))?;
-        *slot = value;
-        self.written += 1;
-        Ok(())
-    }
-
-    fn extend_from_slice(&mut self, values: &[i32]) -> Result<(), TileDecodeError> {
-        let end =
-            self.written
-                .checked_add(values.len())
-                .ok_or(TileDecodeError::ArithmeticOverflow(
-                    "external coefficient write",
-                ))?;
-        let target =
-            self.destination
-                .get_mut(self.written..end)
-                .ok_or(TileDecodeError::InvalidPlan(
-                    "external coefficient storage overflow",
-                ))?;
-        target.copy_from_slice(values);
-        self.written = end;
-        Ok(())
-    }
 }
 
 impl DecodedTile {
@@ -477,150 +409,12 @@ impl DecodedTile {
     }
 }
 
-fn append_planes<T: CoefficientTarget>(
-    coefficients: &mut T,
-    macroblocks: &mut MacroblockMetadata,
-    planes: &mut Vec<CoefficientPlane>,
-    mut decoded: Vec<(DecodedTile, TileLocation)>,
-    component_count: usize,
-    primary_components: usize,
-    color_format: ColorFormat,
-) -> Result<(), TileDecodeError> {
-    if decoded
-        .iter()
-        .any(|(tile, _)| tile.components.len() != component_count)
-    {
-        return Err(TileDecodeError::InvalidPlan("decoded component count"));
-    }
-    for component in 0..component_count {
-        let geometry = if component < primary_components {
-            component_geometry(color_format, component)
-        } else {
-            ComponentGeometry {
-                columns: 4,
-                rows: 4,
-            }
-        };
-        let coefficient_offset = coefficients.len();
-        let macroblock_offset = macroblocks.len();
-        for (tile, location) in &mut decoded {
-            append_tile(
-                coefficients,
-                macroblocks,
-                core::mem::take(&mut tile.components[component]),
-                *location,
-                geometry,
-            )?;
-        }
-        planes.push(CoefficientPlane {
-            coefficient_offset,
-            coefficient_count: coefficients.len() - coefficient_offset,
-            macroblock_offset,
-            macroblock_count: macroblocks.len() - macroblock_offset,
-            block_columns: geometry.columns,
-            block_rows: geometry.rows,
-        });
-    }
-    Ok(())
-}
-
-fn append_tile<T: CoefficientTarget>(
-    coefficients: &mut T,
-    metadata: &mut MacroblockMetadata,
-    macroblocks: Vec<spatial::SpatialMacroblock>,
-    location: TileLocation,
-    geometry: ComponentGeometry,
-) -> Result<(), TileDecodeError> {
-    let expected = usize::try_from(location.width)
-        .ok()
-        .and_then(|width| {
-            usize::try_from(location.height)
-                .ok()
-                .and_then(|height| width.checked_mul(height))
-        })
-        .ok_or(TileDecodeError::ArithmeticOverflow("tile traversal"))?;
-    if macroblocks.len() != expected {
-        return Err(TileDecodeError::InvalidPlan(
-            "decoded tile macroblock count",
-        ));
-    }
-    let width = usize::try_from(location.width)
-        .map_err(|_| TileDecodeError::ArithmeticOverflow("tile width"))?;
-    for (index, macroblock) in macroblocks.into_iter().enumerate() {
-        let x = index % width;
-        let y = index / width;
-        let coefficient_offset = u32::try_from(coefficients.len())
-            .map_err(|_| TileDecodeError::ArithmeticOverflow("coefficient offset"))?;
-        metadata.coefficient_offsets.push(coefficient_offset);
-        metadata.quantizers.push(macroblock.coefficients.quantizers);
-        metadata.bands.push(macroblock.coefficients.bands);
-        metadata.predictions.push(macroblock.prediction);
-        metadata.hp_predictions.push(macroblock.hp_prediction);
-        metadata.tile_edges.push(tile_edges(
-            x,
-            y,
-            width,
-            usize::try_from(location.height)
-                .map_err(|_| TileDecodeError::ArithmeticOverflow("tile height"))?,
-            location.hard,
-        ));
-        let x_mb = location
-            .global_x
-            .checked_add(
-                u32::try_from(x)
-                    .map_err(|_| TileDecodeError::ArithmeticOverflow("macroblock x conversion"))?,
-            )
-            .ok_or(TileDecodeError::ArithmeticOverflow("macroblock x"))?;
-        let y_mb = location
-            .global_y
-            .checked_add(
-                u32::try_from(y)
-                    .map_err(|_| TileDecodeError::ArithmeticOverflow("macroblock y conversion"))?,
-            )
-            .ok_or(TileDecodeError::ArithmeticOverflow("macroblock y"))?;
-        metadata.coded_x.push(x_mb);
-        metadata.coded_y.push(y_mb);
-        metadata
-            .output_x
-            .push(x_mb.saturating_mul(16).saturating_sub(location.margin_left));
-        metadata
-            .output_y
-            .push(y_mb.saturating_mul(16).saturating_sub(location.margin_top));
-        append_coefficients(
-            coefficients,
-            &macroblock.coefficients,
-            geometry.block_count(),
-        )?;
-    }
-    Ok(())
-}
-
 fn coefficients_per_macroblock(bands: BandPresence, block_count: usize) -> usize {
     match bands {
         BandPresence::DcOnly => 1,
         BandPresence::NoHighPass => block_count,
         BandPresence::NoFlexbits | BandPresence::All => block_count * 16,
     }
-}
-
-fn append_coefficients<T: CoefficientTarget>(
-    arena: &mut T,
-    macroblock: &crate::reconstruct::QuantizedMacroblock,
-    block_count: usize,
-) -> Result<(), TileDecodeError> {
-    match macroblock.bands {
-        BandPresence::DcOnly => arena.push(macroblock.dc_low_pass[0])?,
-        BandPresence::NoHighPass => {
-            arena.extend_from_slice(&macroblock.dc_low_pass[..block_count])?;
-        }
-        BandPresence::NoFlexbits | BandPresence::All => {
-            for block in 0..block_count {
-                arena.push(macroblock.dc_low_pass[block])?;
-                arena.extend_from_slice(&macroblock.high_pass[block * 16 + 1..(block + 1) * 16])?;
-            }
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
