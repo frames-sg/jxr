@@ -402,7 +402,8 @@ fn encode_output_at(
     }
     let sample_planes = DescriptorBinding::new(&device, &output_dispatch.samples)?;
     let surface_planes = DescriptorBinding::new(&device, &output_dispatch.surfaces)?;
-    let pipeline = runtime.output_store.select(output_dispatch.pipeline);
+    let pipeline = runtime.output_pipeline(output_dispatch.pipeline, &output_dispatch.params)?;
+    let pipeline = &*pipeline;
     let dispatch_count = if output_dispatch.planar {
         output_dispatch.surfaces.len()
     } else {
@@ -458,6 +459,14 @@ impl<'a, T: GpuAbi> DescriptorBinding<'a, T> {
         match self {
             Self::Inline(values) => encoder.bind_slice_bytes(index, values),
             Self::Buffer(buffer) => encoder.bind_buffer(index, buffer, 0),
+        }
+    }
+
+    /// Number of descriptor elements.
+    fn len(&self) -> u64 {
+        match self {
+            Self::Inline(values) => values.len() as u64,
+            Self::Buffer(buffer) => (buffer.length() / core::mem::size_of::<T>()) as u64,
         }
     }
 }
@@ -813,9 +822,9 @@ mod tests {
         })
     }
 
-    fn luma_grid_arena() -> Arc<CoefficientArena> {
+    fn luma_grid_arena(dc_values: [i32; 4]) -> Arc<CoefficientArena> {
         Arc::new(CoefficientArena {
-            coefficients: vec![0; 4],
+            coefficients: dc_values.to_vec(),
             macroblocks: MacroblockMetadata {
                 coefficient_offsets: vec![0, 1, 2, 3],
                 quantizers: vec![
@@ -1169,6 +1178,20 @@ mod tests {
     }
 
     fn decode_overlap_grid(mode: OverlapMode, hard_tiles: bool) -> DecodedSamples {
+        let plan = overlap_grid_plan(mode, hard_tiles, [0; 4]);
+        crate::MetalDecoderSession::system_default()
+            .unwrap()
+            .decode_to_host(&plan)
+            .unwrap()
+            .samples
+    }
+
+    /// A 2x2-macroblock DC-only luma plan whose overlap filters span both tile axes.
+    fn overlap_grid_plan(
+        mode: OverlapMode,
+        hard_tiles: bool,
+        dc_values: [i32; 4],
+    ) -> MetalDecodePlan {
         let mut primary = luma_plane_info();
         primary.overlap = mode;
         primary.width = 32;
@@ -1239,8 +1262,8 @@ mod tests {
             alpha_format: None,
             ..policy
         };
-        let plan = MetalDecodePlan::from_prepared(
-            luma_grid_arena(),
+        MetalDecodePlan::from_prepared(
+            luma_grid_arena(dc_values),
             None,
             &prepared,
             policy,
@@ -1248,12 +1271,7 @@ mod tests {
             [0, 0],
             BackendRequest::Metal,
         )
-        .unwrap();
-        crate::MetalDecoderSession::system_default()
-            .unwrap()
-            .decode_to_host(&plan)
-            .unwrap()
-            .samples
+        .unwrap()
     }
 
     #[test]
@@ -1550,6 +1568,29 @@ mod tests {
                 assert!(
                     matches!(output, DecodedSamples::U8(values) if values.len() == 1_024 && values.iter().all(|&value| value == 128))
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn batched_overlap_matches_single_image_decodes() {
+        let session = crate::MetalDecoderSession::system_default().unwrap();
+        for mode in [OverlapMode::One, OverlapMode::Two] {
+            for hard_tiles in [false, true] {
+                let plans = [[800, -480, 160, 960], [-800, 320, 1_120, -160]]
+                    .map(|dc_values| overlap_grid_plan(mode, hard_tiles, dc_values));
+                let single = plans
+                    .iter()
+                    .map(|plan| session.decode_to_host(plan).unwrap().samples)
+                    .collect::<Vec<_>>();
+                assert_ne!(single[0], single[1]);
+                let batched = session
+                    .decode_batch_to_host(&plans)
+                    .unwrap()
+                    .into_iter()
+                    .map(|image| image.samples)
+                    .collect::<Vec<_>>();
+                assert_eq!(batched, single, "{mode:?} hard_tiles={hard_tiles}");
             }
         }
     }

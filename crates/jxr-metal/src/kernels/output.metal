@@ -1,3 +1,37 @@
+// Format specialization. A pipeline compiled with these function constants
+// folds every per-format branch in the shared store helpers; the generic
+// pipeline leaves them undefined and reads the same words at run time. Words
+// 0-3 (geometry and crop) and 24 (planar output plane) always stay dynamic.
+#define JXR_OUTPUT_CONSTANT(INDEX) \
+    constant uint jxr_output_fc_##INDEX [[function_constant(INDEX)]]; \
+    constant bool jxr_output_fc_##INDEX##_set = is_function_constant_defined(jxr_output_fc_##INDEX);
+JXR_OUTPUT_CONSTANT(4) JXR_OUTPUT_CONSTANT(5) JXR_OUTPUT_CONSTANT(6) JXR_OUTPUT_CONSTANT(7)
+JXR_OUTPUT_CONSTANT(8) JXR_OUTPUT_CONSTANT(9) JXR_OUTPUT_CONSTANT(10) JXR_OUTPUT_CONSTANT(11)
+JXR_OUTPUT_CONSTANT(12) JXR_OUTPUT_CONSTANT(13) JXR_OUTPUT_CONSTANT(14) JXR_OUTPUT_CONSTANT(15)
+JXR_OUTPUT_CONSTANT(16) JXR_OUTPUT_CONSTANT(17) JXR_OUTPUT_CONSTANT(18) JXR_OUTPUT_CONSTANT(19)
+JXR_OUTPUT_CONSTANT(20) JXR_OUTPUT_CONSTANT(21) JXR_OUTPUT_CONSTANT(22) JXR_OUTPUT_CONSTANT(23)
+JXR_OUTPUT_CONSTANT(25) JXR_OUTPUT_CONSTANT(26)
+#undef JXR_OUTPUT_CONSTANT
+
+inline JxrOutputAbi jxr_output_params(constant JxrOutputAbi &runtime) {
+    JxrOutputAbi params = runtime;
+#define JXR_OUTPUT_FIELD(FIELD, INDEX) \
+    if (jxr_output_fc_##INDEX##_set) params.FIELD = jxr_output_fc_##INDEX;
+    JXR_OUTPUT_FIELD(component_count, 4) JXR_OUTPUT_FIELD(alpha_plane, 5)
+    JXR_OUTPUT_FIELD(internal_color, 6) JXR_OUTPUT_FIELD(output_color, 7)
+    JXR_OUTPUT_FIELD(chroma_sampling, 8) JXR_OUTPUT_FIELD(chroma_centering_x, 9)
+    JXR_OUTPUT_FIELD(chroma_centering_y, 10) JXR_OUTPUT_FIELD(bit_depth, 11)
+    JXR_OUTPUT_FIELD(channel_layout, 12) JXR_OUTPUT_FIELD(channels, 13)
+    JXR_OUTPUT_FIELD(scaled, 14) JXR_OUTPUT_FIELD(alpha_scaled, 15)
+    JXR_OUTPUT_FIELD(premultiply_alpha, 16) JXR_OUTPUT_FIELD(red_blue_not_swapped, 17)
+    JXR_OUTPUT_FIELD(shift_bits, 18) JXR_OUTPUT_FIELD(alpha_shift_bits, 19)
+    JXR_OUTPUT_FIELD(mantissa_length, 20) JXR_OUTPUT_FIELD(alpha_mantissa_length, 21)
+    JXR_OUTPUT_FIELD(exponent_bias_bits, 22) JXR_OUTPUT_FIELD(alpha_exponent_bias_bits, 23)
+    JXR_OUTPUT_FIELD(output_plane_count, 25) JXR_OUTPUT_FIELD(bit_black, 26)
+#undef JXR_OUTPUT_FIELD
+    return params;
+}
+
 inline int jxr_read_plane(device const int *samples, JxrSamplePlaneAbi plane, uint x, uint y) {
     return samples[plane.sample_offset + (y - plane.origin_y) * plane.width + x - plane.origin_x];
 }
@@ -34,7 +68,7 @@ inline int jxr_clamped_plane(device const int *samples, JxrSamplePlaneAbi plane,
 }
 
 inline int jxr_chroma_sample(device const int *samples, JxrSamplePlaneAbi plane,
-                             uint full_x, uint full_y, constant JxrOutputAbi &params) {
+                             uint full_x, uint full_y, thread const JxrOutputAbi &params) {
     if (params.chroma_sampling == 3u) return jxr_read_plane(samples, plane, full_x, full_y);
     int chroma_x = int(full_x >> 1u);
     int pair[2];
@@ -60,8 +94,8 @@ inline int jxr_chroma_sample(device const int *samples, JxrSamplePlaneAbi plane,
     return pair[full_x & 1u];
 }
 
-inline void jxr_primary_values(device const int *samples, device const JxrSamplePlaneAbi *planes,
-                               uint x, uint y, constant JxrOutputAbi &params, thread int values[4]) {
+inline void jxr_primary_values(device const int *samples, constant JxrSamplePlaneAbi *planes,
+                               uint x, uint y, thread const JxrOutputAbi &params, thread int values[4]) {
     for (uint i = 0; i < 4; ++i) values[i] = 0;
     values[0] = jxr_read_plane(samples, planes[0], x, y);
     if (params.component_count == 1u) return;
@@ -74,8 +108,8 @@ inline void jxr_primary_values(device const int *samples, device const JxrSample
     }
 }
 
-inline void jxr_converted(device const int *samples, device const JxrSamplePlaneAbi *planes,
-                          uint x, uint y, constant JxrOutputAbi &params,
+inline void jxr_converted(device const int *samples, constant JxrSamplePlaneAbi *planes,
+                          uint x, uint y, thread const JxrOutputAbi &params,
                           thread int values[4], thread bool &overflow) {
     int input[4];
     jxr_primary_values(samples, planes, x, y, params, input);
@@ -107,8 +141,8 @@ inline void jxr_converted(device const int *samples, device const JxrSamplePlane
 
 // Loads and color-converts one pixel. Every channel store selects from this
 // result instead of repeating chroma upsampling and conversion per channel.
-inline void jxr_load_pixel(device const int *samples, device const JxrSamplePlaneAbi *planes,
-                           uint x, uint y, constant JxrOutputAbi &params,
+inline void jxr_load_pixel(device const int *samples, constant JxrSamplePlaneAbi *planes,
+                           uint x, uint y, thread const JxrOutputAbi &params,
                            thread int converted[4], thread bool &overflow) {
     for (uint i = 0; i < 4; ++i) converted[i] = 0;
     if (params.output_color != 7u) jxr_converted(samples, planes, x, y, params, converted, overflow);
@@ -136,7 +170,7 @@ inline int jxr_shl(int value, uint bits, thread bool &overflow) {
     return shifted;
 }
 
-inline int jxr_scale(int sample, uint component, bool alpha, constant JxrOutputAbi &params,
+inline int jxr_scale(int sample, uint component, bool alpha, thread const JxrOutputAbi &params,
                      thread bool &overflow) {
     uint depth = params.bit_depth;
     uint scaled = alpha ? params.alpha_scaled : params.scaled;
@@ -155,7 +189,7 @@ inline int jxr_scale(int sample, uint component, bool alpha, constant JxrOutputA
     return downscaled;
 }
 
-inline uint jxr_f16_bits(int sample, bool alpha, constant JxrOutputAbi &params,
+inline uint jxr_f16_bits(int sample, bool alpha, thread const JxrOutputAbi &params,
                          thread bool &overflow) {
     int scaled = jxr_scale(sample, 0u, alpha, params, overflow);
     uint sign = scaled < 0 ? 0x8000u : 0u;
@@ -163,7 +197,7 @@ inline uint jxr_f16_bits(int sample, bool alpha, constant JxrOutputAbi &params,
     return sign | min(magnitude, 32767u);
 }
 
-inline uint jxr_f32_bits(int sample, bool alpha, constant JxrOutputAbi &params,
+inline uint jxr_f32_bits(int sample, bool alpha, thread const JxrOutputAbi &params,
                          thread bool &overflow) {
     int scaled = jxr_scale(sample, 0u, alpha, params, overflow);
     uint length = alpha ? params.alpha_mantissa_length : params.mantissa_length;
@@ -196,12 +230,12 @@ inline int jxr_signed_premultiply(int value, int alpha, int maximum) {
     return int(value < 0 ? -result : result);
 }
 
-inline bool jxr_is_padding(uint channel, constant JxrOutputAbi &params) {
+inline bool jxr_is_padding(uint channel, thread const JxrOutputAbi &params) {
     return (params.channel_layout == 12u || params.channel_layout == 13u) && channel == 3u;
 }
 
-inline int jxr_channel_sample(device const int *samples, device const JxrSamplePlaneAbi *planes,
-                              uint channel, uint x, uint y, constant JxrOutputAbi &params,
+inline int jxr_channel_sample(device const int *samples, constant JxrSamplePlaneAbi *planes,
+                              uint channel, uint x, uint y, thread const JxrOutputAbi &params,
                               thread const int converted[4], thread bool &alpha) {
     uint primary_count = params.alpha_plane == UINT_MAX ? params.channels : params.channels - 1u;
     alpha = params.alpha_plane != UINT_MAX && channel == primary_count;
@@ -215,15 +249,15 @@ inline int jxr_channel_sample(device const int *samples, device const JxrSampleP
 }
 
 // Scaled alpha used to premultiply integer color channels, or zero when unused.
-inline int jxr_premultiply_alpha(device const int *samples, device const JxrSamplePlaneAbi *planes,
-                                 uint x, uint y, constant JxrOutputAbi &params,
+inline int jxr_premultiply_alpha(device const int *samples, constant JxrSamplePlaneAbi *planes,
+                                 uint x, uint y, thread const JxrOutputAbi &params,
                                  thread bool &overflow) {
     if (params.premultiply_alpha == 0u || params.alpha_plane == UINT_MAX) return 0;
     return jxr_scale(jxr_read_plane(samples, planes[params.alpha_plane], x, y), 0u, true, params, overflow);
 }
 
-inline int jxr_formatted_integer(device const int *samples, device const JxrSamplePlaneAbi *planes,
-                                 uint channel, uint x, uint y, constant JxrOutputAbi &params,
+inline int jxr_formatted_integer(device const int *samples, constant JxrSamplePlaneAbi *planes,
+                                 uint channel, uint x, uint y, thread const JxrOutputAbi &params,
                                  thread const int converted[4], int alpha_value,
                                  thread bool &overflow) {
     if (jxr_is_padding(channel, params)) return 0;
@@ -244,8 +278,8 @@ inline uint jxr_output_index(JxrSurfacePlaneAbi surface, uint x, uint y, uint ch
 }
 
 // Planar surfaces store one scaled sample per thread from their own plane.
-inline int jxr_planar_value(device const int *samples, device const JxrSamplePlaneAbi *planes,
-                            uint2 gid, constant JxrOutputAbi &params, thread bool &overflow) {
+inline int jxr_planar_value(device const int *samples, constant JxrSamplePlaneAbi *planes,
+                            uint2 gid, thread const JxrOutputAbi &params, thread bool &overflow) {
     uint source_plane = params.output_plane < 3u ? params.output_plane : params.alpha_plane;
     bool chroma = params.output_plane == 1u || params.output_plane == 2u;
     uint x = params.crop_x / (chroma ? 2u : 1u) + gid.x;
@@ -255,12 +289,13 @@ inline int jxr_planar_value(device const int *samples, device const JxrSamplePla
 }
 
 kernel void jxr_output_u8(device const int *samples [[buffer(0)]],
-                          device const JxrSamplePlaneAbi *planes [[buffer(1)]],
-                          device const JxrSurfacePlaneAbi *surfaces [[buffer(2)]],
+                          constant JxrSamplePlaneAbi *planes [[buffer(1)]],
+                          constant JxrSurfacePlaneAbi *surfaces [[buffer(2)]],
                           device uchar *output [[buffer(3)]], device atomic_uint *status [[buffer(4)]],
-                          constant JxrOutputAbi &params [[buffer(5)]], uint2 gid [[thread_position_in_grid]]) {
+                          constant JxrOutputAbi &runtime_params [[buffer(5)]], uint2 gid [[thread_position_in_grid]]) {
+    const JxrOutputAbi params = jxr_output_params(runtime_params);
     JxrSurfacePlaneAbi surface = surfaces[params.output_plane];
-    if (gid.x >= surface.width || gid.y >= surface.height || jxr_failed(status)) return;
+    if (gid.x >= surface.width || gid.y >= surface.height) return;
     bool overflow = false;
     if (params.output_plane_count > 1u) {
         int value = jxr_planar_value(samples, planes, gid, params, overflow);
@@ -281,12 +316,13 @@ kernel void jxr_output_u8(device const int *samples [[buffer(0)]],
 }
 
 #define JXR_INTEGER_STORE(NAME, TYPE, BYTES, MINIMUM, MAXIMUM) \
-kernel void NAME(device const int *samples [[buffer(0)]], device const JxrSamplePlaneAbi *planes [[buffer(1)]], \
-                 device const JxrSurfacePlaneAbi *surfaces [[buffer(2)]], device uchar *output [[buffer(3)]], \
-                 device atomic_uint *status [[buffer(4)]], constant JxrOutputAbi &params [[buffer(5)]], \
+kernel void NAME(device const int *samples [[buffer(0)]], constant JxrSamplePlaneAbi *planes [[buffer(1)]], \
+                 constant JxrSurfacePlaneAbi *surfaces [[buffer(2)]], device uchar *output [[buffer(3)]], \
+                 device atomic_uint *status [[buffer(4)]], constant JxrOutputAbi &runtime_params [[buffer(5)]], \
                  uint2 gid [[thread_position_in_grid]]) { \
+    const JxrOutputAbi params = jxr_output_params(runtime_params); \
     JxrSurfacePlaneAbi surface = surfaces[params.output_plane]; \
-    if (gid.x >= surface.width || gid.y >= surface.height || jxr_failed(status)) return; \
+    if (gid.x >= surface.width || gid.y >= surface.height) return; \
     bool overflow = false; \
     if (params.output_plane_count > 1u) { \
         int value = jxr_planar_value(samples, planes, gid, params, overflow); \
@@ -312,12 +348,13 @@ JXR_INTEGER_STORE(jxr_output_u16, ushort, 2u, 0, (params.bit_depth == 2u ? 1023 
 JXR_INTEGER_STORE(jxr_output_i16, short, 2u, -32768, 32767)
 JXR_INTEGER_STORE(jxr_output_i32, int, 4u, INT_MIN, INT_MAX)
 
-kernel void jxr_output_f16(device const int *samples [[buffer(0)]], device const JxrSamplePlaneAbi *planes [[buffer(1)]],
-                           device const JxrSurfacePlaneAbi *surfaces [[buffer(2)]], device uchar *output [[buffer(3)]],
-                           device atomic_uint *status [[buffer(4)]], constant JxrOutputAbi &params [[buffer(5)]],
+kernel void jxr_output_f16(device const int *samples [[buffer(0)]], constant JxrSamplePlaneAbi *planes [[buffer(1)]],
+                           constant JxrSurfacePlaneAbi *surfaces [[buffer(2)]], device uchar *output [[buffer(3)]],
+                           device atomic_uint *status [[buffer(4)]], constant JxrOutputAbi &runtime_params [[buffer(5)]],
                            uint2 gid [[thread_position_in_grid]]) {
+    const JxrOutputAbi params = jxr_output_params(runtime_params);
     JxrSurfacePlaneAbi surface = surfaces[0];
-    if (gid.x >= surface.width || gid.y >= surface.height || jxr_failed(status)) return;
+    if (gid.x >= surface.width || gid.y >= surface.height) return;
     uint x = params.crop_x + gid.x, y = params.crop_y + gid.y;
     bool overflow = false;
     uint alpha_bits = params.alpha_plane == UINT_MAX
@@ -338,12 +375,13 @@ kernel void jxr_output_f16(device const int *samples [[buffer(0)]], device const
     if (overflow) jxr_fail(status, 16u);
 }
 
-kernel void jxr_output_f32(device const int *samples [[buffer(0)]], device const JxrSamplePlaneAbi *planes [[buffer(1)]],
-                           device const JxrSurfacePlaneAbi *surfaces [[buffer(2)]], device uchar *output [[buffer(3)]],
-                           device atomic_uint *status [[buffer(4)]], constant JxrOutputAbi &params [[buffer(5)]],
+kernel void jxr_output_f32(device const int *samples [[buffer(0)]], constant JxrSamplePlaneAbi *planes [[buffer(1)]],
+                           constant JxrSurfacePlaneAbi *surfaces [[buffer(2)]], device uchar *output [[buffer(3)]],
+                           device atomic_uint *status [[buffer(4)]], constant JxrOutputAbi &runtime_params [[buffer(5)]],
                            uint2 gid [[thread_position_in_grid]]) {
+    const JxrOutputAbi params = jxr_output_params(runtime_params);
     JxrSurfacePlaneAbi surface = surfaces[0];
-    if (gid.x >= surface.width || gid.y >= surface.height || jxr_failed(status)) return;
+    if (gid.x >= surface.width || gid.y >= surface.height) return;
     uint x = params.crop_x + gid.x, y = params.crop_y + gid.y;
     bool overflow = false;
     float alpha_value = 1.0f;
@@ -362,13 +400,14 @@ kernel void jxr_output_f32(device const int *samples [[buffer(0)]], device const
     if (overflow) jxr_fail(status, 16u);
 }
 
-kernel void jxr_output_bits(device const int *samples [[buffer(0)]], device const JxrSamplePlaneAbi *planes [[buffer(1)]],
-                            device const JxrSurfacePlaneAbi *surfaces [[buffer(2)]], device uchar *output [[buffer(3)]],
-                            device atomic_uint *status [[buffer(4)]], constant JxrOutputAbi &params [[buffer(5)]],
+kernel void jxr_output_bits(device const int *samples [[buffer(0)]], constant JxrSamplePlaneAbi *planes [[buffer(1)]],
+                            constant JxrSurfacePlaneAbi *surfaces [[buffer(2)]], device uchar *output [[buffer(3)]],
+                            device atomic_uint *status [[buffer(4)]], constant JxrOutputAbi &runtime_params [[buffer(5)]],
                             uint2 gid [[thread_position_in_grid]]) {
+    const JxrOutputAbi params = jxr_output_params(runtime_params);
     JxrSurfacePlaneAbi surface = surfaces[0];
     uint row_bytes = (surface.width + 7u) / 8u;
-    if (gid.x >= row_bytes || gid.y >= surface.height || jxr_failed(status)) return;
+    if (gid.x >= row_bytes || gid.y >= surface.height) return;
     bool overflow = false;
     uchar byte = 0;
     for (uint bit = 0; bit < 8u; ++bit) {
@@ -383,12 +422,13 @@ kernel void jxr_output_bits(device const int *samples [[buffer(0)]], device cons
     output[surface.byte_offset + gid.y * surface.row_stride_bytes + gid.x] = byte;
 }
 
-kernel void jxr_output_packed16(device const int *samples [[buffer(0)]], device const JxrSamplePlaneAbi *planes [[buffer(1)]],
-                                device const JxrSurfacePlaneAbi *surfaces [[buffer(2)]], device uchar *output [[buffer(3)]],
-                                device atomic_uint *status [[buffer(4)]], constant JxrOutputAbi &params [[buffer(5)]],
+kernel void jxr_output_packed16(device const int *samples [[buffer(0)]], constant JxrSamplePlaneAbi *planes [[buffer(1)]],
+                                constant JxrSurfacePlaneAbi *surfaces [[buffer(2)]], device uchar *output [[buffer(3)]],
+                                device atomic_uint *status [[buffer(4)]], constant JxrOutputAbi &runtime_params [[buffer(5)]],
                                 uint2 gid [[thread_position_in_grid]]) {
+    const JxrOutputAbi params = jxr_output_params(runtime_params);
     JxrSurfacePlaneAbi surface = surfaces[0];
-    if (gid.x >= surface.width || gid.y >= surface.height || jxr_failed(status)) return;
+    if (gid.x >= surface.width || gid.y >= surface.height) return;
     bool overflow = false;
     int values[4];
     jxr_converted(samples, planes, params.crop_x + gid.x, params.crop_y + gid.y, params, values, overflow);
@@ -403,12 +443,13 @@ kernel void jxr_output_packed16(device const int *samples [[buffer(0)]], device 
     *reinterpret_cast<device ushort *>(output + surface.byte_offset + gid.y * surface.row_stride_bytes + gid.x * 2u) = ushort(packed);
 }
 
-kernel void jxr_output_packed32(device const int *samples [[buffer(0)]], device const JxrSamplePlaneAbi *planes [[buffer(1)]],
-                                device const JxrSurfacePlaneAbi *surfaces [[buffer(2)]], device uchar *output [[buffer(3)]],
-                                device atomic_uint *status [[buffer(4)]], constant JxrOutputAbi &params [[buffer(5)]],
+kernel void jxr_output_packed32(device const int *samples [[buffer(0)]], constant JxrSamplePlaneAbi *planes [[buffer(1)]],
+                                constant JxrSurfacePlaneAbi *surfaces [[buffer(2)]], device uchar *output [[buffer(3)]],
+                                device atomic_uint *status [[buffer(4)]], constant JxrOutputAbi &runtime_params [[buffer(5)]],
                                 uint2 gid [[thread_position_in_grid]]) {
+    const JxrOutputAbi params = jxr_output_params(runtime_params);
     JxrSurfacePlaneAbi surface = surfaces[0];
-    if (gid.x >= surface.width || gid.y >= surface.height || jxr_failed(status)) return;
+    if (gid.x >= surface.width || gid.y >= surface.height) return;
     bool overflow = false;
     int values[4];
     jxr_converted(samples, planes, params.crop_x + gid.x, params.crop_y + gid.y, params, values, overflow);

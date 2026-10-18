@@ -10,15 +10,16 @@ use objc2_metal::{
     MTLComputePipelineState,
 };
 
+use std::rc::Rc;
+
 use super::{
     BufferHandle, EncodedMetalSubmission, barrier, begin_encoding_on_queue, encode_output_at,
-    encode_overlap_pass,
 };
 use crate::{
     MetalDecodePlan, MetalError,
     abi::{JxrBatchDispatchAbi, JxrPlaneAbi, macroblock_abi_metadata},
     metal_types::JxrComputeEncoderExt,
-    overlap_plan::OverlapPass,
+    overlap_plan::{OverlapPass, ResidentOverlapSchedule, ResidentWork},
     plan::{MetalCoefficientSource, MetalPlaneInput},
     runtime::MetalRuntime,
 };
@@ -321,6 +322,58 @@ fn encode_overlaps(
         OverlapPass::First => buffers.low.buffer(),
         OverlapPass::Second => buffers.samples.buffer(),
     };
+    let groups = overlap_groups(runtime, plans, buffers, pass)?;
+    if groups.is_empty() {
+        return Ok(());
+    }
+    // Planes write disjoint ranges, so every plane's prefix, filters, and
+    // suffix can each run as one stage with a barrier only between stages.
+    let stages: [fn(&ResidentOverlapSchedule) -> Option<&ResidentWork>; 3] = [
+        |schedule| schedule.prefix.as_ref(),
+        |schedule| schedule.filters.as_ref(),
+        |schedule| schedule.suffix.as_ref(),
+    ];
+    let device = runtime.queue.device();
+    for stage in stages {
+        let mut dispatched = false;
+        for (schedule, entries) in &groups {
+            let Some(work) = stage(schedule) else {
+                continue;
+            };
+            let entries = super::DescriptorBinding::new(&device, entries)?;
+            encoder.setComputePipelineState(&runtime.overlap_batch);
+            encoder.bind_buffer(0, samples, 0)?;
+            encoder.bind_buffer(1, &work.buffer, 0)?;
+            encoder.bind_buffer(2, buffers.status.buffer(), 0)?;
+            encoder.bind_bytes(3, &work.count)?;
+            entries.bind(encoder, 4)?;
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                mtl_size(u64::from(work.count), entries.len(), 1),
+                one_d_threads_per_group(runtime.overlap_batch.threadExecutionWidth() as u64),
+            );
+            dispatched = true;
+        }
+        if dispatched {
+            barrier(encoder, samples);
+        }
+    }
+    Ok(())
+}
+
+type OverlapGroup = (Rc<ResidentOverlapSchedule>, Vec<[u32; 2]>);
+
+/// Groups every enabled (image, plane) by its cached plane-relative schedule.
+///
+/// Each entry is the plane's base sample and the image's status slot, so one
+/// dispatch per schedule stage covers all planes of the same geometry.
+fn overlap_groups(
+    runtime: &MetalRuntime,
+    plans: &[MetalDecodePlan],
+    buffers: &BatchBuffers,
+    pass: OverlapPass,
+) -> Result<Vec<OverlapGroup>, MetalError> {
+    let device = runtime.queue.device();
+    let mut groups: Vec<OverlapGroup> = Vec::new();
     for (image, plan) in plans.iter().enumerate() {
         let input = plan.reconstruction()?;
         let enabled = match pass {
@@ -330,19 +383,30 @@ fn encode_overlaps(
         if !enabled {
             continue;
         }
+        let status = u32_count(image, "batch status index")?;
         for &plane in &buffers.plane_inputs[image] {
-            encode_overlap_pass(
-                runtime,
-                encoder,
+            let schedule = runtime.overlap_schedules.get_or_upload(
+                &device,
                 pass,
                 plane,
-                input,
-                samples,
-                (buffers.status.buffer(), image * core::mem::size_of::<u32>()),
+                input.hard_tiles,
+                &input.tile_column_widths,
+                &input.tile_row_heights,
             )?;
+            let base = schedule.checked_base(match pass {
+                OverlapPass::First => plane.low_offset,
+                OverlapPass::Second => plane.sample_offset,
+            })?;
+            match groups
+                .iter_mut()
+                .find(|(cached, _)| Rc::ptr_eq(cached, &schedule))
+            {
+                Some((_, entries)) => entries.push([base, status]),
+                None => groups.push((schedule, vec![[base, status]])),
+            }
         }
     }
-    Ok(())
+    Ok(groups)
 }
 
 fn encode_highpass_transforms(
