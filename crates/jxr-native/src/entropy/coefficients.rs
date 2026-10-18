@@ -3,7 +3,7 @@
 use super::adaptive::{
     AcVlcState, AdaptiveVlc, DcVlcState, observe_abs_level, observe_first_index, observe_index,
 };
-use super::vlc;
+use super::vlc::{self, PrefixTable};
 use super::{AdaptiveHpScan, AdaptiveLpScan, EntropyError, HpScanDirection, PacketBitReader};
 
 const ABS_REMAP: [i32; 6] = [2, 3, 4, 6, 10, 14];
@@ -11,6 +11,57 @@ const ABS_FIXED_LENGTH: [u8; 6] = [0, 0, 1, 2, 2, 2];
 const RUN_REMAP: [u8; 15] = [1, 2, 3, 5, 7, 1, 2, 3, 5, 7, 1, 2, 3, 4, 5];
 const RUN_BIN: [i8; 15] = [-1, -1, -1, -1, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0];
 const RUN_FIXED_LENGTH: [u8; 15] = [0, 0, 1, 1, 3, 0, 0, 1, 1, 2, 0, 0, 0, 0, 1];
+
+/// `(run << 3) | length` for every eight-bit prefix, indexed by maximum run.
+///
+/// A run code and its refinement span at most seven bits, so one peeked byte
+/// resolves every run of maximum one through fourteen. Each entry depends only
+/// on its first `length` bits because the codes are prefix-free.
+static RUN_LOOKUP: [[u8; 256]; 15] = run_lookup();
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "const evaluation; prefixes are below 256 and the used RUN_BIN entries are non-negative"
+)]
+const fn run_lookup() -> [[u8; 256]; 15] {
+    let small = [
+        PrefixTable::new(vlc::RUN_VALUE_CODES[0]),
+        PrefixTable::new(vlc::RUN_VALUE_CODES[1]),
+        PrefixTable::new(vlc::RUN_VALUE_CODES[2]),
+    ];
+    let index = PrefixTable::new(vlc::RUN_INDEX_CODES);
+    let mut table = [[0_u8; 256]; 15];
+    let mut max_run = 1;
+    while max_run < 15 {
+        let mut prefix = 0;
+        while prefix < 256 {
+            let byte = prefix as u8;
+            let (run, length) = if max_run == 1 {
+                (1, 0)
+            } else if max_run < 5 {
+                let [length, run] = small[max_run - 2].entry(byte).to_be_bytes();
+                assert!(length != 0, "RUN_VALUE codes are complete");
+                (run, length)
+            } else {
+                let [code_length, run_index] = index.entry(byte).to_be_bytes();
+                assert!(code_length != 0, "RUN_INDEX codes are complete");
+                let table_index = run_index as usize + 5 * RUN_BIN[max_run] as usize;
+                let fixed = RUN_FIXED_LENGTH[table_index];
+                let refinement = ((prefix << code_length) & 0xff) >> (8 - fixed);
+                (
+                    RUN_REMAP[table_index] + refinement as u8,
+                    code_length + fixed,
+                )
+            };
+            assert!(run <= 15 && length <= 7, "run entry packs into one byte");
+            table[max_run][prefix] = (run << 3) | length;
+            prefix += 1;
+        }
+        max_run += 1;
+    }
+    table
+}
 
 /// A JPEG XR frequency band.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +236,30 @@ pub(crate) fn decode_hp_block(
     )
 }
 
+/// Decodes LP coefficients directly into their adaptive scan destinations.
+///
+/// Placement order and results match [`decode_ac_block`] followed by
+/// [`DecodedBlock::inverse_scan_lp`]. As with [`decode_hp_block`], the caller
+/// must discard the partial output and scan state on error.
+pub(crate) fn decode_lp_block(
+    reader: &mut PacketBitReader<'_>,
+    class: ComponentClass,
+    start_location: u8,
+    state: &mut AcVlcState,
+    scan: &mut AdaptiveLpScan,
+    output: &mut [i32; 16],
+) -> Result<u8, EntropyError> {
+    decode_ac_coefficients(
+        reader,
+        FrequencyBand::Lowpass,
+        class,
+        start_location,
+        state,
+        |_, index, level| scan.place(output, index, level),
+    )
+}
+
+#[inline]
 fn decode_ac_coefficients(
     reader: &mut PacketBitReader<'_>,
     band: FrequencyBand,
@@ -221,7 +296,7 @@ fn decode_ac_coefficients(
         1
     };
     let run = if zero_run {
-        decode_run(reader, 15 - location)?
+        decode_run_cached(reader, 15 - location)?
     } else {
         0
     };
@@ -232,7 +307,7 @@ fn decode_ac_coefficients(
     while successors != 0 {
         zero_run = successors & 1 == 0;
         let run = if zero_run {
-            decode_run(reader, 15_u8.saturating_sub(location))?
+            decode_run_cached(reader, 15_u8.saturating_sub(location))?
         } else {
             0
         };
@@ -266,6 +341,7 @@ impl DecodedBlock {
     }
 }
 
+#[inline]
 fn advance_location(location: u8, run: u8) -> Result<u8, EntropyError> {
     let next = location
         .checked_add(run)
@@ -283,6 +359,7 @@ fn advance_location(location: u8, run: u8) -> Result<u8, EntropyError> {
     Ok(next)
 }
 
+#[inline]
 fn decode_abs_level(
     reader: &mut PacketBitReader<'_>,
     state: &mut AdaptiveVlc,
@@ -320,6 +397,7 @@ fn decode_abs_level(
         .ok_or(EntropyError::CoefficientOverflow)
 }
 
+#[inline]
 fn decode_first_index(
     reader: &mut PacketBitReader<'_>,
     state: &mut AdaptiveVlc,
@@ -333,6 +411,7 @@ fn decode_first_index(
     Ok(symbol)
 }
 
+#[inline]
 fn decode_index(
     reader: &mut PacketBitReader<'_>,
     location: u8,
@@ -349,6 +428,22 @@ fn decode_index(
     }
 }
 
+/// [`decode_run`] through [`RUN_LOOKUP`], falling back near the packet end.
+#[inline]
+fn decode_run_cached(reader: &mut PacketBitReader<'_>, max_run: u8) -> Result<u8, EntropyError> {
+    if let Some(row) = RUN_LOOKUP
+        .get(usize::from(max_run))
+        .filter(|_| max_run != 0)
+    {
+        let entry = row[usize::from(reader.peek_byte())];
+        if reader.skip_cached(entry & 7) {
+            return Ok(entry >> 3);
+        }
+    }
+    decode_run(reader, max_run)
+}
+
+#[inline]
 fn decode_run(reader: &mut PacketBitReader<'_>, max_run: u8) -> Result<u8, EntropyError> {
     if max_run == 0 || max_run > 14 {
         return Err(EntropyError::InvalidParameter {
@@ -378,16 +473,18 @@ fn decode_run(reader: &mut PacketBitReader<'_>, max_run: u8) -> Result<u8, Entro
     Ok(RUN_REMAP[table_index] + refinement)
 }
 
+#[inline]
 fn signed(magnitude: i32, negative: bool) -> Result<i32, EntropyError> {
-    if negative {
-        magnitude
-            .checked_neg()
-            .ok_or(EntropyError::CoefficientOverflow)
-    } else {
-        Ok(magnitude)
+    // Sign bits are incompressible, so select the result without a branch;
+    // only the unrepresentable negation of `i32::MIN` takes the error path.
+    if negative && magnitude == i32::MIN {
+        return Err(EntropyError::CoefficientOverflow);
     }
+    let mask = -i32::from(negative);
+    Ok((magnitude ^ mask).wrapping_sub(mask))
 }
 
+#[inline]
 fn apply_sign(reader: &mut PacketBitReader<'_>, value: i32) -> Result<i32, EntropyError> {
     if value == 0 {
         return Ok(0);
@@ -467,6 +564,22 @@ mod tests {
         }
         assert!(successes > 1000, "successful blocks: {successes}");
         assert!(failures > 100, "failed blocks: {failures}");
+    }
+
+    #[test]
+    fn cached_runs_match_bit_serial_runs_and_errors() {
+        for max_run in 0..=15_u8 {
+            for pattern in 0_u16..=u16::MAX {
+                let bytes = pattern.to_be_bytes();
+                for bit_length in 0..=16 {
+                    let mut serial = PacketBitReader::with_bit_length(&bytes, bit_length).unwrap();
+                    let mut cached = serial.clone();
+                    let expected = decode_run(&mut serial, max_run);
+                    assert_eq!(decode_run_cached(&mut cached, max_run), expected);
+                    assert_eq!(cached.bit_position(), serial.bit_position());
+                }
+            }
+        }
     }
 
     #[test]

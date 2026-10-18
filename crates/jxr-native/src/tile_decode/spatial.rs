@@ -5,8 +5,8 @@ use jxr_core::{BandPresence, PredictionMode};
 use crate::{
     ImagePlaneHeader,
     entropy::{
-        ColourModel, ComponentClass, FrequencyBand, PacketBitReader, TileEntropyState,
-        decode_ac_block, decode_dc_coefficient, decode_lp_refinement,
+        ColourModel, ComponentClass, PacketBitReader, TileEntropyState, decode_dc_coefficient,
+        decode_lp_block, decode_lp_refinement,
     },
     reconstruct::QuantizedMacroblock,
 };
@@ -231,15 +231,14 @@ pub(super) fn decode_low_pass(
     let coded = reader.read_bit()?;
     let mut non_zero = 0_i32;
     if coded {
-        let block = decode_ac_block(
+        non_zero = i32::from(decode_lp_block(
             reader,
-            FrequencyBand::Lowpass,
             ComponentClass::Luma,
             1,
             &mut entropy.lp_vlc,
-        )?;
-        non_zero = i32::from(block.non_zero_count());
-        block.inverse_scan_lp(&mut entropy.lp_scan, output)?;
+            &mut entropy.lp_scan,
+            output,
+        )?);
     }
     let model_bits = entropy.lp_model.bits(false);
     decode_lp_refinement(reader, output, model_bits)?;

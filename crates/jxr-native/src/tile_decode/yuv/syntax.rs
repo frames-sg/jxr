@@ -4,8 +4,8 @@ use jxr_core::{ChromaSampling, PredictionMode};
 
 use crate::entropy::{
     ColourModel, ComponentClass, FrequencyBand, PacketBitReader, PrefixTable, TileEntropyState,
-    decode_ac_block, decode_dc_coefficient, decode_lp_refinement, decode_lp_refinement_at,
-    decode_prefix,
+    decode_ac_block, decode_dc_coefficient, decode_lp_block, decode_lp_refinement,
+    decode_lp_refinement_at, decode_prefix,
 };
 
 use super::super::{
@@ -217,9 +217,8 @@ pub(in crate::tile_decode) fn decode_low_pass_444(
     for (component, coefficients) in low.iter_mut().enumerate() {
         let chroma = component != 0;
         if pattern & (1 << component) != 0 {
-            let block = decode_ac_block(
+            lap_mean[usize::from(chroma)] += i32::from(decode_lp_block(
                 reader,
-                FrequencyBand::Lowpass,
                 if chroma {
                     ComponentClass::Chroma
                 } else {
@@ -227,9 +226,9 @@ pub(in crate::tile_decode) fn decode_low_pass_444(
                 },
                 1,
                 &mut entropy.lp_vlc,
-            )?;
-            lap_mean[usize::from(chroma)] += i32::from(block.non_zero_count());
-            block.inverse_scan_lp(&mut entropy.lp_scan, coefficients)?;
+                &mut entropy.lp_scan,
+                coefficients,
+            )?);
         }
         decode_lp_refinement(reader, coefficients, entropy.lp_model.bits(chroma))?;
         predict_low_pass(
@@ -262,15 +261,14 @@ pub(in crate::tile_decode) fn decode_low_pass_subsampled(
     let pattern = cbplp.decode(reader)?;
     let mut lap_mean = [0_i32; 2];
     if pattern & 1 != 0 {
-        let block = decode_ac_block(
+        lap_mean[0] = i32::from(decode_lp_block(
             reader,
-            FrequencyBand::Lowpass,
             ComponentClass::Luma,
             1,
             &mut entropy.lp_vlc,
-        )?;
-        lap_mean[0] = i32::from(block.non_zero_count());
-        block.inverse_scan_lp(&mut entropy.lp_scan, &mut low[0])?;
+            &mut entropy.lp_scan,
+            &mut low[0],
+        )?);
     }
     decode_lp_refinement(reader, &mut low[0], entropy.lp_model.bits(false))?;
     if pattern & 2 != 0 {

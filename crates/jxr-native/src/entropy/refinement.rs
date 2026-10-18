@@ -52,12 +52,34 @@ pub fn decode_flex_block(
         return Ok(output);
     }
     for &position in &TRANSPOSE[1..] {
-        let flex = decode_flex(reader, vlc_coefficients[position], bits_left)?;
+        let flex = decode_flex_fast(reader, vlc_coefficients[position], bits_left)?;
         output[position] = flex
             .checked_shl(u32::from(trim_flexbits))
             .ok_or(EntropyError::CoefficientOverflow)?;
     }
     Ok(output)
+}
+
+/// [`decode_flex`] for widths of at most 15 bits, served from the reader cache.
+#[inline]
+fn decode_flex_fast(
+    reader: &mut PacketBitReader<'_>,
+    vlc_coefficient: i32,
+    flex_bits: u8,
+) -> Result<i32, EntropyError> {
+    debug_assert!(flex_bits <= 15);
+    match reader.read_magnitude_and_sign(flex_bits, vlc_coefficient == 0) {
+        Some((magnitude, negative)) => {
+            let magnitude =
+                i32::try_from(magnitude).map_err(|_| EntropyError::CoefficientOverflow)?;
+            Ok(if negative || vlc_coefficient < 0 {
+                -magnitude
+            } else {
+                magnitude
+            })
+        }
+        None => decode_flex(reader, vlc_coefficient, flex_bits),
+    }
 }
 
 /// Refine the fifteen LP positions in the normative 4-by-4 transpose order.
@@ -83,7 +105,11 @@ pub fn decode_lp_refinement_at(
                 value: i64::try_from(position).unwrap_or(i64::MAX),
             });
         }
-        let refinement = decode_flex(reader, coefficients[position], model_bits)?;
+        let refinement = if model_bits <= 15 {
+            decode_flex_fast(reader, coefficients[position], model_bits)?
+        } else {
+            decode_flex(reader, coefficients[position], model_bits)?
+        };
         coefficients[position] = coefficients[position]
             .checked_shl(u32::from(model_bits))
             .and_then(|value| value.checked_add(refinement))

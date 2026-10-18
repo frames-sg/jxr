@@ -60,6 +60,7 @@ pub(in crate::tile_decode) struct SpatialDecoder<'a> {
     bands: BandPresence,
     trim: u8,
     sampling: ChromaSampling,
+    high_pass: Box<[[i32; 256]; 3]>,
 }
 
 impl<'a> SpatialDecoder<'a> {
@@ -84,6 +85,7 @@ impl<'a> SpatialDecoder<'a> {
             bands,
             trim,
             sampling,
+            high_pass: Box::new([[0; 256]; 3]),
         }
     }
 
@@ -113,8 +115,8 @@ impl<'a> SpatialDecoder<'a> {
             self.decode_low_pass(reader, &mut low, position, qp_indices.lp, predictions)?;
         }
         let hp_mode = high_pass::prediction_mode_yuv(&low, self.sampling);
-        let high = if self.bands.has_high_pass() {
-            high_pass::decode_yuv(
+        if self.bands.has_high_pass() {
+            high_pass::decode_yuv_into(
                 reader,
                 &mut self.entropy,
                 &mut self.high_pass_pattern,
@@ -125,11 +127,12 @@ impl<'a> SpatialDecoder<'a> {
                     flexbits_present: self.bands.has_flexbits(),
                     trim_flexbits: self.trim,
                 },
-            )?
-            .coefficients
+                &mut self.high_pass,
+            )?;
         } else {
-            Box::new([[0_i32; 256]; 3])
-        };
+            *self.high_pass = [[0; 256]; 3];
+        }
+        let high = &self.high_pass;
         for component in 0..3 {
             self.components[component].push(SpatialMacroblock {
                 coefficients: QuantizedMacroblock {
