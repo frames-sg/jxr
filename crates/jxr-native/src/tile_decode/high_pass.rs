@@ -157,6 +157,40 @@ pub(super) fn decode_yuv(
     payload: HighpassPayload,
 ) -> Result<DecodedHighComponents, TileDecodeError> {
     let mut output = Box::new([[0_i32; 256]; 3]);
+    let model_bits = decode_yuv_into(
+        reader,
+        entropy,
+        cbphp,
+        position,
+        sampling,
+        mode,
+        payload,
+        &mut output,
+    )?;
+    Ok(DecodedHighComponents {
+        coefficients: output,
+        model_bits,
+    })
+}
+
+/// Decodes YUV HP coefficients into caller-retained storage and returns the model bits.
+///
+/// `output` is cleared first, so a reused buffer matches a freshly zeroed one.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors decode_yuv with its destination"
+)]
+pub(super) fn decode_yuv_into(
+    reader: &mut PacketBitReader<'_>,
+    entropy: &mut TileEntropyState,
+    cbphp: &mut CbphpState,
+    position: MacroblockPosition,
+    sampling: ChromaSampling,
+    mode: PredictionMode,
+    payload: HighpassPayload,
+    output: &mut [[i32; 256]; 3],
+) -> Result<[u8; 2], TileDecodeError> {
+    *output = [[0; 256]; 3];
     let mut coded_blocks = cbphp.decode_yuv(reader, position.x, position.y, sampling)?;
     let model_bits = [entropy.hp_model.bits(false), entropy.hp_model.bits(true)];
     let mut lap_mean = [0_i32; 2];
@@ -214,10 +248,7 @@ pub(super) fn decode_yuv(
         ChromaSampling::Cs444 => ColourModel::Other { components: 3 },
     };
     entropy.hp_model.update(lap_mean, colour)?;
-    Ok(DecodedHighComponents {
-        coefficients: output,
-        model_bits,
-    })
+    Ok(model_bits)
 }
 
 pub(super) fn decode_components(

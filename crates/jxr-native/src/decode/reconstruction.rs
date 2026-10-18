@@ -12,9 +12,9 @@ use rayon::prelude::*;
 use crate::{
     CpuCapabilities, ParsedCodestream, decode_coefficients,
     reconstruct::{
-        ChromaReconstructionConfig, PlanarSamples, QuantizedMacroblock, ReconstructionConfig,
-        ReconstructionError, ReconstructionPipelineWorkspace, TilePartition,
-        reconstruct_chroma_444, reconstruct_luma_scaled_with_cpu,
+        ChromaReconstructionConfig, MacroblockSource, PlanarSamples, QuantizedMacroblock,
+        ReconstructionConfig, ReconstructionError, ReconstructionPipelineWorkspace, TilePartition,
+        reconstruct_chroma_444, reconstruct_luma_from_source, reconstruct_luma_scaled_with_cpu,
     },
 };
 
@@ -265,14 +265,6 @@ fn reconstruct_component(
         raster_reuses,
         pipeline,
     } = workspace;
-    let macroblocks = raster_macroblocks(
-        arena,
-        plane,
-        window,
-        macroblocks,
-        metadata_by_position,
-        raster_reuses,
-    )?;
     let config = ReconstructionConfig {
         macroblock_origin_x: window.origin_x,
         macroblock_origin_y: window.origin_y,
@@ -284,8 +276,67 @@ fn reconstruct_component(
         overlap: plan.primary.overlap,
         tiles: window.tiles.clone(),
     };
+    if plan.scale == DecodeScale::Full {
+        // Materialize each macroblock inside the parallel first-level pass
+        // instead of copying the component into raster order first.
+        let reused = metadata_by_position.capacity() >= plane.macroblock_count;
+        raster_positions(plane, window, metadata_by_position)?;
+        let source = ArenaMacroblocks {
+            arena,
+            indices: metadata_by_position,
+            block_columns: usize::from(plane.block_columns),
+            block_rows: usize::from(plane.block_rows),
+        };
+        if !metadata_by_position.contains(&usize::MAX)
+            && let Ok(samples) = reconstruct_luma_from_source(&source, &config, cpu, pipeline)
+        {
+            *raster_reuses = raster_reuses.saturating_add(u64::from(reused));
+            return Ok(samples);
+        }
+        // Any failure reruns the staged path below, which reports the same
+        // error, with unpacking errors taking precedence, as it always has.
+    }
+    let macroblocks = raster_macroblocks(
+        arena,
+        plane,
+        window,
+        macroblocks,
+        metadata_by_position,
+        raster_reuses,
+    )?;
     reconstruct_luma_scaled_with_cpu(macroblocks, &config, plan.scale, cpu, pipeline)
         .map_err(|error| map_reconstruction_error(&error))
+}
+
+/// Arena macroblocks addressed in raster order through `indices`.
+struct ArenaMacroblocks<'a> {
+    arena: &'a CoefficientArena,
+    indices: &'a [usize],
+    block_columns: usize,
+    block_rows: usize,
+}
+
+impl MacroblockSource for ArenaMacroblocks<'_> {
+    fn macroblock_count(&self) -> usize {
+        self.indices.len()
+    }
+
+    #[inline]
+    fn with_macroblock<R>(
+        &self,
+        index: usize,
+        visit: impl FnOnce(&QuantizedMacroblock) -> Result<R, ReconstructionError>,
+    ) -> Result<R, ReconstructionError> {
+        // The staged rerun reports the specific unpacking error.
+        let macroblock = unpack_macroblock(
+            self.arena,
+            self.indices[index],
+            self.block_columns,
+            self.block_rows,
+        )
+        .map_err(|_| ReconstructionError::InvalidPlaneGeometry("arena macroblock"))?;
+        visit(&macroblock)
+    }
 }
 
 fn raster_macroblocks<'workspace>(
@@ -296,6 +347,34 @@ fn raster_macroblocks<'workspace>(
     metadata_by_position: &mut Vec<usize>,
     reuse_count: &mut u64,
 ) -> Result<&'workspace [QuantizedMacroblock], JxrError> {
+    let capacities_reused = macroblocks.capacity() >= plane.macroblock_count
+        && metadata_by_position.capacity() >= plane.macroblock_count;
+    raster_positions(plane, window, metadata_by_position)?;
+    macroblocks.clear();
+    for &index in metadata_by_position.iter() {
+        if index == usize::MAX {
+            return Err(missing_position());
+        }
+        macroblocks.push(unpack_macroblock(
+            arena,
+            index,
+            usize::from(plane.block_columns),
+            usize::from(plane.block_rows),
+        )?);
+    }
+    *reuse_count = reuse_count.saturating_add(u64::from(capacities_reused));
+    Ok(macroblocks)
+}
+
+/// Records each raster position's arena index, rejecting duplicates.
+///
+/// Unfilled positions remain `usize::MAX`; callers report them in raster
+/// order alongside unpacking errors.
+fn raster_positions(
+    plane: &CoefficientPlane,
+    window: &ReconstructionWindow,
+    metadata_by_position: &mut Vec<usize>,
+) -> Result<(), JxrError> {
     let width =
         usize::try_from(window.width).map_err(|_| JxrError::arithmetic("macroblock row width"))?;
     let height = usize::try_from(window.height)
@@ -315,9 +394,6 @@ fn raster_macroblocks<'workspace>(
             "planned macroblock traversal",
         ));
     }
-    let capacities_reused =
-        macroblocks.capacity() >= count && metadata_by_position.capacity() >= count;
-    macroblocks.clear();
     metadata_by_position.clear();
     metadata_by_position.resize(count, usize::MAX);
     let metadata_end = plane
@@ -339,22 +415,14 @@ fn raster_macroblocks<'workspace>(
         }
         metadata_by_position[position] = index;
     }
-    for &index in metadata_by_position.iter() {
-        if index == usize::MAX {
-            return Err(JxrError::new(
-                JxrErrorKind::InternalInvariant,
-                "missing macroblock position",
-            ));
-        }
-        macroblocks.push(unpack_macroblock(
-            arena,
-            index,
-            usize::from(plane.block_columns),
-            usize::from(plane.block_rows),
-        )?);
-    }
-    *reuse_count = reuse_count.saturating_add(u64::from(capacities_reused));
-    Ok(macroblocks)
+    Ok(())
+}
+
+fn missing_position() -> JxrError {
+    JxrError::new(
+        JxrErrorKind::InternalInvariant,
+        "missing macroblock position",
+    )
 }
 
 fn unpack_macroblock(

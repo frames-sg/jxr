@@ -6,6 +6,7 @@ use jxr_math::color::clamp_sample;
 use super::{
     ComponentPlane, OutputBitDepth, OutputFormatError, OutputFormatRequest,
     color::convert,
+    interleave,
     packed_color::{
         pack_rgb555, pack_rgb555_into, pack_rgb565, pack_rgb565_into, pack_rgb101010,
         pack_rgb101010_into, pack_rgbe, pack_rgbe_into,
@@ -197,6 +198,9 @@ fn fill_u16(context: FormatContext<'_>, output: &mut [u16]) -> Result<(), Output
     } else {
         65_535
     };
+    if interleave::try_store(context, output) {
+        return Ok(());
+    }
     let scaling = context.channel_scales();
     fill_ordered(context, output, |sample, component, alpha| {
         let scaled = scaling.apply(sample, component, alpha)?;
@@ -352,15 +356,17 @@ pub(crate) fn format_components_u8_into_with_cpu(
             output,
         );
     }
-    let mut index = 0;
-    let scaling = context.channel_scales();
-    for_each_ordered(context, |sample, component, alpha| {
-        let scaled = scaling.apply(sample, component, alpha)?;
-        output[index] =
-            u8::try_from(clamp_sample(scaled, 0, 255)).expect("sample is clipped to u8");
-        index += 1;
-        Ok(())
-    })?;
+    if !interleave::try_store(context, output) {
+        let mut index = 0;
+        let scaling = context.channel_scales();
+        for_each_ordered(context, |sample, component, alpha| {
+            let scaled = scaling.apply(sample, component, alpha)?;
+            output[index] =
+                u8::try_from(clamp_sample(scaled, 0, 255)).expect("sample is clipped to u8");
+            index += 1;
+            Ok(())
+        })?;
+    }
     if request.premultiply_alpha {
         super::premultiply::premultiply_u8(
             output,
@@ -390,7 +396,7 @@ impl FormatContext<'_> {
             })
     }
 
-    fn channel_scale(self, component: usize, alpha: bool) -> ChannelScale {
+    pub(super) fn channel_scale(self, component: usize, alpha: bool) -> ChannelScale {
         if self.is_padding(component, alpha) {
             return ChannelScale::Padding;
         }
@@ -645,7 +651,11 @@ fn pack_u8(
         )?;
         return Ok((DecodedSamples::U8(output), used_simd));
     }
-    let mut output = Vec::with_capacity(elements);
+    let mut output = vec![0; elements];
+    if interleave::try_store(context, &mut output) {
+        return Ok((DecodedSamples::U8(output), false));
+    }
+    output.clear();
     let scaling = context.channel_scales();
     for_each_ordered(context, |sample, component, alpha| {
         let scaled = scaling.apply(sample, component, alpha)?;
@@ -659,7 +669,11 @@ fn pack_u16(
     context: FormatContext<'_>,
     elements: usize,
 ) -> Result<DecodedSamples, OutputFormatError> {
-    let mut output = Vec::with_capacity(elements);
+    let mut output = vec![0; elements];
+    if interleave::try_store(context, &mut output) {
+        return Ok(DecodedSamples::U16(output));
+    }
+    output.clear();
     let scaling = context.channel_scales();
     let maximum = if matches!(context.request.bit_depth, OutputBitDepth::U10) {
         1_023

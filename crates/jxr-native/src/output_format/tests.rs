@@ -400,6 +400,134 @@ fn yuv444_to_rgb_u16_preserves_inverse_transform_values() {
 }
 
 #[test]
+fn parallel_cropped_bgra_matches_checked_color_and_alpha_scaling() {
+    let stride = 263;
+    let sources: [Vec<i32>; 4] = core::array::from_fn(|component| {
+        (0..stride * 259)
+            .map(|index| {
+                i32::try_from((index * 37 + component * 101) % 2048).unwrap() * 257 - 262_144
+            })
+            .collect()
+    });
+    let planes = sources.each_ref().map(|samples| ComponentPlane {
+        origin_x: 11,
+        origin_y: 17,
+        width: 259,
+        height: 259,
+        stride,
+        samples,
+    });
+    let internal = ColorFormat::Yuv(ChromaSampling::Cs444);
+    for (depth, format, maximum) in [
+        (
+            OutputBitDepth::U8,
+            PixelFormat::U8(ChannelLayout::Bgra),
+            255,
+        ),
+        (
+            OutputBitDepth::U16 { shift_bits: 1 },
+            PixelFormat::U16(ChannelLayout::Bgra),
+            65_535,
+        ),
+    ] {
+        let mut output = request(internal, ColorFormat::Rgb, depth, format);
+        output.scaled = true;
+        output.alpha_format = Some(AlphaFormatRequest {
+            bit_depth: depth,
+            scaled: false,
+        });
+        // Odd rows and a padded, nonzero-origin crop cross several parallel tasks.
+        output.crop = CropWindow {
+            x: 12,
+            y: 18,
+            width: 257,
+            height: 257,
+        };
+        let decoded = format_components(&planes[..3], Some(planes[3]), output).unwrap();
+        let actual: Vec<i32> = match decoded {
+            DecodedSamples::U8(values) => values.into_iter().map(i32::from).collect(),
+            DecodedSamples::U16(values) => values.into_iter().map(i32::from).collect(),
+            _ => panic!("expected unsigned integer output"),
+        };
+        let mut expected = Vec::with_capacity(actual.len());
+        for y in 0..257 {
+            for x in 0..257 {
+                let index = (y + 1) * stride + x + 1;
+                let source = sources.each_ref().map(|samples| samples[index]);
+                let rgb = super::color::convert(internal, ColorFormat::Rgb, &source, false, true)
+                    .unwrap();
+                for channel in [2, 1, 0, 3] {
+                    let alpha = channel == 3;
+                    let scaled = super::scaling::scale_integer_component(
+                        if alpha { source[3] } else { rgb[channel] },
+                        channel,
+                        if alpha {
+                            ColorFormat::Luma
+                        } else {
+                            ColorFormat::Rgb
+                        },
+                        depth,
+                        !alpha,
+                    )
+                    .unwrap();
+                    expected.push(scaled.clamp(0, maximum));
+                }
+            }
+        }
+        assert_eq!(actual, expected, "{format:?}");
+    }
+}
+
+#[test]
+fn parallel_integer_output_falls_back_without_losing_values_or_overflow_errors() {
+    let mut samples = vec![0; 257 * 257];
+    for (depth, format, midpoint, maximum) in [
+        (
+            OutputBitDepth::U8,
+            PixelFormat::U8(ChannelLayout::Rgb),
+            128,
+            255,
+        ),
+        (
+            OutputBitDepth::U16 { shift_bits: 0 },
+            PixelFormat::U16(ChannelLayout::Rgb),
+            32_768,
+            65_535,
+        ),
+    ] {
+        let mut output = request(ColorFormat::Luma, ColorFormat::Rgb, depth, format);
+        output.crop.width = 257;
+        output.crop.height = 257;
+        *samples.last_mut().unwrap() = 1 << 26;
+        let decoded = format_components(
+            &[ComponentPlane::tightly_packed(257, 257, &samples)],
+            None,
+            output,
+        )
+        .unwrap();
+        let actual: Vec<i32> = match decoded {
+            DecodedSamples::U8(values) => values.into_iter().map(i32::from).collect(),
+            DecodedSamples::U16(values) => values.into_iter().map(i32::from).collect(),
+            _ => panic!("expected unsigned integer output"),
+        };
+        let mut expected = vec![midpoint; samples.len() * 3];
+        expected[(samples.len() - 1) * 3..].fill(maximum);
+        assert_eq!(actual, expected, "{format:?}");
+
+        *samples.last_mut().unwrap() = i32::MAX;
+        assert_eq!(
+            format_components(
+                &[ComponentPlane::tightly_packed(257, 257, &samples)],
+                None,
+                output,
+            ),
+            Err(OutputFormatError::arithmetic("adding output bias")),
+            "{format:?}",
+        );
+    }
+}
+
+#[test]
 fn direct_typed_destinations_match_owned_component_packing() {
     let values = [-17, 23];
     let planes = [ComponentPlane::tightly_packed(2, 1, &values)];

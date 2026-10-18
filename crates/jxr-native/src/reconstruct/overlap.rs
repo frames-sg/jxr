@@ -1,10 +1,12 @@
 //! T.832 clause 9.9.8 overlap operators and full-resolution edge geometry.
 
+use fearless_simd::Level;
 use jxr_math::overlap::{inverse_overlap_filter_4, inverse_overlap_filter_4x4};
 
 use super::ReconstructionError;
 
 pub(super) fn apply_overlap(
+    level: Level,
     samples: &mut [i32],
     width: usize,
     height: usize,
@@ -24,9 +26,31 @@ pub(super) fn apply_overlap(
     } else {
         &full_rows
     };
+    // Interior windows of block-aligned regions use the four-lane kernel.
+    let aligned = columns.iter().chain(rows).all(|boundary| boundary % 4 == 0);
     for vertical in rows.windows(2) {
+        if aligned {
+            super::lanes::filter_interior_windows(
+                level,
+                samples,
+                width,
+                columns,
+                [vertical[0], vertical[1]],
+                overlap_post_filter_4x4,
+            )?;
+        }
         for horizontal in columns.windows(2) {
-            filter_region(
+            if !aligned {
+                filter_interior(
+                    samples,
+                    width,
+                    horizontal[0],
+                    horizontal[1],
+                    vertical[0],
+                    vertical[1],
+                )?;
+            }
+            filter_region_edges(
                 samples,
                 width,
                 horizontal[0],
@@ -39,7 +63,7 @@ pub(super) fn apply_overlap(
     Ok(())
 }
 
-fn filter_region(
+fn filter_interior(
     samples: &mut [i32],
     stride: usize,
     left: usize,
@@ -56,6 +80,17 @@ fn filter_region(
         }
         y += 4;
     }
+    Ok(())
+}
+
+fn filter_region_edges(
+    samples: &mut [i32],
+    stride: usize,
+    left: usize,
+    right: usize,
+    top: usize,
+    bottom: usize,
+) -> Result<(), ReconstructionError> {
     filter_vertical_edges(samples, stride, left, right, top, bottom)?;
     filter_horizontal_edges(samples, stride, left, right, top, bottom)?;
     filter_corner(samples, stride, left, top)?;
@@ -164,6 +199,8 @@ fn overlap_post_filter_4(values: &mut [i32; 4]) -> Result<(), ReconstructionErro
 
 #[cfg(test)]
 mod tests {
+    use fearless_simd::Level;
+
     use super::{apply_overlap, overlap_post_filter_4, overlap_post_filter_4x4};
 
     #[test]
@@ -190,9 +227,9 @@ mod tests {
             9, 9, 9,
         ];
         let mut soft = source;
-        apply_overlap(&mut soft, 8, 4, &[0, 4, 8], &[0, 4], false).unwrap();
+        apply_overlap(Level::new(), &mut soft, 8, 4, &[0, 4, 8], &[0, 4], false).unwrap();
         let mut hard = source;
-        apply_overlap(&mut hard, 8, 4, &[0, 4, 8], &[0, 4], true).unwrap();
+        apply_overlap(Level::new(), &mut hard, 8, 4, &[0, 4, 8], &[0, 4], true).unwrap();
         assert_eq!(
             soft,
             [
@@ -230,7 +267,16 @@ mod tests {
         for row in ROW_ORDER {
             samples.extend_from_slice(&ROWS[row]);
         }
-        apply_overlap(&mut samples, 16, 16, &[0, 16], &[0, 16], false).unwrap();
+        apply_overlap(
+            Level::new(),
+            &mut samples,
+            16,
+            16,
+            &[0, 16],
+            &[0, 16],
+            false,
+        )
+        .unwrap();
         assert_eq!(samples, vec![-128; 16 * 16]);
     }
 }

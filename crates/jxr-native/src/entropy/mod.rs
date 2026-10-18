@@ -11,10 +11,10 @@ mod vlc;
 
 pub use adaptive::{AcVlcState, DcVlcState, TileEntropyState};
 pub use bit_reader::PacketBitReader;
-pub(crate) use coefficients::decode_hp_block;
 pub use coefficients::{
     ComponentClass, DecodedBlock, FrequencyBand, RunLevel, decode_ac_block, decode_dc_coefficient,
 };
+pub(crate) use coefficients::{decode_hp_block, decode_lp_block};
 pub use error::EntropyError;
 pub use model::{CoefficientModel, ColourModel};
 pub use refinement::{

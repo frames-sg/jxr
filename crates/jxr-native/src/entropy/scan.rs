@@ -6,6 +6,7 @@ const SCAN_ORDER_0: [u8; 16] = [0, 4, 1, 5, 8, 2, 9, 6, 12, 3, 10, 13, 7, 14, 11
 const SCAN_ORDER_1: [u8; 16] = [0, 1, 2, 5, 4, 3, 6, 9, 8, 7, 12, 15, 13, 10, 11, 14];
 const SCAN_TOTALS: [i32; 16] = [0, 32, 30, 28, 26, 24, 22, 20, 18, 16, 14, 12, 10, 8, 6, 4];
 
+#[inline]
 fn place_and_adapt(
     order: &mut [u8; 16],
     totals: &mut [i32; 16],
@@ -63,6 +64,7 @@ impl AdaptiveLpScan {
     }
 
     /// Places one parsed coefficient and performs the adjacent scan update.
+    #[inline]
     pub fn place(
         &mut self,
         output: &mut [i32; 16],
@@ -127,6 +129,7 @@ impl AdaptiveHpScan {
     }
 
     /// Places one parsed coefficient into the selected HP scan.
+    #[inline]
     pub fn place(
         &mut self,
         direction: HpScanDirection,

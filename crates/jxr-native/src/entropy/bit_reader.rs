@@ -3,11 +3,18 @@
 use super::EntropyError;
 
 /// A bounds-checked view over exactly one tile packet payload.
+///
+/// Reads are served from a cached, most-significant-bit-aligned window of the
+/// unread bits, so consecutive syntax elements shift a register instead of
+/// reloading the packet. The cache never extends past `bit_length` and its
+/// bits after `cached` are zero, which makes every end check one comparison.
 #[derive(Debug, Clone)]
 pub struct PacketBitReader<'a> {
     bytes: &'a [u8],
     bit_position: usize,
     bit_length: usize,
+    cache: u64,
+    cached: u32,
 }
 
 impl<'a> PacketBitReader<'a> {
@@ -18,6 +25,8 @@ impl<'a> PacketBitReader<'a> {
             bytes,
             bit_position: 0,
             bit_length: bytes.len().saturating_mul(8),
+            cache: 0,
+            cached: 0,
         }
     }
 
@@ -34,6 +43,8 @@ impl<'a> PacketBitReader<'a> {
             bytes,
             bit_position: 0,
             bit_length,
+            cache: 0,
+            cached: 0,
         })
     }
 
@@ -58,36 +69,74 @@ impl<'a> PacketBitReader<'a> {
     /// Reads up to 64 bits, most-significant bit first.
     #[inline]
     pub fn read_bits(&mut self, count: u8) -> Result<u64, EntropyError> {
-        // A byte-aligned 64-bit window always holds 57 bits after the in-byte
-        // offset, so every entropy-syntax read needs exactly one load.
+        // A refilled cache holds at least 57 bits unless the packet ends first.
         if count > 57 {
             return self.read_wide_bits(count);
         }
-        let end = self.checked_end(count)?;
-        let value = match count {
-            0 => 0,
-            _ => self.window() >> (64 - count),
-        };
-        self.bit_position = end;
-        Ok(value)
+        if u32::from(count) > self.cached {
+            self.refill();
+            if u32::from(count) > self.cached {
+                return Err(self.end_error(count));
+            }
+        }
+        Ok(self.consume_cached(count))
     }
 
     /// Returns the next eight bits without consuming them, zero-filled past the packet end.
+    ///
+    /// Afterwards at least `min(8, bits_remaining)` bits are cached.
     #[inline]
-    pub(crate) fn peek_byte(&self) -> u8 {
-        let remaining = self.bits_remaining();
-        let mut window = self.window();
-        if remaining < 8 {
-            window &= !(u64::MAX >> remaining);
+    pub(crate) fn peek_byte(&mut self) -> u8 {
+        if self.cached < 8 {
+            self.refill();
         }
-        window.to_be_bytes()[0]
+        self.cache.to_be_bytes()[0]
     }
 
-    /// Advances past bits already inspected with [`Self::peek_byte`].
+    /// Advances past `count` cached bits when they are available.
+    ///
+    /// Returns `false` without consuming input when fewer bits are cached.
     #[inline]
-    pub(crate) fn skip_bits(&mut self, count: u8) -> Result<(), EntropyError> {
-        self.bit_position = self.checked_end(count)?;
-        Ok(())
+    pub(crate) fn skip_cached(&mut self, count: u8) -> bool {
+        if u32::from(count) > self.cached {
+            return false;
+        }
+        self.consume_cached(count);
+        true
+    }
+
+    /// Reads a `bits`-wide magnitude followed, when `signed` and non-zero, by its sign bit.
+    ///
+    /// Returns the magnitude and whether the sign bit was set. Returns `None`
+    /// without consuming input when fewer than `bits + 1` bits can be cached,
+    /// so callers near the packet end can repeat the read bit-serially.
+    #[inline]
+    pub(crate) fn read_magnitude_and_sign(
+        &mut self,
+        bits: u8,
+        signed: bool,
+    ) -> Option<(u32, bool)> {
+        debug_assert!(bits <= 29);
+        let needed = u32::from(bits) + 1;
+        if needed > self.cached {
+            self.refill();
+            if needed > self.cached {
+                return None;
+            }
+        }
+        let magnitude = (self.cache >> 1) >> (63 - bits);
+        // The sign follows only a non-zero magnitude; selecting it without a
+        // branch avoids mispredicting on data-dependent flexbits.
+        let take_sign = signed && magnitude != 0;
+        let negative = take_sign && (self.cache << bits) >> 63 != 0;
+        let consumed = bits + u8::from(take_sign);
+        self.cache <<= consumed;
+        self.cached -= u32::from(consumed);
+        self.bit_position += usize::from(consumed);
+        Some((
+            u32::try_from(magnitude).expect("magnitude has at most 29 bits"),
+            negative,
+        ))
     }
 
     /// Builds the error a bit-serial reader reports after consuming `consumed` more bits.
@@ -100,6 +149,18 @@ impl<'a> PacketBitReader<'a> {
         }
     }
 
+    /// Consumes `count <= cached` bits, where `count` is at most 57.
+    #[inline]
+    fn consume_cached(&mut self, count: u8) -> u64 {
+        debug_assert!(u32::from(count) <= self.cached && count <= 57);
+        // Splitting the shift keeps a zero-width read defined.
+        let value = (self.cache >> 1) >> (63 - count);
+        self.cache <<= count;
+        self.cached -= u32::from(count);
+        self.bit_position += usize::from(count);
+        value
+    }
+
     #[inline(never)]
     fn read_wide_bits(&mut self, count: u8) -> Result<u64, EntropyError> {
         if count > 64 {
@@ -108,21 +169,12 @@ impl<'a> PacketBitReader<'a> {
                 value: i64::from(count),
             });
         }
-        let end = self.checked_end(count)?;
-        let high_bits = count - 32;
-        let high = self.window() >> (64 - high_bits);
-        self.bit_position += usize::from(high_bits);
-        let low = self.window() >> 32;
-        self.bit_position = end;
-        Ok((high << 32) | low)
-    }
-
-    #[inline]
-    fn checked_end(&self, count: u8) -> Result<usize, EntropyError> {
-        match self.bit_position.checked_add(usize::from(count)) {
-            Some(end) if end <= self.bit_length => Ok(end),
-            _ => Err(self.end_error(count)),
+        if usize::from(count) > self.bits_remaining() {
+            return Err(self.end_error(count));
         }
+        let high = self.read_bits(count - 32)?;
+        let low = self.read_bits(32)?;
+        Ok((high << 32) | low)
     }
 
     #[cold]
@@ -135,13 +187,13 @@ impl<'a> PacketBitReader<'a> {
         }
     }
 
-    /// Returns 64 bits starting at `bit_position`, most-significant-bit aligned.
+    /// Reloads the cache with the unread bits at `bit_position`.
     ///
-    /// Bytes beyond the backing slice read as zero. Bits between the packet
-    /// bit length and the end of its final byte are returned unchanged, so
-    /// callers must bound their use by `bits_remaining`.
-    #[inline]
-    fn window(&self) -> u64 {
+    /// A byte-aligned 64-bit window holds at least 57 bits after the in-byte
+    /// offset. Bytes beyond the backing slice read as zero, and bits beyond
+    /// `bit_length` are cleared.
+    #[inline(never)]
+    fn refill(&mut self) {
         let byte = self.bit_position / 8;
         let word = match self.bytes.get(byte..byte + 8) {
             Some(chunk) => {
@@ -149,7 +201,15 @@ impl<'a> PacketBitReader<'a> {
             }
             None => Self::padded_word(self.bytes, byte),
         };
-        word << (self.bit_position % 8)
+        let offset = self.bit_position % 8;
+        let available = (64 - offset).min(self.bits_remaining());
+        // `available` is at least 57 unless the packet ends, and never zero
+        // when any bit remains.
+        self.cached = u32::try_from(available).expect("window holds at most 64 bits");
+        self.cache = match available {
+            0 => 0,
+            bits => (word << offset) & (u64::MAX << (64 - bits)),
+        };
     }
 
     #[cold]
@@ -243,6 +303,44 @@ mod tests {
                     assert_eq!(reader.bit_position(), start + usize::from(count));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn cached_reads_cross_refills_and_preserve_end_errors() {
+        let bytes: Vec<u8> = (0_u8..40)
+            .map(|index| index.wrapping_mul(73) ^ 0x3c)
+            .collect();
+        let bit_length = bytes.len() * 8 - 5;
+        let widths = [1_u8, 7, 3, 13, 57, 2, 64, 0, 31, 9, 58, 5];
+        let mut reader = PacketBitReader::with_bit_length(&bytes, bit_length).unwrap();
+        let mut position = 0;
+        for &count in widths.iter().cycle().take(64) {
+            let result = reader.read_bits(count);
+            if position + usize::from(count) > bit_length {
+                assert_eq!(
+                    result,
+                    Err(EntropyError::UnexpectedEnd {
+                        bit_position: position,
+                        requested_bits: count,
+                        bit_length,
+                    })
+                );
+            } else {
+                assert_eq!(
+                    result.unwrap(),
+                    reference_bits(&bytes, position, usize::from(count)),
+                    "position {position}, count {count}"
+                );
+                position += usize::from(count);
+            }
+            assert_eq!(reader.bit_position(), position);
+            let expected_peek = (0..8).fold(0_u8, |value, bit| {
+                let index = position + bit;
+                let set = index < bit_length && (bytes[index / 8] >> (7 - index % 8)) & 1 != 0;
+                (value << 1) | u8::from(set)
+            });
+            assert_eq!(reader.peek_byte(), expected_peek);
         }
     }
 

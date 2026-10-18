@@ -1,4 +1,4 @@
-//! Normative scalar output formatting from reconstructed signed component planes.
+//! Normative CPU output formatting from reconstructed signed component planes.
 //!
 //! The implementation follows T.832 clauses 9.10.4 through 9.10.8. Chroma
 //! upsampling is intentionally outside this module: callers must supply full-
@@ -6,6 +6,7 @@
 
 mod color;
 mod error;
+mod interleave;
 mod packed_color;
 mod packing;
 mod planar;

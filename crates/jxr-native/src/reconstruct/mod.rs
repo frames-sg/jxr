@@ -7,6 +7,7 @@
 
 mod chroma;
 mod contract;
+mod lanes;
 mod overlap;
 mod packing;
 mod pipeline;
@@ -25,4 +26,7 @@ pub use packing::{pack_luma_u8, pack_luma_u16};
 pub use pipeline::reconstruct_luma;
 #[cfg(test)]
 pub(crate) use pipeline::reconstruct_luma_scaled;
-pub(crate) use pipeline::{ReconstructionPipelineWorkspace, reconstruct_luma_scaled_with_cpu};
+pub(crate) use pipeline::{
+    MacroblockSource, ReconstructionPipelineWorkspace, reconstruct_luma_from_source,
+    reconstruct_luma_scaled_with_cpu,
+};

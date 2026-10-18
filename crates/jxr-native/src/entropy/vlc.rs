@@ -19,6 +19,11 @@ pub(crate) struct PrefixTable {
 }
 
 impl PrefixTable {
+    /// Returns the `(length << 8) | symbol` entry for an eight-bit prefix, or zero.
+    pub(crate) const fn entry(&self, prefix: u8) -> u16 {
+        self.lookup[prefix as usize]
+    }
+
     pub(crate) const fn new(codes: &[VlcCode]) -> Self {
         let mut lookup = [0_u16; 1 << LOOKUP_BITS];
         let mut max_length = 0;
@@ -55,13 +60,13 @@ pub(crate) fn decode(
     syntax: &'static str,
     table: &PrefixTable,
 ) -> Result<u8, EntropyError> {
-    let remaining = reader.bits_remaining();
     let entry = table.lookup[usize::from(reader.peek_byte())];
     let [length, symbol] = entry.to_be_bytes();
-    if entry != 0 && usize::from(length) <= remaining {
-        reader.skip_bits(length)?;
+    // The peek caches `min(8, remaining)` bits, so a cached code is in bounds.
+    if entry != 0 && reader.skip_cached(length) {
         return Ok(symbol);
     }
+    let remaining = reader.bits_remaining();
     if remaining < usize::from(table.max_length) {
         return Err(reader.unexpected_end_after(remaining));
     }
@@ -96,11 +101,14 @@ const ABS_LEVEL_CODES: [&[VlcCode]; 2] = [
     ],
 ];
 
+/// `RUN_VALUE` codes for maximum runs two, three, and four.
+pub(super) const RUN_VALUE_CODES: [&[VlcCode]; 3] =
+    [RUN_VALUE_2_CODES, RUN_VALUE_3_CODES, RUN_VALUE_4_CODES];
 const RUN_VALUE_2_CODES: &[VlcCode] = &[c(0b1, 1, 1), c(0b0, 1, 2)];
 const RUN_VALUE_3_CODES: &[VlcCode] = &[c(0b1, 1, 1), c(0b01, 2, 2), c(0b00, 2, 3)];
 const RUN_VALUE_4_CODES: &[VlcCode] =
     &[c(0b1, 1, 1), c(0b01, 2, 2), c(0b001, 3, 3), c(0b000, 3, 4)];
-const RUN_INDEX_CODES: &[VlcCode] = &[
+pub(super) const RUN_INDEX_CODES: &[VlcCode] = &[
     c(0b1, 1, 0),
     c(0b01, 2, 1),
     c(0b001, 3, 2),
