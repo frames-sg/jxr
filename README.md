@@ -206,8 +206,8 @@ attached GPU session or choose the CPU before submission. Explicit `Metal` and
 `Cuda` requests return an error when unavailable or unsupported. GPU failures
 after submission are returned without a CPU retry.
 
-Automatic routing uses provisional workload thresholds. **No general
-CPU-versus-GPU speedup is claimed.** See the [routing model](docs/architecture.md#route-model),
+Automatic routing uses workload thresholds (measured for Metal, provisional for
+CUDA). **No general CPU-versus-GPU speedup is claimed.** See the [routing model](docs/architecture.md#route-model),
 [CUDA backend guide](docs/cuda-backend.md), and hardware reports for
 [release 0.3.0](https://github.com/frames-sg/jxr/releases/tag/v0.3.0).
 

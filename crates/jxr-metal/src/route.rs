@@ -4,8 +4,17 @@ use j2k_core::BackendRequest;
 
 use crate::MetalError;
 
-/// Provisional auto-routing threshold, measured in reconstructed coefficients.
-pub const METAL_AUTO_THRESHOLD: u64 = 16_384;
+/// Auto-routing threshold, measured in reconstructed coefficients.
+///
+/// Single-image Metal decodes pay a fixed submit-to-completion latency and run
+/// a short GPU burst at low clock, while CPU reconstruction is a small part of
+/// the shared entropy cost. Interleaved CPU vs Metal host decodes on M4,
+/// M4 Pro, and M5 Max put every measured image below 1.8M coefficients at
+/// 0.29-0.98x on Metal, except on M5 Max one 131px and two multi-tile 256px
+/// images at 1.10-1.15x. From 2.1M up, 4:4:4 8-bit images reach parity
+/// (0.92-1.05x), and 4:2:0 or fixed-point outputs, whose CPU reconstruction
+/// is costlier, reach 1.26-1.35x. 2^21 sits between those measured groups.
+pub const METAL_AUTO_THRESHOLD: u64 = 1 << 21;
 
 /// Concrete route selected by the Metal adapter planner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
