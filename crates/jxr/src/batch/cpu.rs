@@ -101,6 +101,15 @@ impl CpuBatchDecoder {
         self.workers.install(operation)
     }
 
+    /// Run `operation` on the calling thread while its spawned jobs use the pool.
+    #[cfg(feature = "metal")]
+    pub(crate) fn in_place_scope<'scope, Output>(
+        &self,
+        operation: impl FnOnce(&rayon::Scope<'scope>) -> Output,
+    ) -> Output {
+        self.workers.in_place_scope(operation)
+    }
+
     /// Parse and group owned compressed inputs concurrently.
     pub fn prepare(
         &self,
