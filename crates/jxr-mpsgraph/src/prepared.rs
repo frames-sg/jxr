@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use jxr::{PreparedReconstruction, Rect};
+use jxr::Rect;
 
 use crate::{Error, MpsGraphTensorSpec};
 
@@ -67,7 +67,7 @@ impl IndexedGroupError {
 )]
 pub(crate) struct PreparedImage {
     pub(crate) source_index: usize,
-    pub(crate) reconstruction: PreparedReconstruction,
+    pub(crate) plan: jxr_metal::MetalDecodePlan,
     pub(crate) decoded_region: Rect,
 }
 
