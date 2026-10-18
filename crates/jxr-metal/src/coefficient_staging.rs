@@ -9,28 +9,78 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 #[cfg(target_os = "macos")]
 use objc2_metal::{MTLBuffer, MTLResource, MTLStorageMode};
 
+/// One pooled shared allocation backing every staging slice cut from it.
+///
+/// The buffer returns to its session's staging pool when the last slice,
+/// sealed arena, or in-flight submission referencing it is dropped, so a
+/// later preparation can never overwrite coefficients the GPU still reads.
+#[cfg(target_os = "macos")]
+pub(crate) struct StagingAllocation {
+    buffer: Option<crate::buffer_pool::PooledBuffer>,
+    pool: Arc<crate::buffer_pool::StagingPool>,
+}
+
+// SAFETY: The allocation is only retained, released, and queried for its
+// mapped base address. Mutable CPU access is mediated by disjoint
+// `MetalCoefficientStaging` slices behind `&mut self`, sealed arenas are
+// immutable, and Metal buffers may be retained and released on any thread.
+#[cfg(target_os = "macos")]
+unsafe impl Send for StagingAllocation {}
+// SAFETY: Shared references expose only the immutable buffer handle; see the
+// `Send` justification for how writes to the mapped contents are partitioned.
+#[cfg(target_os = "macos")]
+unsafe impl Sync for StagingAllocation {}
+
+#[cfg(target_os = "macos")]
+impl StagingAllocation {
+    pub(crate) fn new(
+        buffer: crate::buffer_pool::PooledBuffer,
+        pool: Arc<crate::buffer_pool::StagingPool>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            buffer: Some(buffer),
+            pool,
+        })
+    }
+
+    fn buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        self.buffer
+            .as_ref()
+            .expect("staging allocation owns its buffer until drop")
+            .buffer()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for StagingAllocation {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            let _ = self.pool.recycle(buffer);
+        }
+    }
+}
+
 /// Exclusively writable shared Metal storage for CPU entropy output.
+///
+/// Storage may be recycled from an earlier decode, so its contents are
+/// unspecified until written: callers must initialize every element before
+/// [`Self::seal`].
 pub struct MetalCoefficientStaging {
     #[cfg(target_os = "macos")]
-    buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    allocation: Arc<StagingAllocation>,
     element_count: usize,
     element_offset: usize,
 }
 
-// SAFETY: Staging has unique ownership, exposes mapped memory only through
-// `&mut self`, and is never submitted before it is consumed by `seal`.
-#[cfg(target_os = "macos")]
-unsafe impl Send for MetalCoefficientStaging {}
-
 impl MetalCoefficientStaging {
     #[cfg(target_os = "macos")]
     pub(crate) fn new(
-        buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+        allocation: Arc<StagingAllocation>,
         element_count: usize,
         element_offset: usize,
     ) -> Self {
         Self {
-            buffer,
+            allocation,
             element_count,
             element_offset,
         }
@@ -55,7 +105,8 @@ impl MetalCoefficientStaging {
     ) -> Result<T, crate::MetalError> {
         #[cfg(target_os = "macos")]
         {
-            if self.buffer.storageMode() != MTLStorageMode::Shared {
+            let buffer = self.allocation.buffer();
+            if buffer.storageMode() != MTLStorageMode::Shared {
                 return Err(crate::MetalError::InvalidDestination {
                     reason: "coefficient staging is not in shared storage",
                 });
@@ -74,7 +125,7 @@ impl MetalCoefficientStaging {
                 })?;
             if byte_offset
                 .checked_add(byte_len)
-                .is_none_or(|end| end > self.buffer.length())
+                .is_none_or(|end| end > buffer.length())
             {
                 return Err(crate::MetalError::InvalidDestination {
                     reason: "coefficient staging exceeds its Metal allocation",
@@ -82,14 +133,15 @@ impl MetalCoefficientStaging {
             }
             // SAFETY: The checked element offset lies within the shared allocation.
             let pointer = unsafe {
-                self.buffer
+                buffer
                     .contents()
                     .as_ptr()
                     .cast::<i32>()
                     .add(self.element_offset)
             };
-            // SAFETY: `&mut self` provides exclusive CPU access, the buffer has
-            // not been sealed or submitted, and the checked typed range fits.
+            // SAFETY: `&mut self` provides exclusive CPU access to this slice,
+            // sibling slices cover disjoint checked ranges, the allocation is
+            // not recycled while referenced, and it has not been submitted.
             let coefficients =
                 unsafe { core::slice::from_raw_parts_mut(pointer, self.element_count) };
             Ok(write(coefficients))
@@ -118,7 +170,7 @@ impl MetalCoefficientStaging {
         }
         Ok(MetalCoefficientArena {
             #[cfg(target_os = "macos")]
-            buffer: self.buffer,
+            allocation: self.allocation,
             #[cfg(target_os = "macos")]
             element_offset: self.element_offset,
             descriptor: Arc::new(descriptor),
@@ -129,21 +181,11 @@ impl MetalCoefficientStaging {
 /// Immutable CPU-produced coefficients already resident in shared Metal storage.
 pub struct MetalCoefficientArena {
     #[cfg(target_os = "macos")]
-    buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    allocation: Arc<StagingAllocation>,
     #[cfg(target_os = "macos")]
     element_offset: usize,
     descriptor: Arc<CoefficientArenaDescriptor>,
 }
-
-// SAFETY: Sealing removes mutable CPU access. Metal buffers and immutable
-// resource descriptors may be retained and bound from different host threads;
-// command ordering remains the submitting session's responsibility.
-#[cfg(target_os = "macos")]
-unsafe impl Send for MetalCoefficientArena {}
-// SAFETY: Every field is immutable after sealing, and Metal permits concurrent
-// read-only resource references during command encoding.
-#[cfg(target_os = "macos")]
-unsafe impl Sync for MetalCoefficientArena {}
 
 impl core::fmt::Debug for MetalCoefficientArena {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -162,7 +204,17 @@ impl MetalCoefficientArena {
 
     #[cfg(target_os = "macos")]
     pub(crate) fn buffer_handle(&self) -> Retained<ProtocolObject<dyn MTLBuffer>> {
-        self.buffer.clone()
+        self.allocation
+            .buffer
+            .as_ref()
+            .expect("staging allocation owns its buffer until drop")
+            .handle()
+    }
+
+    /// Keeps the pooled allocation out of reuse until a submission completes.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn lease(&self) -> Arc<StagingAllocation> {
+        self.allocation.clone()
     }
 
     #[cfg(target_os = "macos")]
@@ -172,7 +224,7 @@ impl MetalCoefficientArena {
 
     #[cfg(target_os = "macos")]
     pub(crate) fn allocation_address(&self) -> usize {
-        Retained::as_ptr(&self.buffer).cast::<()>() as usize
+        core::ptr::from_ref(self.allocation.buffer()).cast::<()>() as usize
     }
 }
 

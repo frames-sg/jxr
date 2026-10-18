@@ -45,10 +45,13 @@ const BATCH_IMAGES_PER_COMMAND: usize = 8;
 // groups trade no concurrency for fewer serialized command buffers.
 const DENSE_IMAGES_PER_COMMAND: usize = 16;
 
+type StagingLease = std::sync::Arc<crate::coefficient_staging::StagingAllocation>;
+
 struct ArenaBuffers {
     packed: BufferHandle,
     packed_offset_bytes: usize,
     macroblocks: BufferHandle,
+    staging: Option<StagingLease>,
 }
 
 struct ReconstructionBuffers {
@@ -67,9 +70,14 @@ pub(crate) struct EncodedMetalSubmission {
     pub(crate) status_offset: usize,
     pub(crate) layout: SurfaceLayout,
     pub(crate) uploads: Vec<BufferHandle>,
+    /// Pooled coefficient staging that must not be reused before completion.
+    pub(crate) staging: Vec<StagingLease>,
     pub(crate) private_scratch: Vec<PooledBuffer>,
     pub(crate) shared_scratch: Vec<PooledBuffer>,
     pub(crate) buffer_pools: std::rc::Rc<MetalBufferPools>,
+    pub(crate) stage_timings: std::rc::Rc<crate::stage_timing::StageTimings>,
+    /// Whether this submission accounts for its shared command's GPU time.
+    pub(crate) owns_command: bool,
     pub(crate) completion_event: EventHandle,
 }
 
@@ -209,8 +217,14 @@ fn encode_batch_with_outputs(
         let completion_event = checked_event(&queue.device())?;
         command.encodeSignalEvent_value(&completion_event, 1);
         command.commit();
-        submissions.extend(encodings.into_iter().map(|encoding| {
-            finish_encoding(runtime, command.clone(), completion_event.clone(), encoding)
+        submissions.extend(encodings.into_iter().enumerate().map(|(index, encoding)| {
+            finish_encoding(
+                runtime,
+                command.clone(),
+                completion_event.clone(),
+                encoding,
+                index == 0,
+            )
         }));
     }
     Ok(submissions)
@@ -232,6 +246,7 @@ fn encode_with_output(
         command,
         completion_event,
         encoding,
+        true,
     ))
 }
 
@@ -476,6 +491,7 @@ fn finish_encoding(
     command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     completion_event: EventHandle,
     encoding: PlanEncoding,
+    owns_command: bool,
 ) -> EncodedMetalSubmission {
     let buffers = encoding.buffers;
     let status = buffers.status.handle();
@@ -484,6 +500,11 @@ fn finish_encoding(
         .iter()
         .flat_map(|arena| [arena.packed.clone(), arena.macroblocks.clone()])
         .collect();
+    let staging = buffers
+        .arenas
+        .iter()
+        .filter_map(|arena| arena.staging.clone())
+        .collect();
     EncodedMetalSubmission {
         command,
         output: buffers.output,
@@ -491,9 +512,12 @@ fn finish_encoding(
         status_offset: 0,
         layout: encoding.layout,
         uploads,
+        staging,
         private_scratch: vec![buffers.low, buffers.samples],
         shared_scratch: vec![buffers.status],
         buffer_pools: runtime.buffer_pools.clone(),
+        stage_timings: runtime.stage_timings.clone(),
+        owns_command,
         completion_event,
     }
 }
@@ -514,6 +538,7 @@ fn allocate_buffers(
                     packed: upload.packed,
                     packed_offset_bytes: 0,
                     macroblocks: upload.macroblocks,
+                    staging: None,
                 }
             }
             MetalCoefficientSource::Shared(coefficients) => {
@@ -530,6 +555,7 @@ fn allocate_buffers(
                         &device,
                         &macroblock_abi_metadata(arena.macroblocks())?,
                     )?,
+                    staging: Some(coefficients.lease()),
                 }
             }
         });
@@ -1274,6 +1300,31 @@ mod tests {
         .unwrap()
     }
 
+    /// A one-macroblock luma plan whose DC coefficient is staged directly in pooled storage.
+    fn staged_luma_plan(session: &crate::MetalDecoderSession, dc: i32) -> MetalDecodePlan {
+        let mut staging = session.coefficient_staging(1).unwrap();
+        staging
+            .with_coefficients_mut(|coefficients| coefficients[0] = dc)
+            .unwrap();
+        let arena = single_plane_arena(dc);
+        let descriptor = CoefficientArenaDescriptor {
+            coefficient_count: arena.coefficients.len(),
+            macroblocks: arena.macroblocks.clone(),
+            planes: arena.planes.clone(),
+        };
+        let (prepared, policy, layout) =
+            luma_plan_contract(OutputBitDepth::U8, PixelFormat::U8(ChannelLayout::Luma));
+        MetalDecodePlan::from_staged_primary(
+            Arc::new(staging.seal(descriptor).unwrap()),
+            &prepared,
+            policy,
+            layout,
+            [0, 0],
+            BackendRequest::Metal,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn dc_luma_macroblock_matches_scalar_u8_output() {
         let device = j2k_metal_support::system_default_device().unwrap();
@@ -1593,6 +1644,50 @@ mod tests {
                 assert_eq!(batched, single, "{mode:?} hard_tiles={hard_tiles}");
             }
         }
+    }
+
+    #[test]
+    fn pooled_staging_is_reused_only_after_its_submission_completes() {
+        let session = crate::MetalDecoderSession::system_default().unwrap();
+        let plan = staged_luma_plan(&session, 16);
+        let pending = session.submit(&plan).unwrap();
+        drop(plan);
+        let staging = |session: &crate::MetalDecoderSession| {
+            session
+                .buffer_pool_diagnostics()
+                .unwrap()
+                .staging
+                .cached_buffers
+        };
+        // The in-flight command still leases the allocation the plan released.
+        assert_eq!(staging(&session), 0);
+        drop(pending.wait().unwrap());
+        assert_eq!(staging(&session), 1);
+
+        let reused = staged_luma_plan(&session, 32);
+        assert_eq!(staging(&session), 0);
+        let DecodedSamples::U8(samples) = session.decode_to_host(&reused).unwrap().samples else {
+            panic!("expected U8 output");
+        };
+        assert!(samples.iter().all(|&sample| sample == 130));
+    }
+
+    #[test]
+    fn stage_diagnostics_attribute_one_command_per_decode() {
+        let session = crate::MetalDecoderSession::system_default().unwrap();
+        let plan = luma_plan(16, OutputBitDepth::U8, PixelFormat::U8(ChannelLayout::Luma));
+        session.decode_to_host(&plan).unwrap();
+        let before = session.stage_diagnostics().unwrap();
+        session.decode_to_host(&plan).unwrap();
+        let stages = session.stage_diagnostics().unwrap().since(before);
+        assert_eq!(stages.commands, 1);
+        assert!(stages.encode > core::time::Duration::ZERO);
+        assert!(stages.gpu > core::time::Duration::ZERO);
+        assert!(stages.readback > core::time::Duration::ZERO);
+        assert_eq!(
+            before.since(session.stage_diagnostics().unwrap()).commands,
+            0
+        );
     }
 
     #[test]

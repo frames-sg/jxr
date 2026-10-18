@@ -99,7 +99,60 @@ impl MetalBufferPools {
                     state: "shared Metal buffer pool",
                 })?
                 .diagnostics(),
+            staging: MetalBufferPoolDiagnostics::default(),
         })
+    }
+}
+
+/// Exact-size retention for shared CPU entropy staging.
+///
+/// Fresh shared allocations fault in every page on first CPU write, which
+/// costs more than the entropy copy itself for multi-megabyte images. Unlike
+/// the runtime scratch pools, staging is released from whichever thread drops
+/// the last plan or submission referencing it, so the pool is shared by `Arc`.
+pub(crate) struct StagingPool {
+    state: Mutex<PoolState>,
+}
+
+// SAFETY: The pool only retains, releases, and transfers whole Metal buffers
+// under its mutex and never touches their contents. Metal buffer objects may
+// be retained, released, and handed between threads; CPU access to staging
+// contents is partitioned by `MetalCoefficientStaging` slices.
+unsafe impl Send for StagingPool {}
+// SAFETY: Every shared-reference operation locks the mutex; see `Send`.
+unsafe impl Sync for StagingPool {}
+
+impl StagingPool {
+    pub(crate) fn new(device: &ProtocolObject<dyn MTLDevice>) -> Self {
+        Self {
+            state: Mutex::new(PoolState::new(PoolLimits::for_device(
+                device.maxBufferLength(),
+            ))),
+        }
+    }
+
+    pub(crate) fn take(
+        &self,
+        device: &ProtocolObject<dyn MTLDevice>,
+        bytes: usize,
+    ) -> Result<PooledBuffer, MetalError> {
+        MetalBufferPools::take_or_allocate(&self.state, bytes, |bytes| {
+            checked_shared_buffer(device, bytes).map_err(MetalError::from)
+        })
+    }
+
+    pub(crate) fn recycle(&self, buffer: PooledBuffer) -> Result<(), MetalError> {
+        recycle(&self.state, buffer)
+    }
+
+    pub(crate) fn diagnostics(&self) -> Result<MetalBufferPoolDiagnostics, MetalError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| MetalError::StatePoisoned {
+                state: "Metal staging pool",
+            })?
+            .diagnostics())
     }
 }
 
