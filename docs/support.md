@@ -1,11 +1,11 @@
 # JPEG XR support boundary
 
-The intended boundary is raw T.832 codestream and Annex-A still-image decode for
-Main-profile syntax, validated Annex-A serialization around existing raw
+JXR supports raw T.832 codestream and Annex-A still-image decode for
+Main-profile syntax, plus validated Annex-A serialization around existing raw
 codestreams. Annex-F/HEIF sequence storage, T.832 codestream encoding, and
 transcoding are out of scope.
 
-For published [JXR 0.2.0](https://github.com/frames-sg/jxr/releases/tag/v0.2.0),
+For published [JXR 0.3.0](https://github.com/frames-sg/jxr/releases/tag/v0.3.0),
 the CPU, Metal, and CUDA routes byte-match T.835 for all 517 T.834 cases
 classified as in-scope Main syntax. The Annex-A writer comparison also passes
 those 517 cases. The remaining 179 corpus entries are explicitly skipped because
@@ -65,7 +65,7 @@ they use Advanced-only output syntax or a JPEG 2000 `.jpx` wrapper.
   separate-alpha codestreams, including typed orientation, finite positive
   display resolution, exact ICC bytes, four-byte-aligned payloads, and a final
   full parser/format-consistency validation pass.
-- CPU CI on Linux/macOS and an opt-in, serialized self-hosted Apple-silicon
+- Hosted CPU CI on Linux and an opt-in, serialized self-hosted Apple-silicon
   workflow covering strict workspace checks, Metal, MPSGraph, T.834/T.835
   differential runs, the pathology benchmark, and retained diagnostic artifacts.
 - Optional dynamically loaded CUDA reconstruction with reusable contexts and
@@ -74,13 +74,13 @@ they use Advanced-only output syntax or a JPEG 2000 `.jpx` wrapper.
   CPU differential suite, a serialized self-hosted NVIDIA workflow, and a
   phase-separated pathology benchmark. The NVIDIA workflow passed all 517
   in-scope T.834/T.835 cases, CPU/ROI comparisons, lifecycle tests, and benchmark
-  checks for release 0.2.0; see the [CUDA workflow](https://github.com/frames-sg/jxr/actions/runs/36360508404).
+  checks for release 0.3.0; see the [CUDA workflow](https://github.com/frames-sg/jxr/actions/runs/37444777485).
 
 ## Explicitly incomplete
 
 - A wider device performance corpus. CPU, Metal, and CUDA pass all 517
   in-scope T.834/T.835 differential cases in the published release reports.
-  The [Metal hardware workflow](https://github.com/frames-sg/jxr/actions/runs/36359668987)
+  The [Metal hardware workflow](https://github.com/frames-sg/jxr/actions/runs/37444774439)
   and NVIDIA workflow are both operational, but these conformance fixtures do
   not establish performance across a representative application corpus.
 - Native reduced-resolution decode for spatially interleaved packets and for
@@ -91,5 +91,6 @@ they use Advanced-only output syntax or a JPEG 2000 `.jpx` wrapper.
   small conformance images and establishes no general speedup over CPU.
 - ICC color transforms. Profiles are exposed byte-for-byte for a caller-selected
   color-management system and are never approximated inside the codec.
+
 Unsupported combinations return errors; they are not approximated by a nearby
 color format or silently retried after device submission.

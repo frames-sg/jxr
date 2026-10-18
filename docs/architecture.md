@@ -56,6 +56,37 @@ The thresholds are algorithmic starting points, not benchmark claims. They stay
 isolated in the backend route modules so later end-to-end measurements can
 replace them without changing entropy or reconstruction code.
 
+## Attach a GPU session
+
+Enable the `metal` or `cuda` feature on `jxr`, then create a session and reuse it
+across images. For a compatible 8-bit RGB source on Apple-silicon macOS:
+
+```rust
+use jxr::{
+    AlphaHandling, BackendRequest, ChannelLayout, DecodeRequest, JxrView,
+    PixelFormat, metal::MetalDecoderSession,
+};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read("image.jxr")?;
+    let view = JxrView::parse(&bytes)?;
+    let request = DecodeRequest::new(PixelFormat::U8(ChannelLayout::Rgb))
+        .with_alpha(AlphaHandling::Drop)
+        .with_backend(BackendRequest::Metal);
+    let session = MetalDecoderSession::system_default()?;
+    let mut decoder = view.decoder().with_metal_session(&session);
+    let image = decoder.decode(&request)?;
+    println!("Decoded {} bytes", image.samples.byte_len());
+    Ok(())
+}
+```
+
+For CUDA, replace the session with `jxr::cuda::CudaDecoderSession::new(0)?`
+(device 0), attach it with `with_cuda_session(&session)`, and request
+`BackendRequest::Cuda`. The CUDA Driver API and NVRTC bindings load at runtime.
+Enabling a feature alone does not attach a session. Keep the session alive for
+as long as the decoder borrows it.
+
 ## Owned batch flow
 
 `PreparedJxr` owns parsed compressed metadata behind a shared allocation.
@@ -86,7 +117,7 @@ additional coefficient and dense-allocation lifetime required by its exact-queue
 NHWC graph handoff. The shared `j2k-mpsgraph-support` submission guard retains
 those input owners and graph resources through completion; JXR validation and
 result assembly remain in the adapter. See the
-[adapter's release prerequisite](../crates/jxr-mpsgraph/README.md#shared-submission-owner-and-release-prerequisite).
+[adapter's shared submission owner](../crates/jxr-mpsgraph/README.md#shared-submission-owner).
 
 `CudaBatchDecoder` consumes the same groups and coefficient-ready cache. It
 schedules independent images over four streams and can retain per-image outputs,

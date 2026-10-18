@@ -1,153 +1,270 @@
-# JXR
+# JXR: JPEG XR for Rust
 
-**Release status:** [JXR 0.3.0](https://crates.io/crates/jxr/0.3.0) is published,
-with J2K dependencies pinned to 0.12.0 and Rust 1.99.0 required. See
-[the release notes](docs/releasing.md#030-release-line) for validation and migration.
+[![crates.io](https://img.shields.io/crates/v/jxr.svg)](https://crates.io/crates/jxr)
+[![docs.rs](https://img.shields.io/docsrs/jxr)](https://docs.rs/jxr)
+[![CI](https://github.com/frames-sg/jxr/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/frames-sg/jxr/actions/workflows/ci.yml?query=branch%3Amain+event%3Apush)
+[![downloads](https://img.shields.io/crates/d/jxr.svg)](https://crates.io/crates/jxr)
+[![license](https://img.shields.io/crates/l/jxr.svg)](#license)
 
-Published packages are available on [crates.io](https://crates.io/crates/jxr).
-Release notes and CPU, Metal, and CUDA reports are attached to the
-[GitHub releases](https://github.com/frames-sg/jxr/releases).
+JXR decodes JPEG XR images in Rust, with optional Apple GPU (Metal) and
+NVIDIA GPU (CUDA) reconstruction. The default build runs on the CPU and needs
+no GPU runtime or reference codec.
 
-JXR is a JPEG XR implementation with a safe Rust CPU decoder, optional Metal or
-CUDA reconstruction, and a validated Annex-A still-image container writer.
+It reads raw JPEG XR codestreams and Annex-A still-image files, decodes full
+images or regions, and preserves high-bit-depth samples, alpha, and embedded
+ICC profiles. It can also wrap an existing codestream in an Annex-A file;
+pixel-to-codestream encoding is not implemented.
 
-The project is under active development. Its CPU route byte-matches T.835 for
-all 517 T.834 cases in the repository's Main-syntax scope; Advanced-only output
-syntax and JPEG 2000 `.jpx` wrappers remain outside that scope. No general
-CPU-versus-GPU speedup is claimed.
-
-## Architecture
-
-Container parsing, entropy decoding, adaptive scans, coefficient remapping,
-and DC/LP prediction run on the CPU. Regular reconstruction stages—dequantization,
-inverse transforms, overlap filtering, color conversion, and packing—have
-backend-local Metal phase code and resource lifecycles. Metal submission is
-enabled for the complete five-phase pipeline.
-
-The default `jxr` build is CPU-only. The `metal` and `cuda` features add
-accelerator integration without changing decoded image semantics or requiring
-those runtimes for a CPU-only build.
-
-The CUDA backend consumes the same CPU-produced coefficient contract as Metal
-and includes reusable sessions, four streams, bounded scratch and immutable
-upload caches, asynchronous and resident output, checked caller-owned device
-destinations, homogeneous dense batches, and all typed/packed store paths. It is
-compiled through dynamically loaded Driver API/NVRTC bindings, so an all-feature
-build does not need a CUDA toolkit or NVIDIA driver. The self-hosted NVIDIA
-workflow passed for release 0.2.1, including all 517 in-scope T.834/T.835
-comparisons, CPU/ROI differential tests, and the configured benchmark. See the
-[passing CUDA workflow](https://github.com/frames-sg/jxr/actions/runs/36435655712) and
-[CUDA backend decision and validation boundary](docs/cuda-backend.md).
-
-## Current usable slice
-
-The connected CPU path decodes spatial- and frequency-mode Y-only, YUV420,
-YUV422, YUV444, YUVK, and Main-profile 2–16 channel N-component syntax across
-all band-presence modes. It carries compact, sampling-aware per-component
-quantizers and prediction metadata through a macroblock-major arena,
-prunes region requests to the required tile/halo window, reconstructs
-independent color planes and macroblock transform phases in parallel, and feeds exact scalar
-chroma reconstruction, color, alpha, crop, and typed packing stages. Hard and
-soft tiles, overlap modes 0–2, supported integer/float depths, and matching
-separate Annex-A alpha are represented by the current pipeline. Native planar
-YUV420/YUV422, BD10 YUV, CMYK/N-component alpha, and session-selected safe
-AVX2/NEON HP dequantization and common U8 packing are connected.
-Frequency-mode inputs also support true native quarter-width/height DC+LP decode
-and sixteenth-width/height DC-only decode; unneeded packet bands are not entropy
-decoded. These reduced routes are currently CPU-only.
-
-Annex-A inspection retains the raw pixel-format GUID and also reports a typed
-classification for every T.832 Table A.6 value, with known formats checked
-against the codestream's color, depth, component, alpha, premultiplication, and
-RGB/BGR padding declarations.
-
-```rust,no_run
-use jxr::{ChannelLayout, DecodeRequest, DecodeScale, JxrView, PixelFormat};
-
-# fn decode(bytes: &[u8]) -> Result<(), jxr::JxrError> {
-let view = JxrView::parse(bytes)?;
-let request = DecodeRequest::new(PixelFormat::U8(ChannelLayout::Luma));
-let mut decoder = view.decoder();
-let image = decoder.decode(&request)?;
-assert_eq!(image.decoded_region.w, view.info().width);
-
-let thumbnail = decoder.decode(&request.clone().with_scale(DecodeScale::Sixteenth))?;
-assert_eq!(thumbnail.decoded_region.w, view.info().width.div_ceil(16));
-# Ok(())
-# }
+```sh
+cargo add jxr
 ```
 
-Integrated alpha is connected for every implemented primary layout in spatial
-and frequency modes. On M1-or-newer Apple GPUs, Metal reconstruction supports
-multi-plane transforms, hard/soft overlap, chroma and color conversion, integrated
-or separate alpha, native planar and typed/packed output, host readback, resident
-output, checked external destinations, and bounded batch submission. Default-device
-batch submission schedules independent images over four Metal queues; caller-supplied
-queues remain exact and ordered. CPU entropy output
-can be written directly into per-image slices of one shared Metal allocation.
-Compatible image groups reuse that allocation, concatenate descriptors, and run
-macroblock × image × component transform grids without a coefficient repack.
-Batch host output writes directly into pooled shared buffers without
-private-output blits, and `decode_batch_to_shared` exposes completed bytes without
-copying them into Rust-owned samples. The current CPU T.834/T.835 differential
-run passes all 517 in-scope cases. Metal byte-matches every affected baseline and
-Main output-format case, including padded RGB/BGR and RGBE storage.
+Requires **Rust 1.99.0 or newer**. The current release is **0.3.0**; see the
+[release notes](docs/releasing.md#030-release-line) for migration details.
 
-The standalone `jxr-mpsgraph` crate adds an Apple-silicon NHWC tensor route for
-homogeneous Gray, RGB, and RGBA `U8`, `U16`, and `I16` batches. It keeps JPEG XR
-parsing and entropy on the CPU, exact reconstruction in the existing Metal
-kernels, and codec plus graph work on one caller-owned command queue. The
-application does not read decoded pixels back or upload them again on this path;
-framework-internal zero-copy is deliberately not claimed without Metal capture.
+## What it does
 
-The standalone `jxr-image` crate transfers exact Luma/LumaA/RGB/RGBA `U8` and
-`U16` output, plus RGB/RGBA `F32`, into `image::DynamicImage` without copying
-pixel storage. Its `ImageFrame` keeps ICC bytes, decode metadata, and straight
-versus premultiplied alpha outside `DynamicImage`; unsupported layouts are
-rejected instead of being silently converted.
+- **Inspect without decoding pixels.** Read dimensions, color format, bit
+  depth, tiling, orientation, alpha, and container metadata through `JxrView`.
+- **Decode a whole image or a region.** Region requests limit reconstruction
+  to the required tiles and overlap halo.
+- **Decode thumbnails at native resolution.** Frequency-mode images support
+  quarter-width/height and sixteenth-width/height CPU decode, skipping the
+  higher-frequency bands that the output does not need.
+- **Keep the sample representation you need.** Supported outputs include
+  grayscale, RGB/BGR, CMYK, multichannel, planar YUV, integer and floating-point
+  samples, packed RGB/RGBE, and integrated or separate alpha.
+- **Decode batches.** Prepare inputs once, group compatible output shapes,
+  and reuse CPU workers or GPU sessions. CPU batches support native and NCHW
+  layouts; GPU output can remain in device memory.
+- **Connect to other libraries.** `jxr-image` transfers supported buffers into
+  `image::DynamicImage`; `jxr-mpsgraph` hands Metal batches to Apple's MPSGraph.
+- **Write Annex-A containers.** `write_annex_a` packages an existing raw
+  codestream with validated metadata and optional separate alpha.
 
-`write_annex_a` wraps an existing raw T.832 codestream in a deterministic
-Annex-A file. It validates the primary and optional separate-alpha codestreams,
-their declared dimensions, display resolution, orientation, ICC payload, and
-known pixel-format GUID consistency before returning output. This is container
-serialization, not pixel-to-codestream encoding.
+The supported format boundary is **Main-profile syntax**. Advanced-only output
+syntax, JPEG 2000 `.jpx` wrappers, Annex-F/HEIF sequences, and transcoding are
+outside the scope. See the [full support guide](docs/support.md).
 
-## High-throughput native batches
+## Quick start
 
-The shared owned-batch API accepts `EncodedImage` values containing `Arc<[u8]>`
-storage and a complete `DecodeRequest`. Preparation parses and plans inputs in a
-retained worker pool, groups matching native output contracts without padding,
-and preserves input-local failures by original index. `PreparedBatch` is cheaply
-cloneable and can be decoded repeatedly without reparsing or replanning.
+Decode a compatible 8-bit color image to RGB, explicitly dropping any alpha:
 
-`CpuBatchDecoder` returns one contiguous typed `CpuBatchSamples` owner per
-homogeneous group. Native-layout bit-packed, integer, floating-point, packed RGB,
-RGBE, and planar YUV outputs are reconstructed and packed directly into that
-final allocation, including independently encoded alpha. Every validated unpacked
-NCHW format uses the same direct store followed by a typed transpose in
-worker-retained scratch. Each CPU worker also keeps primary and separate-alpha
-coefficient arenas, component-raster buffers, inverse-transform scratch, and
-recyclable signed component planes across calls, while preparation keeps a
-bounded identity-and-request cache so repeated `Arc<[u8]>` inputs share parsing,
-planning, and optional coefficient-ready state.
-`CpuBatchDiagnostics` reports cache, direct-store, compaction, and retained
-workspace counters. CPU groups can also write exact caller-owned typed
-destinations.
+```rust
+use jxr::{AlphaHandling, ChannelLayout, DecodeRequest, JxrView, PixelFormat};
 
-`MetalBatchDecoder` consumes the same prepared groups. It supports nonblocking
-high-level submission, completed per-image resident output, or one private
-`MetalResidentBatch` allocation per homogeneous group. Exact-queue sessions can
-submit a prepared group into a caller-owned dense Metal destination while the
-submission retains exclusive access through completion. The MPSGraph adapter
-continues to use native NHWC contracts on its exact command queue.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read("image.jxr")?;
+    let view = JxrView::parse(&bytes)?;
+    let request = DecodeRequest::new(PixelFormat::U8(ChannelLayout::Rgb))
+        .with_alpha(AlphaHandling::Drop);
+    let mut decoder = view.decoder();
+    let image = decoder.decode(&request)?;
 
-Annex-A ICC bytes are available without copying through `JxrView::icc_profile`
-and `PreparedJxr::icc_profile`. `JxrDecoder::decode_oriented` applies declared
-presentation orientation for supported full-image single-plane host layouts,
-including bit-packed luma. Color-profile application remains the responsibility
-of a color-management system; the codec does not approximate ICC transforms.
+    println!(
+        "{}x{}, {:?}, {} bytes",
+        image.decoded_region.w,
+        image.decoded_region.h,
+        image.format,
+        image.samples.byte_len(),
+    );
+    Ok(())
+}
+```
+
+`image.samples` holds typed pixel storage, and `image.planes` describes its
+layout. ICC bytes are available through `view.icc_profile()`; applying the
+profile is the application's responsibility. Use `decode_oriented` to apply
+the file's presentation orientation for supported full-image host outputs.
+
+### Choose an output format
+
+For an unfamiliar file, inspect `view.info()` before choosing a request. Replace
+the request and decode portion of `main` above with this to select grayscale or
+RGB output for common unsigned 8- and 16-bit sources, retaining alpha:
+
+```rust
+use jxr::{AlphaMode, ColorFormat, SampleFormat};
+
+let info = view.info();
+println!("Source: {:?}, {:?}, alpha: {:?}",
+    info.primary.color_format, info.primary.sample_format, info.alpha_mode);
+
+let has_alpha = info.alpha_mode != AlphaMode::None;
+let layout = match (info.primary.color_format, has_alpha) {
+    (ColorFormat::Luma, false) => ChannelLayout::Luma,
+    (ColorFormat::Luma, true) => ChannelLayout::LumaAlpha,
+    (ColorFormat::Rgb | ColorFormat::Yuv(_), false) => ChannelLayout::Rgb,
+    (ColorFormat::Rgb | ColorFormat::Yuv(_), true) => ChannelLayout::Rgba,
+    _ => return Err("Choose an explicit output layout for this color format".into()),
+};
+let output = match info.primary.sample_format {
+    SampleFormat::Unsigned { bits: 8 } => PixelFormat::U8(layout),
+    SampleFormat::Unsigned { bits: 16 } => PixelFormat::U16(layout),
+    _ => return Err("Choose an explicit output format for this sample depth".into()),
+};
+let request = DecodeRequest::new(output); // Preserve alpha by default.
+let image = view.decoder().decode(&request)?;
+```
+
+`primary.color_format` describes the coded planes: an RGB image commonly uses
+YUV internally, which is why both branches request RGB output. The container's
+declared pixel representation, when present, is available separately through
+`info.metadata.annex_a_pixel_format`.
+
+This example handles a common subset, not every JXR output. CMYK, multichannel,
+signed, floating-point, and packed formats need an explicit `PixelFormat`;
+see the [supported formats](docs/support.md). Decoding validates the full
+source/output combination and returns an error if it is unsupported.
+
+### Use with `image::DynamicImage`
+
+Add the adapter alongside `jxr`:
+
+```sh
+cargo add jxr-image
+```
+
+Using the `view` and format-aware `request` above, decode into the `image` crate
+and create a preview that fits within 256 × 256 pixels:
+
+```rust
+let frame = jxr_image::decode_view(&view, &request)?;
+let image: &jxr_image::image::DynamicImage = frame.image();
+let preview = image.thumbnail(256, 256);
+println!("Preview: {}x{}", preview.width(), preview.height());
+```
+
+Use this in place of the preceding `decoder.decode` call to avoid decoding
+twice. The adapter transfers the decoded pixel allocation without copying it;
+`thumbnail` then creates a resized image after a full decode. For frequency-mode
+inputs, the native thumbnail route below can skip higher-frequency bands.
+
+Keep `frame` when you need its ICC profile or straight/premultiplied alpha
+metadata; `frame.into_image()` returns only the `DynamicImage` and discards that
+extra metadata. The adapter does not apply ICC transforms or presentation
+orientation. It supports Luma/LumaA/RGB/RGBA at `U8` and `U16`, plus RGB/RGBA at
+`F32`. See the [adapter guide](crates/jxr-image/README.md) for details.
+
+### Regions and thumbnails
+
+With the same `view` and `request`, decode a 256 × 256 region within the image:
+
+```rust
+use jxr::Rect;
+
+let region = Rect { x: 0, y: 0, w: 256, h: 256 };
+let crop = view.decoder().decode(&request.clone().with_region(region))?;
+```
+
+For a frequency-mode image, decode a thumbnail at one sixteenth of the width
+and height:
+
+```rust
+use jxr::{BackendRequest, DecodeScale};
+
+let thumbnail_request = request.clone()
+    .with_scale(DecodeScale::Sixteenth)
+    .with_backend(BackendRequest::Cpu);
+let thumbnail = view.decoder().decode(&thumbnail_request)?;
+```
+
+`DecodeScale::Quarter` is also available. Region coordinates remain in
+full-resolution pixels. Native reduced decode currently requires frequency-mode
+input and the CPU backend; spatial-mode and GPU reduction are not implemented.
+
+### Inspect a file
+
+From a repository checkout:
+
+```sh
+cargo run -p jxr --example inspect -- image.jxr
+```
+
+This prints parsed metadata without decoding pixels. JXR currently provides a
+library and this inspection example, rather than a standalone conversion CLI.
+
+## GPU support
+
+The CPU parses the container and decodes entropy; Metal or CUDA can run the
+reconstruction and output stages. Both support host output, resident device
+buffers, caller-owned destinations, and batches.
+
+| Backend | Enable | Runtime requirements |
+| --- | --- | --- |
+| CPU | Default; no features needed | No GPU runtime |
+| Metal | `cargo add jxr --features metal` | Apple-silicon macOS (M1 or newer) |
+| CUDA | `cargo add jxr --features cuda` | Compatible NVIDIA GPU, driver, and NVRTC; hardware validation currently covers Linux |
+
+For single-image GPU decoding, attach a reusable session to the decoder;
+enabling a feature alone does not attach one. See the
+[Metal and CUDA session example](docs/architecture.md#attach-a-gpu-session).
+Building the CUDA feature does not require CUDA libraries or an NVIDIA driver.
+
+`BackendRequest::Cpu` keeps work on the CPU. The default `Auto` may use an
+attached GPU session or choose the CPU before submission. Explicit `Metal` and
+`Cuda` requests return an error when unavailable or unsupported. GPU failures
+after submission are returned without a CPU retry.
+
+Automatic routing uses provisional workload thresholds. **No general
+CPU-versus-GPU speedup is claimed.** See the [routing model](docs/architecture.md#route-model),
+[CUDA backend guide](docs/cuda-backend.md), and hardware reports for
+[release 0.3.0](https://github.com/frames-sg/jxr/releases/tag/v0.3.0).
+
+## Which crate do I need?
+
+Most applications only need `jxr`.
+
+| You want to | Use |
+| --- | --- |
+| Inspect or decode JPEG XR; wrap existing codestreams | [`jxr`](https://docs.rs/jxr) |
+| Decode with an Apple or NVIDIA GPU | `jxr` with `metal` or `cuda` |
+| Transfer decoded pixels to `image::DynamicImage` | [`jxr-image`](crates/jxr-image/README.md) |
+| Feed Metal-resident batches to MPSGraph | [`jxr-mpsgraph`](crates/jxr-mpsgraph/README.md) |
+| Manage device sessions and buffers directly | [`jxr-metal`](https://docs.rs/jxr-metal) or [`jxr-cuda`](https://docs.rs/jxr-cuda) |
+
+`jxr-core`, `jxr-native`, and `jxr-math` provide the shared types, CPU engine,
+and exact arithmetic behind those APIs. `jxr-test-support` is an unpublished
+validation package. See [architecture](docs/architecture.md) for how they fit
+together.
+
+## Correctness and limits
+
+**Reference comparisons.** For release 0.3.0, CPU, Metal, and CUDA output each
+byte-matched the T.835 reference software on all **517 in-scope T.834 cases**.
+Annex-A writer comparisons passed the same cases. Another 179 entries were
+excluded for Advanced-only output syntax or `.jpx` wrappers. This is scoped
+differential evidence, not a claim of complete JPEG XR conformance. The
+[release notes](docs/releasing.md#030-release-line) link to the validation runs.
+
+**Input handling.** The public facade forbids unsafe Rust. Decode requests
+include configurable `DecodeLimits` for dimensions, compressed input,
+coefficients, and host allocations. Parser, decode, and output/batch fuzz targets
+live in the repository; ordinary CI checks that the fuzz package builds.
+
+**Color and metadata.** JXR exposes ICC profiles without applying color
+transforms. It preserves explicit alpha and output-format semantics, and rejects
+unsupported combinations instead of approximating another format.
+
+**API status.** JXR is under active development on the `0.x` release line.
+Version 0.3.0 uses exact J2K 0.12.0 dependencies; applications using the shared
+J2K types must update those dependencies together. Check the release notes
+before upgrading.
+
+## Documentation and contributing
+
+- [API reference](https://docs.rs/jxr)
+- [Supported formats and known limitations](docs/support.md)
+- [Architecture and batch decoding](docs/architecture.md)
+- [CUDA backend and validation](docs/cuda-backend.md)
+- [`image` integration](crates/jxr-image/README.md)
+- [MPSGraph integration](crates/jxr-mpsgraph/README.md)
+- [Release history and migration notes](docs/releasing.md)
+- [Contributing, local checks, and bug reports](CONTRIBUTING.md)
+- [Issues](https://github.com/frames-sg/jxr/issues)
 
 ## License
 
-Licensed under either Apache-2.0 or MIT at your option. Third-party table data,
-when introduced, is tracked in `THIRD_PARTY_NOTICES.md`.
+Licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your
+option. See [third-party notices](THIRD_PARTY_NOTICES.md) for attribution and
+reference-software boundaries.
