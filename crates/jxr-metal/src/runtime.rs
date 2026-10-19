@@ -1,15 +1,31 @@
-use std::rc::Rc;
+use std::{cell::RefCell, collections::VecDeque, ptr::NonNull, rc::Rc};
 
+use jxr_core::device_plan::OutputParameterWords;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLCommandQueue, MTLCompileOptions, MTLComputePipelineState, MTLDevice, MTLGPUFamily,
-    MTLLibrary,
+    MTLCommandQueue, MTLCompileOptions, MTLComputePipelineState, MTLDataType, MTLDevice,
+    MTLFunctionConstantValues, MTLGPUFamily, MTLLibrary,
 };
 
-use crate::kernels;
+use crate::{kernels, output_plan::StorePipeline};
 
-type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+pub(crate) type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+
+// Output parameter words that only select per-format branches. Geometry and
+// crop (0-3) and the planar plane index (24) stay dynamic, so one
+// specialization serves every image size of a format.
+const SPECIALIZED_OUTPUT_WORDS: [usize; 22] = [
+    4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 25, 26,
+];
+// Distinct output formats whose specialized store pipelines stay compiled.
+const RETAINED_OUTPUT_SPECIALIZATIONS: usize = 32;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OutputSpecializationKey {
+    pipeline: StorePipeline,
+    words: [u32; SPECIALIZED_OUTPUT_WORDS.len()],
+}
 
 // Four queues outperformed one and eight on the initial 16-core M4 Pro target.
 // Exact caller-queue sessions intentionally bypass this default.
@@ -27,38 +43,9 @@ pub(crate) struct MetalRuntime {
     pub(crate) hp_transform: Pipeline,
     pub(crate) batch_hp_transform: Pipeline,
     pub(crate) overlap_second: Pipeline,
-    pub(crate) output_store: OutputPipelines,
-}
-
-pub(crate) struct OutputPipelines {
-    pub(crate) bits: Pipeline,
-    pub(crate) u8: Pipeline,
-    pub(crate) u16: Pipeline,
-    pub(crate) i16: Pipeline,
-    pub(crate) i32: Pipeline,
-    pub(crate) f16: Pipeline,
-    pub(crate) f32: Pipeline,
-    pub(crate) packed16: Pipeline,
-    pub(crate) packed32: Pipeline,
-}
-
-impl OutputPipelines {
-    pub(crate) fn select(
-        &self,
-        kind: crate::output_plan::StorePipeline,
-    ) -> &ProtocolObject<dyn MTLComputePipelineState> {
-        match kind {
-            crate::output_plan::StorePipeline::Bits => &self.bits,
-            crate::output_plan::StorePipeline::U8 => &self.u8,
-            crate::output_plan::StorePipeline::U16 => &self.u16,
-            crate::output_plan::StorePipeline::I16 => &self.i16,
-            crate::output_plan::StorePipeline::I32 => &self.i32,
-            crate::output_plan::StorePipeline::F16 => &self.f16,
-            crate::output_plan::StorePipeline::F32 => &self.f32,
-            crate::output_plan::StorePipeline::Packed16 => &self.packed16,
-            crate::output_plan::StorePipeline::Packed32 => &self.packed32,
-        }
-    }
+    pub(crate) overlap_batch: Pipeline,
+    library: Retained<ProtocolObject<dyn MTLLibrary>>,
+    output_specializations: RefCell<VecDeque<(OutputSpecializationKey, Pipeline)>>,
 }
 
 impl MetalRuntime {
@@ -117,19 +104,83 @@ impl MetalRuntime {
                 &library,
                 "jxr_second_overlap",
             )?,
-            output_store: OutputPipelines {
-                bits: pipeline(device, &library, "jxr_output_bits")?,
-                u8: pipeline(device, &library, "jxr_output_u8")?,
-                u16: pipeline(device, &library, "jxr_output_u16")?,
-                i16: pipeline(device, &library, "jxr_output_i16")?,
-                i32: pipeline(device, &library, "jxr_output_i32")?,
-                f16: pipeline(device, &library, "jxr_output_f16")?,
-                f32: pipeline(device, &library, "jxr_output_f32")?,
-                packed16: pipeline(device, &library, "jxr_output_packed16")?,
-                packed32: pipeline(device, &library, "jxr_output_packed32")?,
-            },
+            overlap_batch: pipeline(device, &library, "jxr_overlap_batch")?,
+            library,
+            output_specializations: RefCell::new(VecDeque::new()),
         })
     }
+
+    /// Returns the output store compiled for this exact format.
+    ///
+    /// Function constants fold the per-format branches of the generic store,
+    /// which is otherwise instruction-bound at low GPU clocks. Specializations
+    /// compile on first use and are retained per session.
+    pub(crate) fn output_pipeline(
+        &self,
+        kind: StorePipeline,
+        params: &OutputParameterWords,
+    ) -> Result<Pipeline, crate::MetalError> {
+        let key = OutputSpecializationKey {
+            pipeline: kind,
+            words: SPECIALIZED_OUTPUT_WORDS.map(|index| params[index]),
+        };
+        if let Some((_, pipeline)) = self
+            .output_specializations
+            .borrow()
+            .iter()
+            .find(|(cached, _)| *cached == key)
+        {
+            return Ok(pipeline.clone());
+        }
+        let pipeline = specialized_pipeline(
+            &self.queue.device(),
+            &self.library,
+            kind.entrypoint(),
+            &key.words,
+        )?;
+        let mut cache = self.output_specializations.borrow_mut();
+        if cache.len() == RETAINED_OUTPUT_SPECIALIZATIONS {
+            cache.pop_front();
+        }
+        cache.push_back((key, pipeline.clone()));
+        Ok(pipeline)
+    }
+}
+
+fn specialized_pipeline(
+    device: &ProtocolObject<dyn MTLDevice>,
+    library: &ProtocolObject<dyn MTLLibrary>,
+    name: &str,
+    words: &[u32; SPECIALIZED_OUTPUT_WORDS.len()],
+) -> Result<Pipeline, j2k_metal_support::MetalSupportError> {
+    let values = MTLFunctionConstantValues::new();
+    for (&index, value) in SPECIALIZED_OUTPUT_WORDS.iter().zip(words) {
+        // SAFETY: `value` points to a live u32 for the duration of the call,
+        // matching the shader's `uint` function constant declared at `index`.
+        unsafe {
+            values.setConstantValue_type_atIndex(
+                NonNull::from(value).cast(),
+                MTLDataType::UInt,
+                index,
+            );
+        }
+    }
+    let function = library
+        .newFunctionWithName_constantValues_error(&NSString::from_str(name), &values)
+        .map_err(
+            |error| j2k_metal_support::MetalSupportError::PipelineFunction {
+                function_name: name.to_owned(),
+                message: error.localizedDescription().to_string(),
+            },
+        )?;
+    device
+        .newComputePipelineStateWithFunction_error(&function)
+        .map_err(
+            |error| j2k_metal_support::MetalSupportError::PipelineState {
+                function_name: name.to_owned(),
+                message: error.localizedDescription().to_string(),
+            },
+        )
 }
 
 fn pipeline(

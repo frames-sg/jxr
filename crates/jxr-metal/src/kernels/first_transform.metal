@@ -5,7 +5,7 @@ inline void jxr_dequantize_first_transform_one(
     device atomic_uint *status,
     JxrPlaneAbi plane,
     uint gid) {
-    if (gid >= plane.macroblock_count || jxr_failed(status)) return;
+    if (gid >= plane.macroblock_count) return;
     const uint metadata_index = plane.macroblock_offset + gid;
     const JxrMacroblockAbi metadata = macroblocks[metadata_index];
     const uint block_count = plane.block_columns * plane.block_rows;

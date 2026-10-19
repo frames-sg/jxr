@@ -1,10 +1,12 @@
 #include <metal_stdlib>
 using namespace metal;
 
-inline bool jxr_failed(device atomic_uint *status) {
-    return atomic_load_explicit(status, memory_order_relaxed) != 0u;
-}
-
+// Status is sticky: the first failing thread's code wins and later failures
+// leave it unchanged. Kernels do not poll it before working. Dispatches in a
+// command run in phase order, so an earlier phase's failure is always the one
+// recorded, no addressing depends on reconstructed values, and any output of
+// a failed command is discarded on the host. Polling a shared atomic from
+// every thread only cost bandwidth on the success path.
 inline void jxr_fail(device atomic_uint *status, uint code) {
     uint expected = 0u;
     while (expected == 0u

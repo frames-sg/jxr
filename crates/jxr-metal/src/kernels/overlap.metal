@@ -173,7 +173,22 @@ kernel void jxr_first_overlap(
     constant uint &work_count [[buffer(3)]],
     constant uint &base [[buffer(4)]],
     uint gid [[thread_position_in_grid]]) {
-    if (gid < work_count && !jxr_failed(status)) jxr_apply_overlap(samples + base, work[gid], status);
+    if (gid < work_count) jxr_apply_overlap(samples + base, work[gid], status);
+}
+
+// Batched form: every (image, plane) entry in grid row `gid.y` shares one
+// plane-relative schedule, so a whole command's planes filter in one dispatch.
+// Each entry holds the plane's first sample and the image's status slot.
+kernel void jxr_overlap_batch(
+    device int *samples [[buffer(0)]],
+    device const JxrOverlapWorkAbi *work [[buffer(1)]],
+    device atomic_uint *statuses [[buffer(2)]],
+    constant uint &work_count [[buffer(3)]],
+    device const uint2 *entries [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= work_count) return;
+    const uint2 entry = entries[gid.y];
+    jxr_apply_overlap(samples + entry.x, work[gid.x], statuses + entry.y);
 }
 
 kernel void jxr_second_overlap(
@@ -183,5 +198,5 @@ kernel void jxr_second_overlap(
     constant uint &work_count [[buffer(3)]],
     constant uint &base [[buffer(4)]],
     uint gid [[thread_position_in_grid]]) {
-    if (gid < work_count && !jxr_failed(status)) jxr_apply_overlap(samples + base, work[gid], status);
+    if (gid < work_count) jxr_apply_overlap(samples + base, work[gid], status);
 }

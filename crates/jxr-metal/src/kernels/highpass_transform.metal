@@ -23,7 +23,7 @@ inline void jxr_highpass_second_transform_one(
     const uint block_count = plane.block_columns * plane.block_rows;
     const uint macroblock = thread_index / block_count;
     const uint block = thread_index - macroblock * block_count;
-    if (macroblock >= plane.macroblock_count || jxr_failed(status)) return;
+    if (macroblock >= plane.macroblock_count) return;
     const JxrMacroblockAbi metadata = macroblocks[plane.macroblock_offset + macroblock];
     const uint column = block % plane.block_columns;
     const uint row = block / plane.block_columns;
