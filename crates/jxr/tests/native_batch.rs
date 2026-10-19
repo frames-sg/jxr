@@ -445,6 +445,44 @@ fn metal_batch_consumes_shared_preparation_and_keeps_resident_outputs() {
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
+fn metal_batch_pipelines_chunks_in_source_order() {
+    use jxr::MetalBatchDecoder;
+
+    let encoded: Arc<[u8]> = minimal_raw_codestream().into();
+    let strict_metal = DecodeRequest::new(PixelFormat::U8(ChannelLayout::Luma))
+        .with_backend(BackendRequest::Metal);
+    // Spans more than two pipeline chunks with one unparsable input mid-batch.
+    let mut inputs = (0..70)
+        .map(|_| EncodedImage::new(Arc::clone(&encoded), strict_metal.clone()))
+        .collect::<Vec<_>>();
+    inputs[37] = EncodedImage::full(
+        Arc::from([0_u8, 1, 2]),
+        PixelFormat::U8(ChannelLayout::Luma),
+    );
+    let decoder = MetalBatchDecoder::system_default(BatchDecodeOptions::default()).unwrap();
+    let prepared = decoder.prepare(inputs).unwrap();
+    if assert_unavailable_metal_contract(&decoder, &prepared) {
+        return;
+    }
+    let batch = decoder.decode_prepared(&prepared).unwrap();
+
+    assert!(batch.group_errors().is_empty());
+    assert_eq!(batch.errors().len(), 1);
+    assert_eq!(batch.errors()[0].index(), 37);
+    assert_eq!(batch.groups().len(), 1);
+    let group = &batch.groups()[0];
+    let expected = (0..70).filter(|&index| index != 37).collect::<Vec<_>>();
+    assert_eq!(group.source_indices(), expected);
+    assert_eq!(group.images().len(), expected.len());
+    assert_eq!(group.reports().len(), expected.len());
+    let reference = decoder.session().readback(&group.images()[0]).unwrap();
+    for image in group.images() {
+        assert_eq!(decoder.session().readback(image).unwrap(), reference);
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
 fn metal_batch_exposes_nonblocking_and_single_allocation_groups() {
     use jxr::MetalBatchDecoder;
 

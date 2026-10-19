@@ -18,6 +18,20 @@ use contracts::{SubmittedDenseGroup, SubmittedMetalGroup};
 type CountedCandidate<'a> = (usize, usize, &'a PreparedImage);
 type PlannedItem<'a> = (usize, &'a PreparedImage, jxr_metal::MetalDecodePlan);
 
+type StagedPlan<'a> = (
+    usize,
+    &'a PreparedImage,
+    Result<jxr_metal::MetalDecodePlan, jxr_core::JxrError>,
+);
+
+/// Images prepared and submitted per pipeline step of a resident group.
+///
+/// Each chunk is submitted as soon as its CPU entropy finishes, so the GPU
+/// reconstructs it while the worker pool prepares the next chunk; only the
+/// last chunk's reconstruction remains on the critical path. Groups no larger
+/// than one chunk keep the single prepare-then-submit order.
+const PIPELINE_CHUNK_IMAGES: usize = 32;
+
 /// Persistent high-level Metal decoder for owned and prepared batches.
 pub struct MetalBatchDecoder {
     session: jxr_metal::MetalDecoderSession,
@@ -171,15 +185,60 @@ impl MetalBatchDecoder {
         group: &PreparedBatchGroup,
         errors: &mut Vec<IndexedBatchError>,
     ) -> Result<Option<SubmittedMetalGroup>, MetalBatchGroupError> {
-        let candidates = self.count_candidates(group, errors);
-        if candidates.is_empty() {
-            return Ok(None);
+        let mut candidates = self.count_candidates(group, errors);
+        let mut pending = PendingGroup::with_capacity(candidates.len());
+        let mut prepared: Option<Vec<PlannedItem<'_>>> = None;
+        while !candidates.is_empty() || prepared.is_some() {
+            let rest = candidates.split_off(candidates.len().min(PIPELINE_CHUNK_IMAGES));
+            let chunk = core::mem::replace(&mut candidates, rest);
+            let staged = self.stage_chunk(chunk, &mut pending);
+            let mut planned = None;
+            self.preparer.in_place_scope(|scope| {
+                if let Some((chunk, staging)) = staged {
+                    scope.spawn(|_| planned = Some(entropy_into_staging(chunk, staging)));
+                }
+                // Encode the previous chunk on this thread while the pool
+                // decodes the next chunk's entropy.
+                if let Some(items) = prepared.take() {
+                    pending.submit(&self.session, &items);
+                }
+            });
+            prepared = planned.map(|planned| classify_planned(planned, errors));
         }
-        let items = self.prepare_candidates(candidates, errors)?;
-        if items.is_empty() {
-            return Ok(None);
+        pending.finish(group)
+    }
+
+    /// Allocates staging for one chunk on the session thread.
+    ///
+    /// Returns `None` for an empty chunk or once the group has failed; a group
+    /// failure covers every image without its own decode error.
+    fn stage_chunk<'a>(
+        &self,
+        chunk: Vec<CountedCandidate<'a>>,
+        pending: &mut PendingGroup,
+    ) -> Option<(
+        Vec<CountedCandidate<'a>>,
+        Vec<jxr_metal::MetalCoefficientStaging>,
+    )> {
+        if chunk.is_empty() {
+            return None;
         }
-        self.submit_items(group, &items).map(Some)
+        if pending.failure.is_some() {
+            pending
+                .source_indices
+                .extend(chunk.iter().map(|(source_index, _, _)| *source_index));
+            return None;
+        }
+        match self.stage_candidates(&chunk) {
+            Ok(staging) => Some((chunk, staging)),
+            Err(error) => {
+                pending
+                    .source_indices
+                    .extend(error.source_indices().iter().copied());
+                pending.failure = Some(error.source);
+                None
+            }
+        }
     }
 
     fn submit_dense_group(
@@ -267,76 +326,33 @@ impl MetalBatchDecoder {
         candidates: Vec<CountedCandidate<'a>>,
         errors: &mut Vec<IndexedBatchError>,
     ) -> Result<Vec<PlannedItem<'a>>, MetalBatchGroupError> {
-        let source_indices = candidates
-            .iter()
-            .map(|(source_index, _, _)| *source_index)
-            .collect::<Vec<_>>();
+        let staging = self.stage_candidates(&candidates)?;
+        let planned = self
+            .preparer
+            .install(|| entropy_into_staging(candidates, staging));
+        Ok(classify_planned(planned, errors))
+    }
+
+    /// Allocates one shared staging slice per candidate.
+    fn stage_candidates(
+        &self,
+        candidates: &[CountedCandidate<'_>],
+    ) -> Result<Vec<jxr_metal::MetalCoefficientStaging>, MetalBatchGroupError> {
         let counts = candidates
             .iter()
             .map(|(_, count, _)| *count)
             .collect::<Vec<_>>();
-        let staging = self
-            .session
+        self.session
             .coefficient_staging_slices(&counts)
-            .map_err(|source| MetalBatchGroupError::new(source_indices.clone(), source))?;
-        let planned = self.preparer.install(|| {
-            candidates
-                .into_par_iter()
-                .zip(staging)
-                .map(|((source_index, _, image), staging)| {
-                    let plan = image.image().decoder().prepare_metal_plan_with_staging(
-                        image.request(),
-                        image.plan(),
-                        staging,
-                    );
-                    (source_index, image, plan)
-                })
-                .collect::<Vec<_>>()
-        });
-        let mut items = Vec::with_capacity(planned.len());
-        for (source_index, image, plan) in planned {
-            match plan {
-                Ok(plan) => items.push((source_index, image, plan)),
-                Err(source) => errors.push(IndexedBatchError::new(
-                    source_index,
-                    BatchErrorStage::Decode,
+            .map_err(|source| {
+                MetalBatchGroupError::new(
+                    candidates
+                        .iter()
+                        .map(|(source_index, _, _)| *source_index)
+                        .collect(),
                     source,
-                )),
-            }
-        }
-        Ok(items)
-    }
-
-    fn submit_items(
-        &self,
-        group: &PreparedBatchGroup,
-        items: &[PlannedItem<'_>],
-    ) -> Result<SubmittedMetalGroup, MetalBatchGroupError> {
-        let submitted_indices = items
-            .iter()
-            .map(|(source_index, _, _)| *source_index)
-            .collect::<Vec<_>>();
-        let plans = items
-            .iter()
-            .map(|(_, _, plan)| plan.clone())
-            .collect::<Vec<_>>();
-        let submission = self
-            .session
-            .submit_batch(&plans)
-            .map_err(|source| MetalBatchGroupError::new(submitted_indices.clone(), source))?;
-        let mut image_infos = Vec::with_capacity(items.len());
-        let mut decoded_regions = Vec::with_capacity(items.len());
-        for (_, image, _) in items {
-            image_infos.push(image.plan().info.clone());
-            decoded_regions.push(image.plan().output_region);
-        }
-        Ok(SubmittedMetalGroup {
-            info: group.info().clone(),
-            source_indices: submitted_indices,
-            image_infos,
-            decoded_regions,
-            submission,
-        })
+                )
+            })
     }
 
     /// Submit one all-success prepared group into a caller-owned dense destination.
@@ -379,6 +395,107 @@ impl MetalBatchDecoder {
             decoded_regions,
             submission,
         })
+    }
+}
+
+/// Decodes CPU entropy for every candidate into its staging slice, in parallel
+/// on the current pool.
+fn entropy_into_staging(
+    candidates: Vec<CountedCandidate<'_>>,
+    staging: Vec<jxr_metal::MetalCoefficientStaging>,
+) -> Vec<StagedPlan<'_>> {
+    candidates
+        .into_par_iter()
+        .zip(staging)
+        .map(|((source_index, _, image), staging)| {
+            let plan = image.image().decoder().prepare_metal_plan_with_staging(
+                image.request(),
+                image.plan(),
+                staging,
+            );
+            (source_index, image, plan)
+        })
+        .collect()
+}
+
+/// Separates successful plans from indexed decode errors.
+fn classify_planned<'a>(
+    planned: Vec<StagedPlan<'a>>,
+    errors: &mut Vec<IndexedBatchError>,
+) -> Vec<PlannedItem<'a>> {
+    let mut items = Vec::with_capacity(planned.len());
+    for (source_index, image, plan) in planned {
+        match plan {
+            Ok(plan) => items.push((source_index, image, plan)),
+            Err(source) => errors.push(IndexedBatchError::new(
+                source_index,
+                BatchErrorStage::Decode,
+                source,
+            )),
+        }
+    }
+    items
+}
+
+/// Chunk submissions and every image they account for, in source order.
+struct PendingGroup {
+    source_indices: Vec<usize>,
+    image_infos: Vec<jxr_core::ImageInfo>,
+    decoded_regions: Vec<jxr_core::Rect>,
+    submissions: Vec<jxr_metal::MetalBatchSubmission>,
+    failure: Option<jxr_metal::MetalError>,
+}
+
+impl PendingGroup {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            source_indices: Vec::with_capacity(capacity),
+            image_infos: Vec::with_capacity(capacity),
+            decoded_regions: Vec::with_capacity(capacity),
+            submissions: Vec::new(),
+            failure: None,
+        }
+    }
+
+    /// Submits one prepared chunk unless the group has already failed.
+    fn submit(&mut self, session: &jxr_metal::MetalDecoderSession, items: &[PlannedItem<'_>]) {
+        if items.is_empty() {
+            return;
+        }
+        if self.failure.is_none() {
+            let plans = items
+                .iter()
+                .map(|(_, _, plan)| plan.clone())
+                .collect::<Vec<_>>();
+            match session.submit_batch(&plans) {
+                Ok(submission) => self.submissions.push(submission),
+                Err(source) => self.failure = Some(source),
+            }
+        }
+        for (source_index, image, _) in items {
+            self.source_indices.push(*source_index);
+            self.image_infos.push(image.plan().info.clone());
+            self.decoded_regions.push(image.plan().output_region);
+        }
+    }
+
+    fn finish(
+        self,
+        group: &PreparedBatchGroup,
+    ) -> Result<Option<SubmittedMetalGroup>, MetalBatchGroupError> {
+        if let Some(source) = self.failure {
+            return Err(MetalBatchGroupError::new(self.source_indices, source));
+        }
+        if self.source_indices.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(SubmittedMetalGroup {
+            info: group.info().clone(),
+            source_indices: self.source_indices,
+            image_infos: self.image_infos,
+            decoded_regions: self.decoded_regions,
+            submissions: self.submissions,
+        }))
     }
 }
 

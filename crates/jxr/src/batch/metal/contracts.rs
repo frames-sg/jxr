@@ -135,7 +135,28 @@ pub(super) struct SubmittedMetalGroup {
     pub(super) source_indices: Vec<usize>,
     pub(super) image_infos: Vec<ImageInfo>,
     pub(super) decoded_regions: Vec<Rect>,
-    pub(super) submission: jxr_metal::MetalBatchSubmission,
+    /// Pipelined chunk submissions in source order.
+    pub(super) submissions: Vec<jxr_metal::MetalBatchSubmission>,
+}
+
+impl SubmittedMetalGroup {
+    /// Waits for every chunk in order and returns the first failure, if any.
+    fn wait(
+        submissions: Vec<jxr_metal::MetalBatchSubmission>,
+    ) -> Result<Vec<jxr_metal::ResidentMetalImage>, jxr_metal::MetalError> {
+        let mut images = Vec::new();
+        let mut failure = None;
+        for submission in submissions {
+            match submission.wait() {
+                Ok(mut chunk) if failure.is_none() => images.append(&mut chunk),
+                Ok(_) => {}
+                Err(source) => {
+                    failure.get_or_insert(source);
+                }
+            }
+        }
+        failure.map_or(Ok(images), Err)
+    }
 }
 
 /// Nonblocking high-level Metal batch retaining every pending group.
@@ -167,7 +188,7 @@ impl SubmittedMetalPreparedBatch {
     pub fn wait(mut self) -> MetalBatchDecodeResult {
         let mut groups = Vec::with_capacity(self.groups.len());
         for pending in self.groups {
-            match pending.submission.wait() {
+            match SubmittedMetalGroup::wait(pending.submissions) {
                 Ok(images) => {
                     let reports = images.iter().map(|image| image.report().clone()).collect();
                     groups.push(MetalBatchGroup {
