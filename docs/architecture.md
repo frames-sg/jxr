@@ -45,14 +45,18 @@ stage or resource lifetime, not by arbitrary helper categories.
 
 ## Route model
 
-The provisional promotion point is 16,384 reconstructed coefficients for
-Metal and CUDA. CPU remains the route below the threshold or when a compatible device
+Metal promotes at 2^21 (2,097,152) reconstructed coefficients, measured with
+interleaved single-image CPU and Metal host decodes on M4, M4 Pro, and M5 Max:
+smaller images mostly ran at 0.29-0.98x on Metal because a fixed submission
+latency outweighs the CPU reconstruction it replaces, while larger ones ran at
+0.92-1.35x. CUDA keeps the provisional 16,384-coefficient promotion point.
+CPU remains the route below the threshold or when a compatible device
 is unavailable. Explicit device requests are strict. Automatic fallback is
 legal only before submission; an error after a command is submitted is returned
 to the caller. Native reduced requests currently stay on CPU; explicit Metal or
 CUDA requests for those scales fail before accelerator preparation.
 
-The thresholds are algorithmic starting points, not benchmark claims. They stay
+The thresholds are routing heuristics, not benchmark claims. They stay
 isolated in the backend route modules so later end-to-end measurements can
 replace them without changing entropy or reconstruction code.
 
