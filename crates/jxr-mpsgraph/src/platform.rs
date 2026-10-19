@@ -32,22 +32,36 @@ struct PreparedRequest {
 
 type PreparedRequestResult = (usize, Result<(PreparedImage, MpsGraphTensorSpec), Error>);
 
-/// Decode one request's entropy and validate its single-image dense layout.
-fn prepare_request(input: &PreparedRequest) -> PreparedRequestResult {
+/// Plan one request and return its exact Metal coefficient staging length.
+fn count_request(input: &PreparedRequest) -> Result<usize, Error> {
+    Ok(input
+        .image
+        .decoder()
+        .metal_coefficient_count(&input.request)?)
+}
+
+/// Decode one request's entropy into its staging and validate its
+/// single-image dense layout.
+fn prepare_request(
+    (input, staging): (&PreparedRequest, jxr_metal::MetalCoefficientStaging),
+) -> PreparedRequestResult {
     let source_index = input.source_index;
     let prepared = (|| {
-        let reconstruction = input
+        let plan = input
             .image
             .decoder()
-            .prepare_reconstruction(&input.request)?;
-        let layout = reconstruction.output_layout();
+            .prepare_metal_with_staging(&input.request, staging)?;
+        let layout = plan.output();
         let individual_spec = MpsGraphTensorSpec::from_image_layout(layout, 1)?;
         DenseMetalBatchLayout::new(layout.clone(), 1)?;
+        let decoded_region = plan.output_region().ok_or(Error::InvalidTensorContract {
+            reason: "prepared Metal plan has no output region",
+        })?;
         Ok::<_, Error>((
             PreparedImage {
                 source_index,
-                decoded_region: reconstruction.plan().output_region,
-                reconstruction,
+                plan,
+                decoded_region,
             },
             individual_spec,
         ))
@@ -117,6 +131,10 @@ impl MpsGraphBatchDecoder {
     }
 
     /// Run CPU parsing/entropy preparation and partition valid inputs deterministically.
+    ///
+    /// Coefficients are decoded on the worker pool directly into this decoder's
+    /// Metal coefficient staging, which the prepared groups retain until they
+    /// are dropped. A staging allocation failure fails the whole call.
     pub fn prepare(
         &self,
         inputs: Vec<MpsGraphDecodeInput>,
@@ -214,19 +232,37 @@ impl MpsGraphBatchDecoder {
         self.prepare_requests(&requests, errors)
     }
 
-    /// Decode entropy for every request on the worker pool, then group the
-    /// results in source order.
+    /// Decode entropy for every request on the worker pool directly into
+    /// session coefficient staging, then group the results in source order.
+    ///
+    /// Staging is allocated on this thread because the session is not shared
+    /// across threads; only entropy decoding runs on the pool.
     fn prepare_requests(
         &self,
         requests: &[PreparedRequest],
         mut errors: Vec<IndexedPreparationError>,
     ) -> Result<MpsGraphPreparedBatch, Error> {
         let mut groups: Vec<MpsGraphPreparedGroup> = Vec::with_capacity(requests.len());
-        let prepared: Vec<_> = if requests.len() > 1 {
-            self.batch_preparer
-                .install(|| requests.par_iter().map(prepare_request).collect())
+        let counts = self.map_requests(requests.iter().collect(), count_request);
+        let mut candidates = Vec::with_capacity(requests.len());
+        let mut lengths = Vec::with_capacity(requests.len());
+        for (input, count) in requests.iter().zip(counts) {
+            match count {
+                Ok(count) => {
+                    candidates.push(input);
+                    lengths.push(count);
+                }
+                Err(error) => errors.push(IndexedPreparationError::new(input.source_index, error)),
+            }
+        }
+        let prepared = if candidates.is_empty() {
+            Vec::new()
         } else {
-            requests.iter().map(prepare_request).collect()
+            let staging = self.session.coefficient_staging_slices(&lengths)?;
+            self.map_requests(
+                candidates.into_iter().zip(staging).collect(),
+                prepare_request,
+            )
         };
         for (source_index, prepared) in prepared {
             match prepared {
@@ -237,7 +273,7 @@ impl MpsGraphBatchDecoder {
                     }) {
                         group.images.push(image);
                         group.spec = MpsGraphTensorSpec::from_image_layout(
-                            group.images[0].reconstruction.output_layout(),
+                            group.images[0].plan.output(),
                             group.images.len(),
                         )?;
                     } else {
@@ -252,6 +288,20 @@ impl MpsGraphBatchDecoder {
         }
         errors.sort_by_key(IndexedPreparationError::source_index);
         Ok(MpsGraphPreparedBatch { groups, errors })
+    }
+
+    /// Map requests on the worker pool, or inline for a single request.
+    fn map_requests<Input: Send, Output: Send>(
+        &self,
+        inputs: Vec<Input>,
+        operation: impl Fn(Input) -> Output + Send + Sync,
+    ) -> Vec<Output> {
+        if inputs.len() > 1 {
+            self.batch_preparer
+                .install(|| inputs.into_par_iter().map(operation).collect())
+        } else {
+            inputs.into_iter().map(operation).collect()
+        }
     }
 
     /// Decode every valid prepared group into completed dense `MPSGraph` inputs.
@@ -293,7 +343,7 @@ impl MpsGraphBatchDecoder {
         &self,
         group: &MpsGraphPreparedGroup,
     ) -> Result<PreparedDestination, Error> {
-        let image_layout = group.images[0].reconstruction.output_layout().clone();
+        let image_layout = group.images[0].plan.output().clone();
         let dense = DenseMetalBatchLayout::new(image_layout, group.images.len())?;
         if dense.byte_len() != group.spec.byte_len()? {
             return Err(Error::InvalidTensorContract {
@@ -302,7 +352,7 @@ impl MpsGraphBatchDecoder {
         }
         let mut plans = Vec::with_capacity(group.images.len());
         for image in &group.images {
-            plans.push(image.reconstruction.metal_plan()?);
+            plans.push(image.plan.clone());
         }
         let buffer = j2k_metal_support::checked_private_buffer(&self.device, dense.byte_len())?;
         Ok((plans, dense, buffer))
