@@ -130,3 +130,38 @@ passed for the tagged source. CPU, Annex-A writer, Metal, and CUDA reference
 comparisons each passed 517 in-scope cases, with 179 declared scope exclusions
 and no failures. The reports and hardware benchmark results are attached to
 the [0.3.0 release](https://github.com/frames-sg/jxr/releases/tag/v0.3.0).
+
+## 0.3.1 patch release
+
+This patch release makes decoding faster without changing decoded output or
+the existing decode contracts. CPU entropy decoding caches packet bits, decodes
+run prefixes and per-symbol codes inline, and places coefficients directly in
+their adaptive scan. Spatial tiles decode straight into the coefficient arena
+or caller-owned Metal staging instead of being copied after the tile decode.
+CPU inverse transforms, overlap filters, and common integer output packing use
+four-lane and row-parallel paths with checked scalar fallbacks.
+
+Metal specializes output stores, batches overlap dispatches, reuses
+coefficient staging across submissions, and overlaps `MetalBatchDecoder`
+preparation with GPU reconstruction. Automatic Metal routing now promotes at
+2^21 reconstructed coefficients instead of 16,384, so `Auto` decodes smaller
+images on the CPU; explicit Metal requests are unchanged. MPSGraph batch
+preparation runs on the decoder's worker pool and decodes entropy directly into
+Metal staging, so prepared groups run without a coefficient upload. A staging
+allocation failure now fails `prepare` rather than a later run.
+
+Additions are `MetalDecoderSession::stage_diagnostics` with
+`MetalStageDiagnostics`, the `staging` field of the non-exhaustive
+`MetalBufferPoolsDiagnostics`, and `CpuBatchDecoder::install`. Per-change
+measurements are in pull requests #12 through #19.
+
+Publish the changed packages and their exact-version dependents in this order:
+
+1. `jxr-native` 0.3.1
+2. `jxr-metal` 0.3.1
+3. `jxr` 0.3.1
+4. `jxr-image` 0.3.1
+5. `jxr-mpsgraph` 0.3.1
+
+`jxr-math` 0.1.1, `jxr-core` 0.3.0, and `jxr-cuda` 0.3.0 are unchanged and stay
+at their published versions. `jxr-image` changes only its exact `jxr` pin.
