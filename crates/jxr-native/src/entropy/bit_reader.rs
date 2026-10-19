@@ -67,7 +67,11 @@ impl<'a> PacketBitReader<'a> {
     }
 
     /// Reads up to 64 bits, most-significant bit first.
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "a call per read made flexbit-heavy decoding about 2% slower"
+    )]
+    #[inline(always)]
     pub fn read_bits(&mut self, count: u8) -> Result<u64, EntropyError> {
         // A refilled cache holds at least 57 bits unless the packet ends first.
         if count > 57 {
@@ -140,13 +144,13 @@ impl<'a> PacketBitReader<'a> {
     }
 
     /// Builds the error a bit-serial reader reports after consuming `consumed` more bits.
-    #[cold]
+    #[inline]
     pub(crate) fn unexpected_end_after(&self, consumed: usize) -> EntropyError {
-        EntropyError::UnexpectedEnd {
-            bit_position: self.bit_position.saturating_add(consumed),
-            requested_bits: 1,
-            bit_length: self.bit_length,
-        }
+        unexpected_end(
+            self.bit_position.saturating_add(consumed),
+            1,
+            self.bit_length,
+        )
     }
 
     /// Consumes `count <= cached` bits, where `count` is at most 57.
@@ -177,39 +181,42 @@ impl<'a> PacketBitReader<'a> {
         Ok((high << 32) | low)
     }
 
-    #[cold]
-    #[inline(never)]
+    #[inline]
     fn end_error(&self, count: u8) -> EntropyError {
-        EntropyError::UnexpectedEnd {
-            bit_position: self.bit_position,
-            requested_bits: count,
-            bit_length: self.bit_length,
-        }
+        unexpected_end(self.bit_position, count, self.bit_length)
     }
 
     /// Reloads the cache with the unread bits at `bit_position`.
+    #[inline]
+    fn refill(&mut self) {
+        (self.cache, self.cached) = Self::window(self.bytes, self.bit_position, self.bit_length);
+    }
+
+    /// Returns the cache and its bit count for the unread bits at `bit_position`.
     ///
     /// A byte-aligned 64-bit window holds at least 57 bits after the in-byte
     /// offset. Bytes beyond the backing slice read as zero, and bits beyond
-    /// `bit_length` are cleared.
+    /// `bit_length` are cleared. It takes and returns values rather than the
+    /// reader so that calling it does not force a register-held reader to memory.
     #[inline(never)]
-    fn refill(&mut self) {
-        let byte = self.bit_position / 8;
-        let word = match self.bytes.get(byte..byte + 8) {
+    fn window(bytes: &[u8], bit_position: usize, bit_length: usize) -> (u64, u32) {
+        let byte = bit_position / 8;
+        let word = match bytes.get(byte..byte + 8) {
             Some(chunk) => {
                 u64::from_be_bytes(chunk.try_into().expect("slice is exactly eight bytes"))
             }
-            None => Self::padded_word(self.bytes, byte),
+            None => Self::padded_word(bytes, byte),
         };
-        let offset = self.bit_position % 8;
-        let available = (64 - offset).min(self.bits_remaining());
+        let offset = bit_position % 8;
+        let available = (64 - offset).min(bit_length - bit_position);
         // `available` is at least 57 unless the packet ends, and never zero
         // when any bit remains.
-        self.cached = u32::try_from(available).expect("window holds at most 64 bits");
-        self.cache = match available {
+        let cached = u32::try_from(available).expect("window holds at most 64 bits");
+        let cache = match available {
             0 => 0,
             bits => (word << offset) & (u64::MAX << (64 - bits)),
         };
+        (cache, cached)
     }
 
     #[cold]
@@ -219,6 +226,20 @@ impl<'a> PacketBitReader<'a> {
         let tail = bytes.get(byte..).unwrap_or_default();
         padded[..tail.len()].copy_from_slice(tail);
         u64::from_be_bytes(padded)
+    }
+}
+
+#[cold]
+#[inline(never)]
+const fn unexpected_end(
+    bit_position: usize,
+    requested_bits: u8,
+    bit_length: usize,
+) -> EntropyError {
+    EntropyError::UnexpectedEnd {
+        bit_position,
+        requested_bits,
+        bit_length,
     }
 }
 

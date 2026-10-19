@@ -359,7 +359,11 @@ fn advance_location(location: u8, run: u8) -> Result<u8, EntropyError> {
     Ok(next)
 }
 
-#[inline]
+#[expect(
+    clippy::inline_always,
+    reason = "a call per symbol made HP and LP block decoding up to 12% slower"
+)]
+#[inline(always)]
 fn decode_abs_level(
     reader: &mut PacketBitReader<'_>,
     state: &mut AdaptiveVlc,
@@ -397,7 +401,11 @@ fn decode_abs_level(
         .ok_or(EntropyError::CoefficientOverflow)
 }
 
-#[inline]
+#[expect(
+    clippy::inline_always,
+    reason = "a call per symbol made HP and LP block decoding up to 12% slower"
+)]
+#[inline(always)]
 fn decode_first_index(
     reader: &mut PacketBitReader<'_>,
     state: &mut AdaptiveVlc,
@@ -411,7 +419,11 @@ fn decode_first_index(
     Ok(symbol)
 }
 
-#[inline]
+#[expect(
+    clippy::inline_always,
+    reason = "a call per symbol made HP and LP block decoding up to 12% slower"
+)]
+#[inline(always)]
 fn decode_index(
     reader: &mut PacketBitReader<'_>,
     location: u8,
@@ -429,7 +441,11 @@ fn decode_index(
 }
 
 /// [`decode_run`] through [`RUN_LOOKUP`], falling back near the packet end.
-#[inline]
+#[expect(
+    clippy::inline_always,
+    reason = "a call per symbol made HP and LP block decoding up to 12% slower"
+)]
+#[inline(always)]
 fn decode_run_cached(reader: &mut PacketBitReader<'_>, max_run: u8) -> Result<u8, EntropyError> {
     if let Some(row) = RUN_LOOKUP
         .get(usize::from(max_run))
@@ -443,7 +459,8 @@ fn decode_run_cached(reader: &mut PacketBitReader<'_>, max_run: u8) -> Result<u8
     decode_run(reader, max_run)
 }
 
-#[inline]
+#[cold]
+#[inline(never)]
 fn decode_run(reader: &mut PacketBitReader<'_>, max_run: u8) -> Result<u8, EntropyError> {
     if max_run == 0 || max_run > 14 {
         return Err(EntropyError::InvalidParameter {
