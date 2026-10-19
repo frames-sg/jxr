@@ -3,25 +3,106 @@ use jxr_core::{BandPresence, PredictionMode};
 use crate::{ImagePlaneHeader, QuantizerSet, reconstruct::QuantizedMacroblock};
 
 use super::{
-    CoefficientTarget, SliceTarget, TileDecodeError,
+    TileDecodeError, coefficients_per_macroblock,
+    output::{MacroblockRecord, PlaneWriter},
     spatial::{MacroblockPosition, SpatialMacroblock, decode_spatial_packet, predict_low_pass},
 };
 
+fn record(bands: BandPresence) -> MacroblockRecord {
+    MacroblockRecord {
+        quantizers: jxr_core::QuantizerSet {
+            dc: 1,
+            low_pass: 1,
+            high_pass: 1,
+        },
+        bands,
+        prediction: PredictionMode::None,
+        hp_prediction: PredictionMode::None,
+    }
+}
+
 #[test]
-fn direct_coefficient_target_fills_exact_slice_and_rejects_overflow() {
-    let mut storage = [0_i32; 4];
+fn plane_writer_fills_exact_window_and_rejects_overflow() {
+    let mut storage = [0_i32; 8];
     {
-        let mut target = SliceTarget::new(&mut storage);
-        target.push(3).unwrap();
-        target.extend_from_slice(&[-2, 7, 11]).unwrap();
-        assert_eq!(target.len(), 4);
-        let error = target.push(13).unwrap_err();
+        let mut writer = PlaneWriter::new(&mut storage, 4, 2);
+        let high = [0; 256];
+        writer
+            .push(
+                &[3, -2, 7, 11, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &high,
+                record(BandPresence::NoHighPass),
+            )
+            .unwrap();
+        writer
+            .push(
+                &[5, 6, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &high,
+                record(BandPresence::NoHighPass),
+            )
+            .unwrap();
+        let error = writer
+            .push(&[0; 16], &high, record(BandPresence::DcOnly))
+            .unwrap_err();
         assert_eq!(
             error,
             TileDecodeError::InvalidPlan("external coefficient storage overflow")
         );
+        assert_eq!(writer.finish().unwrap().len(), 2);
     }
-    assert_eq!(storage, [3, -2, 7, 11]);
+    assert_eq!(storage, [3, -2, 7, 11, 5, 6, 8, 9]);
+}
+
+#[test]
+fn plane_writer_rejects_incomplete_windows() {
+    let mut storage = [0_i32; 8];
+    let mut writer = PlaneWriter::new(&mut storage, 4, 1);
+    writer
+        .push(&[0; 16], &[0; 256], record(BandPresence::NoHighPass))
+        .unwrap();
+    assert_eq!(
+        writer.finish().unwrap_err(),
+        TileDecodeError::InvalidPlan("external coefficient storage fill length")
+    );
+    let mut writer = PlaneWriter::new(&mut storage, 4, 2);
+    writer
+        .push(&[0; 16], &[0; 256], record(BandPresence::NoHighPass))
+        .unwrap();
+    assert_eq!(
+        writer.finish().unwrap_err(),
+        TileDecodeError::InvalidPlan("decoded tile macroblock count")
+    );
+}
+
+#[test]
+fn plane_writer_interleaves_low_pass_with_each_high_pass_block() {
+    let mut low = [0; 16];
+    low[..4].copy_from_slice(&[-10, -20, -30, -40]);
+    let high: [i32; 256] = core::array::from_fn(|index| i32::try_from(index).unwrap() + 1);
+    let mut storage = [0_i32; 64];
+    let mut writer = PlaneWriter::new(&mut storage, 4, 1);
+    writer.push(&low, &high, record(BandPresence::All)).unwrap();
+    writer.finish().unwrap();
+    for block in 0..4 {
+        assert_eq!(storage[block * 16], low[block]);
+        assert_eq!(
+            storage[block * 16 + 1..(block + 1) * 16],
+            high[block * 16 + 1..(block + 1) * 16]
+        );
+    }
+}
+
+/// Decode a one-macroblock Y-only tile and return its stored coefficients.
+fn decode_one(
+    packet: &[u8],
+    plane: &ImagePlaneHeader,
+    bands: BandPresence,
+) -> Result<(Vec<i32>, MacroblockRecord), TileDecodeError> {
+    let mut coefficients = vec![-1; coefficients_per_macroblock(bands, 16)];
+    let mut writer = PlaneWriter::new(&mut coefficients, 16, 1);
+    decode_spatial_packet(packet, plane, bands, 1, 1, false, &mut writer)?;
+    let records = writer.finish()?;
+    Ok((coefficients, records[0]))
 }
 
 #[derive(Default)]
@@ -88,8 +169,7 @@ fn plane(bands_present: u8) -> ImagePlaneHeader {
 
 #[test]
 fn rejects_wrong_tile_start_code_before_reading_headers() {
-    let error = decode_spatial_packet(&[0, 0, 2, 0], &plane(3), BandPresence::DcOnly, 1, 1, false)
-        .unwrap_err();
+    let error = decode_one(&[0, 0, 2, 0], &plane(3), BandPresence::DcOnly).unwrap_err();
     assert_eq!(error, TileDecodeError::InvalidStartCode { value: 2 });
 }
 
@@ -98,29 +178,17 @@ fn decodes_one_zero_dc_only_macroblock() {
     // Start code, arbitrary byte, IS_DC_CH_FLAG=0, eight DC refinement bits,
     // then seven zero alignment bits.
     let packet = [0, 0, 1, 0x5a, 0, 0, 0];
-    let decoded =
-        decode_spatial_packet(&packet, &plane(3), BandPresence::DcOnly, 1, 1, false).unwrap();
-    assert_eq!(decoded.len(), 1);
-    assert_eq!(decoded[0].coefficients.dc_low_pass, [0; 16]);
-    assert_eq!(decoded[0].coefficients.high_pass, [0; 256]);
-    assert_eq!(decoded[0].coefficients.quantizers.dc, 1);
+    let (coefficients, record) = decode_one(&packet, &plane(3), BandPresence::DcOnly).unwrap();
+    assert_eq!(coefficients, [0]);
+    assert_eq!(record.quantizers.dc, 1);
 }
 
 #[test]
 fn decodes_zero_low_pass_refinements_when_high_pass_is_absent() {
     let mut packet = packet_through_low_pass();
     packet.align_zero();
-    let decoded = decode_spatial_packet(
-        &packet.bytes,
-        &plane(2),
-        BandPresence::NoHighPass,
-        1,
-        1,
-        false,
-    )
-    .unwrap();
-    assert_eq!(decoded[0].coefficients.dc_low_pass, [0; 16]);
-    assert_eq!(decoded[0].coefficients.high_pass, [0; 256]);
+    let (coefficients, _) = decode_one(&packet.bytes, &plane(2), BandPresence::NoHighPass).unwrap();
+    assert_eq!(coefficients, [0; 16]);
 }
 
 fn packet_with_high_pass() -> Vec<u8> {
@@ -136,38 +204,20 @@ fn packet_with_high_pass() -> Vec<u8> {
 
 #[test]
 fn decodes_y_only_high_pass_vlc_for_no_flexbits_mode() {
-    let decoded = decode_spatial_packet(
+    let (coefficients, _) = decode_one(
         &packet_with_high_pass(),
         &plane(1),
         BandPresence::NoFlexbits,
-        1,
-        1,
-        false,
     )
     .unwrap();
-    assert_eq!(
-        decoded[0]
-            .coefficients
-            .high_pass
-            .iter()
-            .filter(|&&value| value != 0)
-            .count(),
-        16
-    );
+    assert_eq!(coefficients.len(), 256);
+    assert_eq!(coefficients.iter().filter(|&&value| value != 0).count(), 16);
 }
 
 #[test]
 fn all_bands_with_zero_model_bits_consumes_no_flex_payload() {
-    let decoded = decode_spatial_packet(
-        &packet_with_high_pass(),
-        &plane(0),
-        BandPresence::All,
-        1,
-        1,
-        false,
-    )
-    .unwrap();
-    assert_eq!(decoded[0].coefficients.bands, BandPresence::All);
+    let (_, record) = decode_one(&packet_with_high_pass(), &plane(0), BandPresence::All).unwrap();
+    assert_eq!(record.bands, BandPresence::All);
 }
 
 #[test]

@@ -3,35 +3,36 @@
 use jxr_core::{BandPresence, ChromaSampling, PredictionMode};
 
 use crate::{
-    ImagePlaneHeader,
+    ImagePlaneHeader, ParsedCodestream,
     entropy::{PacketBitReader, TileEntropyState},
-    reconstruct::QuantizedMacroblock,
 };
 
 use super::super::{
-    DecodedTile, TileDecodeError,
+    TileDecodeError,
     cbphp::CbphpState,
     high_pass::{self, HighpassPayload},
+    output::{MacroblockRecord, PlaneWriter},
     quantizer::TileQuantizers,
     spatial::{
-        MacroblockPosition, SpatialMacroblock, consume_byte_alignment, parse_packet_prefix, read_u8,
+        MacroblockPosition, PredictionRecord, consume_byte_alignment, parse_packet_prefix, read_u8,
     },
 };
 use super::syntax::{self, CbplpState};
 
 pub(in crate::tile_decode) fn decode(
     packet: &[u8],
-    plane: &ImagePlaneHeader,
+    parsed: &ParsedCodestream,
     bands: BandPresence,
     tile_width: u32,
     tile_height: u32,
-    trim_flexbits_present: bool,
-    sampling: ChromaSampling,
-) -> Result<DecodedTile, TileDecodeError> {
+    output: &mut [PlaneWriter<'_>],
+) -> Result<(), TileDecodeError> {
+    let plane = &parsed.headers.primary;
+    let sampling = super::sampling(plane.internal_color_format)?;
     let (width, height, count) = tile_geometry(tile_width, tile_height)?;
     let mut reader = PacketBitReader::new(packet);
     parse_packet_prefix(&mut reader)?;
-    let trim = read_trim(&mut reader, trim_flexbits_present)?;
+    let trim = read_trim(&mut reader, parsed.headers.image.flags.trim_flexbits())?;
     let mut decoder = SpatialDecoder::new(
         TileQuantizers::parse(&mut reader, plane)?,
         plane,
@@ -43,15 +44,14 @@ pub(in crate::tile_decode) fn decode(
     );
     for y in 0..height {
         for x in 0..width {
-            decoder.decode_macroblock(&mut reader, MacroblockPosition { width, x, y })?;
+            decoder.decode_macroblock(&mut reader, MacroblockPosition { width, x, y }, output)?;
         }
     }
-    consume_byte_alignment(&mut reader)?;
-    Ok(decoder.finish())
+    consume_byte_alignment(&mut reader)
 }
 
 pub(in crate::tile_decode) struct SpatialDecoder<'a> {
-    components: [Vec<SpatialMacroblock>; 3],
+    history: [Vec<PredictionRecord>; 3],
     entropy: TileEntropyState,
     low_pass_pattern: CbplpState,
     high_pass_pattern: CbphpState,
@@ -76,7 +76,7 @@ impl<'a> SpatialDecoder<'a> {
         let mut entropy = TileEntropyState::new();
         entropy.reset_tile();
         Self {
-            components: core::array::from_fn(|_| Vec::with_capacity(capacity)),
+            history: core::array::from_fn(|_| Vec::with_capacity(capacity)),
             entropy,
             low_pass_pattern: CbplpState::new(sampling),
             high_pass_pattern: CbphpState::new(width),
@@ -93,7 +93,11 @@ impl<'a> SpatialDecoder<'a> {
         &mut self,
         reader: &mut PacketBitReader<'_>,
         position: MacroblockPosition,
+        output: &mut [PlaneWriter<'_>],
     ) -> Result<(), TileDecodeError> {
+        if output.len() != 3 {
+            return Err(TileDecodeError::InvalidPlan("decoded component count"));
+        }
         if position.x.is_multiple_of(16) {
             self.entropy.reset_scan_totals();
         }
@@ -101,7 +105,7 @@ impl<'a> SpatialDecoder<'a> {
         let dc = syntax::decode_dc(
             reader,
             &mut self.entropy,
-            &self.components,
+            &self.history,
             position,
             self.sampling,
         )?;
@@ -129,24 +133,26 @@ impl<'a> SpatialDecoder<'a> {
                 },
                 &mut self.high_pass,
             )?;
-        } else {
-            *self.high_pass = [[0; 256]; 3];
         }
-        let high = &self.high_pass;
-        for component in 0..3 {
-            self.components[component].push(SpatialMacroblock {
-                coefficients: QuantizedMacroblock {
-                    dc_low_pass: low[component],
-                    high_pass: high[component],
+        // Writers read `high_pass` only when the bands carry HP, and HP decoding
+        // clears it first, so a skipped band never exposes stale values.
+        for (component, output) in output.iter_mut().enumerate() {
+            output.push(
+                &low[component],
+                &self.high_pass[component],
+                MacroblockRecord {
                     quantizers: self.quantizers.reconstruction_steps_for(
                         component,
                         qp_indices,
                         self.plane.scaled,
                     )?,
                     bands: self.bands,
+                    prediction: predictions[component],
+                    hp_prediction: hp_mode,
                 },
-                prediction: predictions[component],
-                hp_prediction: hp_mode,
+            )?;
+            self.history[component].push(PredictionRecord {
+                dc_low_pass: low[component],
                 lp_qp_index: qp_indices.lp,
             });
         }
@@ -168,7 +174,7 @@ impl<'a> SpatialDecoder<'a> {
         predictions: [PredictionMode; 3],
     ) -> Result<(), TileDecodeError> {
         let context = syntax::LowPassContext {
-            decoded: &self.components,
+            decoded: &self.history,
             position,
             qp_index,
             predictions,
@@ -190,12 +196,6 @@ impl<'a> SpatialDecoder<'a> {
                 context,
                 self.sampling,
             )
-        }
-    }
-
-    pub(in crate::tile_decode) fn finish(self) -> DecodedTile {
-        DecodedTile {
-            components: self.components.into_iter().collect(),
         }
     }
 }

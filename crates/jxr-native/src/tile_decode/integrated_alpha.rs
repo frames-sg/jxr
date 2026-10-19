@@ -5,16 +5,16 @@ use jxr_core::{BandPresence, PredictionMode};
 use crate::{
     ImagePlaneHeader,
     entropy::{PacketBitReader, TileEntropyState},
-    reconstruct::QuantizedMacroblock,
 };
 
 use super::{
-    DecodedTile, TileDecodeError,
+    TileDecodeError,
     cbphp::CbphpState,
     multicomponent,
+    output::{MacroblockRecord, PlaneWriter},
     quantizer::TileQuantizers,
     spatial::{
-        MacroblockPosition, SpatialMacroblock, adapt_at_boundary, consume_byte_alignment,
+        MacroblockPosition, PredictionRecord, adapt_at_boundary, consume_byte_alignment,
         decode_high_band, decode_low_bands, parse_packet_prefix, read_u8,
     },
     yuv,
@@ -25,7 +25,11 @@ pub(super) fn decode_spatial(
     planes: IntegratedPlanes<'_>,
     tile_width: u32,
     tile_height: u32,
-) -> Result<DecodedTile, TileDecodeError> {
+    output: &mut [PlaneWriter<'_>],
+) -> Result<(), TileDecodeError> {
+    let Some((alpha_output, primary_output)) = output.split_last_mut() else {
+        return Err(TileDecodeError::InvalidPlan("decoded component count"));
+    };
     let width = usize::try_from(tile_width)
         .map_err(|_| TileDecodeError::ArithmeticOverflow("integrated alpha tile width"))?;
     let height = usize::try_from(tile_height)
@@ -86,16 +90,11 @@ pub(super) fn decode_spatial(
     for y in 0..height {
         for x in 0..width {
             let position = MacroblockPosition { width, x, y };
-            primary_decoder.decode_macroblock(&mut reader, position)?;
-            alpha_decoder.decode_macroblock(&mut reader, position)?;
+            primary_decoder.decode_macroblock(&mut reader, position, primary_output)?;
+            alpha_decoder.decode_macroblock(&mut reader, position, alpha_output)?;
         }
     }
-    consume_byte_alignment(&mut reader)?;
-    let mut decoded = primary_decoder.finish().components;
-    decoded.push(alpha_decoder.decoded);
-    Ok(DecodedTile {
-        components: decoded,
-    })
+    consume_byte_alignment(&mut reader)
 }
 
 enum PrimaryDecoder<'a> {
@@ -109,21 +108,15 @@ impl PrimaryDecoder<'_> {
         &mut self,
         reader: &mut PacketBitReader<'_>,
         position: MacroblockPosition,
+        output: &mut [PlaneWriter<'_>],
     ) -> Result<(), TileDecodeError> {
         match self {
-            Self::Luma(decoder) => decoder.decode_macroblock(reader, position),
-            Self::Yuv(decoder) => decoder.decode_macroblock(reader, position),
-            Self::Multi(decoder) => decoder.decode_macroblock(reader, position),
-        }
-    }
-
-    fn finish(self) -> DecodedTile {
-        match self {
-            Self::Luma(decoder) => DecodedTile {
-                components: vec![decoder.decoded],
+            Self::Luma(decoder) => match output {
+                [output] => decoder.decode_macroblock(reader, position, output),
+                _ => Err(TileDecodeError::InvalidPlan("decoded component count")),
             },
-            Self::Yuv(decoder) => decoder.finish(),
-            Self::Multi(decoder) => decoder.finish(),
+            Self::Yuv(decoder) => decoder.decode_macroblock(reader, position, output),
+            Self::Multi(decoder) => decoder.decode_macroblock(reader, position, output),
         }
     }
 }
@@ -144,7 +137,7 @@ struct PlaneDecoder<'a> {
     plane: &'a ImagePlaneHeader,
     bands: BandPresence,
     trim: u8,
-    decoded: Vec<SpatialMacroblock>,
+    history: Vec<PredictionRecord>,
 }
 
 impl<'a> PlaneDecoder<'a> {
@@ -165,7 +158,7 @@ impl<'a> PlaneDecoder<'a> {
             plane,
             bands,
             trim,
-            decoded: Vec::with_capacity(capacity),
+            history: Vec::with_capacity(capacity),
         }
     }
 
@@ -173,6 +166,7 @@ impl<'a> PlaneDecoder<'a> {
         &mut self,
         reader: &mut PacketBitReader<'_>,
         position: MacroblockPosition,
+        output: &mut PlaneWriter<'_>,
     ) -> Result<(), TileDecodeError> {
         if position.x.is_multiple_of(16) {
             self.entropy.reset_scan_totals();
@@ -181,7 +175,7 @@ impl<'a> PlaneDecoder<'a> {
         let (low, prediction) = decode_low_bands(
             reader,
             &mut self.entropy,
-            &self.decoded,
+            &self.history,
             position,
             qp.lp,
             self.bands,
@@ -196,21 +190,24 @@ impl<'a> PlaneDecoder<'a> {
             self.bands,
             self.trim,
         )?;
-        self.decoded.push(SpatialMacroblock {
-            coefficients: QuantizedMacroblock {
-                dc_low_pass: low,
-                high_pass: high,
+        output.push(
+            &low,
+            &high,
+            MacroblockRecord {
                 quantizers: self
                     .quantizers
                     .reconstruction_steps(qp, self.plane.scaled)?,
                 bands: self.bands,
+                prediction,
+                hp_prediction: if self.bands.has_high_pass() {
+                    hp_mode
+                } else {
+                    PredictionMode::None
+                },
             },
-            prediction,
-            hp_prediction: if self.bands.has_high_pass() {
-                hp_mode
-            } else {
-                PredictionMode::None
-            },
+        )?;
+        self.history.push(PredictionRecord {
+            dc_low_pass: low,
             lp_qp_index: qp.lp,
         });
         adapt_at_boundary(
@@ -228,14 +225,19 @@ mod tests {
     use jxr_core::BandPresence;
 
     use super::{IntegratedPlanes, decode_spatial};
-    use crate::{ImagePlaneHeader, QuantizerSet};
+    use crate::{ImagePlaneHeader, QuantizerSet, tile_decode::output::PlaneWriter};
 
     #[test]
     fn spatial_yuv444_interleaves_primary_then_alpha() {
         let packet = [0, 0, 1, 0x5a, 0x80, 0, 0, 0, 0];
         let primary = header(3, 3);
         let alpha = header(0, 1);
-        let decoded = decode_spatial(
+        let mut storage = [-1_i32; 4];
+        let mut writers: Vec<_> = storage
+            .chunks_mut(1)
+            .map(|window| PlaneWriter::new(window, 16, 1))
+            .collect();
+        decode_spatial(
             &packet,
             IntegratedPlanes {
                 primary: &primary,
@@ -246,13 +248,20 @@ mod tests {
             },
             1,
             1,
+            &mut writers,
         )
         .unwrap();
-        assert_eq!(decoded.components.len(), 4);
-        assert!(decoded.components.iter().all(|plane| {
-            plane[0].coefficients.dc_low_pass == [0; 16]
-                && plane[0].coefficients.high_pass == [0; 256]
-        }));
+        let records: Vec<_> = writers
+            .into_iter()
+            .map(|writer| writer.finish().unwrap())
+            .collect();
+        assert_eq!(records.len(), 4);
+        assert!(
+            records
+                .iter()
+                .all(|plane| plane.len() == 1 && plane[0].bands == BandPresence::DcOnly)
+        );
+        assert_eq!(storage, [0; 4]);
     }
 
     fn header(internal_color_format: u8, components: u16) -> ImagePlaneHeader {

@@ -11,7 +11,7 @@ use crate::entropy::{
 use super::super::{
     TileDecodeError,
     spatial::{
-        MacroblockPosition, SpatialMacroblock, checked_add, low_pass_prediction_mode,
+        MacroblockPosition, PredictionNeighbour, checked_add, low_pass_prediction_mode,
         predict_low_pass, spatial_macroblock,
     },
 };
@@ -91,10 +91,10 @@ impl CbplpState {
     }
 }
 
-pub(in crate::tile_decode) fn decode_dc(
+pub(in crate::tile_decode) fn decode_dc<M: PredictionNeighbour>(
     reader: &mut PacketBitReader<'_>,
     entropy: &mut TileEntropyState,
-    decoded: &[Vec<SpatialMacroblock>; 3],
+    decoded: &[Vec<M>; 3],
     position: MacroblockPosition,
     sampling: ChromaSampling,
 ) -> Result<[(i32, PredictionMode); 3], TileDecodeError> {
@@ -124,9 +124,9 @@ pub(in crate::tile_decode) fn decode_dc(
     predict_dc_yuv(residual, decoded, position, sampling)
 }
 
-fn predict_dc_yuv(
+fn predict_dc_yuv<M: PredictionNeighbour>(
     residual: [i32; 3],
-    decoded: &[Vec<SpatialMacroblock>; 3],
+    decoded: &[Vec<M>; 3],
     position: MacroblockPosition,
     sampling: ChromaSampling,
 ) -> Result<[(i32, PredictionMode); 3], TileDecodeError> {
@@ -185,32 +185,41 @@ fn predict_dc_yuv(
     Ok(output)
 }
 
-fn dc_at(
-    decoded: &[SpatialMacroblock],
+fn dc_at<M: PredictionNeighbour>(
+    decoded: &[M],
     width: usize,
     x: usize,
     y: usize,
 ) -> Result<i32, TileDecodeError> {
     decoded
         .get(y.saturating_mul(width).saturating_add(x))
-        .map(|macroblock| macroblock.coefficients.dc_low_pass[0])
+        .map(|macroblock| macroblock.dc_low_pass()[0])
         .ok_or(TileDecodeError::InvalidPlan("YUV DC prediction neighbour"))
 }
 
-#[derive(Clone, Copy)]
-pub(in crate::tile_decode) struct LowPassContext<'a> {
-    pub(in crate::tile_decode) decoded: &'a [Vec<SpatialMacroblock>; 3],
+pub(in crate::tile_decode) struct LowPassContext<'a, M> {
+    pub(in crate::tile_decode) decoded: &'a [Vec<M>; 3],
     pub(in crate::tile_decode) position: MacroblockPosition,
     pub(in crate::tile_decode) qp_index: u8,
     pub(in crate::tile_decode) predictions: [PredictionMode; 3],
 }
 
-pub(in crate::tile_decode) fn decode_low_pass_444(
+// Manual impls: the context only borrows its history, so it is `Copy` for any
+// neighbour type, while a derive would require `M: Copy`.
+impl<M> Clone for LowPassContext<'_, M> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<M> Copy for LowPassContext<'_, M> {}
+
+pub(in crate::tile_decode) fn decode_low_pass_444<M: PredictionNeighbour>(
     reader: &mut PacketBitReader<'_>,
     entropy: &mut TileEntropyState,
     cbplp: &mut CbplpState,
     low: &mut [[i32; 16]; 3],
-    context: LowPassContext<'_>,
+    context: LowPassContext<'_, M>,
 ) -> Result<(), TileDecodeError> {
     let pattern = cbplp.decode(reader)?;
     let mut lap_mean = [0_i32; 2];
@@ -245,12 +254,12 @@ pub(in crate::tile_decode) fn decode_low_pass_444(
     Ok(())
 }
 
-pub(in crate::tile_decode) fn decode_low_pass_subsampled(
+pub(in crate::tile_decode) fn decode_low_pass_subsampled<M: PredictionNeighbour>(
     reader: &mut PacketBitReader<'_>,
     entropy: &mut TileEntropyState,
     cbplp: &mut CbplpState,
     low: &mut [[i32; 16]; 3],
-    context: LowPassContext<'_>,
+    context: LowPassContext<'_, M>,
     sampling: ChromaSampling,
 ) -> Result<(), TileDecodeError> {
     if sampling == ChromaSampling::Cs444 {
@@ -376,9 +385,9 @@ fn remap_joint_chroma(
     Ok(())
 }
 
-fn predict_subsampled_chroma(
+fn predict_subsampled_chroma<M: PredictionNeighbour>(
     current: &mut [i32; 16],
-    decoded: &[SpatialMacroblock],
+    decoded: &[M],
     position: MacroblockPosition,
     dc_mode: PredictionMode,
     lp_qp_index: u8,
@@ -388,30 +397,22 @@ fn predict_subsampled_chroma(
     let MacroblockPosition { width, x, y } = position;
     match (sampling, mode) {
         (ChromaSampling::Cs420, PredictionMode::FromLeft) => {
-            let left = &spatial_macroblock(decoded, width, x - 1, y)?
-                .coefficients
-                .dc_low_pass;
+            let left = spatial_macroblock(decoded, width, x - 1, y)?.dc_low_pass();
             current[2] = checked_add(current[2], left[2], "YUV420 left LP prediction")?;
         }
         (ChromaSampling::Cs420, PredictionMode::FromTop) => {
-            let top = &spatial_macroblock(decoded, width, x, y - 1)?
-                .coefficients
-                .dc_low_pass;
+            let top = spatial_macroblock(decoded, width, x, y - 1)?.dc_low_pass();
             current[1] = checked_add(current[1], top[1], "YUV420 top LP prediction")?;
         }
         (ChromaSampling::Cs422, PredictionMode::FromLeft) => {
-            let left = &spatial_macroblock(decoded, width, x - 1, y)?
-                .coefficients
-                .dc_low_pass;
+            let left = spatial_macroblock(decoded, width, x - 1, y)?.dc_low_pass();
             for index in [4, 2, 6] {
                 current[index] =
                     checked_add(current[index], left[index], "YUV422 left LP prediction")?;
             }
         }
         (ChromaSampling::Cs422, PredictionMode::FromTop) => {
-            let top = &spatial_macroblock(decoded, width, x, y - 1)?
-                .coefficients
-                .dc_low_pass;
+            let top = spatial_macroblock(decoded, width, x, y - 1)?.dc_low_pass();
             current[4] = checked_add(current[4], top[4], "YUV422 top LP prediction")?;
             current[1] = checked_add(current[1], top[5], "YUV422 top LP prediction")?;
             current[5] = checked_add(current[5], current[1], "YUV422 internal LP prediction")?;
