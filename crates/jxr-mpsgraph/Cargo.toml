@@ -55,6 +55,7 @@ objc2-metal-performance-shaders-graph = { version = "=0.3.2", default-features =
     "MPSGraphTensorData",
     "MPSGraphTensorShapeOps",
 ] }
+rayon.workspace = true
 
 [lints.rust]
 unsafe_code = "allow"

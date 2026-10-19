@@ -7,6 +7,7 @@ use objc2_foundation::{NSArray, NSNumber};
 use objc2_metal::{MTLBuffer, MTLCommandQueue, MTLDevice};
 use objc2_metal_performance_shaders::MPSDataType;
 use objc2_metal_performance_shaders_graph::MPSGraphTensorData;
+use rayon::prelude::*;
 
 use crate::{
     Error, IndexedPreparationError, MpsGraphDecodeInput, MpsGraphPreparedBatch,
@@ -27,6 +28,31 @@ struct PreparedRequest {
     source_index: usize,
     image: jxr::PreparedJxr,
     request: jxr::DecodeRequest,
+}
+
+type PreparedRequestResult = (usize, Result<(PreparedImage, MpsGraphTensorSpec), Error>);
+
+/// Decode one request's entropy and validate its single-image dense layout.
+fn prepare_request(input: &PreparedRequest) -> PreparedRequestResult {
+    let source_index = input.source_index;
+    let prepared = (|| {
+        let reconstruction = input
+            .image
+            .decoder()
+            .prepare_reconstruction(&input.request)?;
+        let layout = reconstruction.output_layout();
+        let individual_spec = MpsGraphTensorSpec::from_image_layout(layout, 1)?;
+        DenseMetalBatchLayout::new(layout.clone(), 1)?;
+        Ok::<_, Error>((
+            PreparedImage {
+                source_index,
+                decoded_region: reconstruction.plan().output_region,
+                reconstruction,
+            },
+            individual_spec,
+        ))
+    })();
+    (source_index, prepared)
 }
 
 /// Persistent decoder whose JPEG XR and `MPSGraph` work share one Metal queue.
@@ -103,8 +129,8 @@ impl MpsGraphBatchDecoder {
                 request: input.options.strict_request(),
                 image: input.image,
             })
-            .collect();
-        Self::prepare_requests(requests, Vec::new())
+            .collect::<Vec<_>>();
+        self.prepare_requests(&requests, Vec::new())
     }
 
     /// Parse and group shared codec batch inputs without decoding coefficients.
@@ -134,7 +160,7 @@ impl MpsGraphBatchDecoder {
                 maximum: self.batch_preparer.options().max_inputs,
             }));
         }
-        let graph_prepared = Self::prepare_shared_batch(prepared)?;
+        let graph_prepared = self.prepare_shared_batch(prepared)?;
         self.decode_prepared(&graph_prepared)
     }
 
@@ -147,7 +173,10 @@ impl MpsGraphBatchDecoder {
         self.decode_batch(&prepared)
     }
 
-    fn prepare_shared_batch(prepared: &jxr::PreparedBatch) -> Result<MpsGraphPreparedBatch, Error> {
+    fn prepare_shared_batch(
+        &self,
+        prepared: &jxr::PreparedBatch,
+    ) -> Result<MpsGraphPreparedBatch, Error> {
         let mut errors = Vec::with_capacity(prepared.errors().len());
         for error in prepared.errors() {
             errors.push(IndexedPreparationError::new(
@@ -182,31 +211,24 @@ impl MpsGraphBatchDecoder {
             }
         }
         requests.sort_by_key(|request| request.source_index);
-        Self::prepare_requests(requests, errors)
+        self.prepare_requests(&requests, errors)
     }
 
+    /// Decode entropy for every request on the worker pool, then group the
+    /// results in source order.
     fn prepare_requests(
-        requests: Vec<PreparedRequest>,
+        &self,
+        requests: &[PreparedRequest],
         mut errors: Vec<IndexedPreparationError>,
     ) -> Result<MpsGraphPreparedBatch, Error> {
         let mut groups: Vec<MpsGraphPreparedGroup> = Vec::with_capacity(requests.len());
-        for input in requests {
-            let source_index = input.source_index;
-            let prepared = (|| {
-                let reconstruction = input
-                    .image
-                    .decoder()
-                    .prepare_reconstruction(&input.request)?;
-                let layout = reconstruction.output_layout();
-                let individual_spec = MpsGraphTensorSpec::from_image_layout(layout, 1)?;
-                DenseMetalBatchLayout::new(layout.clone(), 1)?;
-                Ok::<_, Error>(PreparedImage {
-                    source_index,
-                    decoded_region: reconstruction.plan().output_region,
-                    reconstruction,
-                })
-                .map(|image| (image, individual_spec))
-            })();
+        let prepared: Vec<_> = if requests.len() > 1 {
+            self.batch_preparer
+                .install(|| requests.par_iter().map(prepare_request).collect())
+        } else {
+            requests.iter().map(prepare_request).collect()
+        };
+        for (source_index, prepared) in prepared {
             match prepared {
                 Ok((image, individual_spec)) => {
                     if let Some(group) = groups.iter_mut().find(|group| {

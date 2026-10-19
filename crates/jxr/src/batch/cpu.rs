@@ -93,11 +93,12 @@ impl CpuBatchDecoder {
         self.workers.current_num_threads()
     }
 
-    #[cfg(any(feature = "metal", feature = "cuda"))]
-    pub(crate) fn install<Output: Send>(
-        &self,
-        operation: impl FnOnce() -> Output + Send,
-    ) -> Output {
+    /// Run `operation` on this decoder's worker pool.
+    ///
+    /// Rayon parallel work started inside `operation` uses the configured
+    /// image-level worker count instead of the global pool, so adapters that
+    /// prepare their own per-image work share this decoder's concurrency limit.
+    pub fn install<Output: Send>(&self, operation: impl FnOnce() -> Output + Send) -> Output {
         self.workers.install(operation)
     }
 

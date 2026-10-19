@@ -189,6 +189,47 @@ fn prepare_partitions_by_tensor_shape_and_preserves_indexed_errors() {
 
 #[test]
 #[ignore = "requires the downloaded T.834 corpus and an Apple GPU"]
+fn parallel_prepare_keeps_groups_and_errors_in_source_order() {
+    let image = conformance_image();
+    let (width, height) = image.info().dimensions();
+    let mut region = MpsGraphDecodeOptions::new(PixelFormat::U8(ChannelLayout::Luma));
+    region.region = Some(Rect {
+        x: 0,
+        y: 0,
+        w: width / 2,
+        h: height / 2,
+    });
+    let decoder = MpsGraphBatchDecoder::system_default().unwrap();
+    let inputs = (0..40)
+        .map(|index| match index % 3 {
+            0 => input(&image, PixelFormat::U8(ChannelLayout::Luma)),
+            1 => MpsGraphDecodeInput {
+                image: image.clone(),
+                options: region.clone(),
+            },
+            _ => input(&image, PixelFormat::U8(ChannelLayout::Bgr)),
+        })
+        .collect();
+    let prepared = decoder.prepare(inputs).unwrap();
+
+    let with_residue = |residue| {
+        (0..40)
+            .filter(|index| index % 3 == residue)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(prepared.groups().len(), 2);
+    assert_eq!(prepared.groups()[0].source_indices(), with_residue(0));
+    assert_eq!(prepared.groups()[1].source_indices(), with_residue(1));
+    let errors = prepared
+        .errors()
+        .iter()
+        .map(jxr_mpsgraph::IndexedPreparationError::source_index)
+        .collect::<Vec<_>>();
+    assert_eq!(errors, with_residue(2));
+}
+
+#[test]
+#[ignore = "requires the downloaded T.834 corpus and an Apple GPU"]
 fn direct_identity_run_and_completed_handoff_share_the_codec_queue() {
     let image = conformance_image();
     let mut decoder = MpsGraphBatchDecoder::system_default().unwrap();
