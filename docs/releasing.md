@@ -161,7 +161,10 @@ Publish the changed packages and their exact-version dependents in this order:
 2. `jxr-metal` 0.3.1
 3. `jxr` 0.3.1
 4. `jxr-image` 0.3.1
-5. `jxr-mpsgraph` 0.3.1
+5. `jxr-mpsgraph` 0.4.0
 
 `jxr-math` 0.1.1, `jxr-core` 0.3.0, and `jxr-cuda` 0.3.0 are unchanged and stay
 at their published versions. `jxr-image` changes only its exact `jxr` pin.
+`jxr-mpsgraph` moves to 0.4.0 because `MpsGraphPreparedGroup` and
+`MpsGraphPreparedBatch` now hold staged Metal plans and are no longer
+`UnwindSafe` or `RefUnwindSafe`; its other public API is unchanged.
