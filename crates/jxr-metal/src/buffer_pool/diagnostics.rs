@@ -18,4 +18,6 @@ pub struct MetalBufferPoolDiagnostics {
 pub struct MetalBufferPoolsDiagnostics {
     pub private: MetalBufferPoolDiagnostics,
     pub shared: MetalBufferPoolDiagnostics,
+    /// Shared coefficient staging retained for CPU entropy output.
+    pub staging: MetalBufferPoolDiagnostics,
 }

@@ -9,8 +9,8 @@ use std::{
 
 use jxr::{
     AlphaHandling, BackendRequest, BatchDecodeOptions, CpuBatchDecoder, DecodeRequest,
-    DecodedImage, EncodedImage, JxrView, PixelFormat,
-    metal::{MetalDecodePlan, MetalDecoderSession},
+    DecodedImage, EncodedImage, JxrView, MetalBatchDecoder, PixelFormat,
+    metal::{MetalDecodePlan, MetalDecoderSession, MetalStageDiagnostics},
 };
 use jxr_test_support::{
     checksum_bytes, checksum_cpu_batch_image, checksum_samples, oracle_format, summarize_timings,
@@ -60,6 +60,7 @@ fn run() -> Result<(), BenchmarkError> {
     let workload = load_workload(&path)?;
     let cpu = CpuBatchDecoder::new(BatchDecodeOptions::default())?;
     let session = MetalDecoderSession::system_default()?;
+    let batch_api = MetalBatchDecoder::system_default(BatchDecodeOptions::default())?;
     if !session.is_usable() {
         return Err("the default Metal device is not usable for JXR reconstruction".into());
     }
@@ -90,9 +91,11 @@ fn run() -> Result<(), BenchmarkError> {
     );
     println!("timed scope includes parse + CPU entropy + reconstruction; file I/O is excluded");
     println!("resident ends in private Metal output; host writes directly to pooled shared output");
+    println!("batch API decodes owned inputs with MetalBatchDecoder into resident output");
+    println!("Metal stages: encode/submit, completion wait, summed GPU execution, host readback");
 
     for batch_size in BATCH_SIZES {
-        let result = measure_batch(&workload, &cpu, &session, batch_size, checksum)?;
+        let result = measure_batch(&workload, &cpu, &session, &batch_api, batch_size, checksum)?;
         print_result(&workload, batch_size, &result);
     }
     let diagnostics = cpu.diagnostics();
@@ -115,6 +118,7 @@ fn run() -> Result<(), BenchmarkError> {
 
 struct BatchResult {
     cpu: jxr_test_support::TimingSummary,
+    batch_api: MetalSummary,
     resident: MetalSummary,
     dense: MetalSummary,
     shared: MetalSummary,
@@ -126,18 +130,24 @@ struct MetalMeasurement {
     total: Duration,
     prepare: Duration,
     execute: Duration,
+    stages: MetalStageDiagnostics,
 }
 
 struct MetalSummary {
     total: jxr_test_support::TimingSummary,
     prepare: jxr_test_support::TimingSummary,
     execute: jxr_test_support::TimingSummary,
+    encode: Duration,
+    wait: Duration,
+    gpu: Duration,
+    readback: Duration,
 }
 
 fn measure_batch(
     workload: &Workload,
     cpu_decoder: &CpuBatchDecoder,
     session: &MetalDecoderSession,
+    batch_api: &MetalBatchDecoder,
     batch_size: usize,
     expected_checksum: u64,
 ) -> Result<BatchResult, BenchmarkError> {
@@ -149,8 +159,10 @@ fn measure_batch(
             batch_size,
             expected_checksum,
         )?;
+        let _ = run_batch_api(workload, batch_api, batch_size, expected_checksum)?;
     }
 
+    let mut batch_api_samples = Vec::with_capacity(ITERATIONS);
     let mut cpu = Vec::with_capacity(ITERATIONS);
     let mut resident = Vec::with_capacity(ITERATIONS);
     let mut dense = Vec::with_capacity(ITERATIONS);
@@ -171,6 +183,12 @@ fn measure_batch(
             &mut shared,
             &mut host,
         )?;
+        batch_api_samples.push(run_batch_api(
+            workload,
+            batch_api,
+            batch_size,
+            expected_checksum,
+        )?);
     }
     for _ in 0..WARMUPS {
         let _ = run_pipelined_resident(workload, session, batch_size)?;
@@ -181,6 +199,7 @@ fn measure_batch(
 
     Ok(BatchResult {
         cpu: summarize_timings(&cpu).ok_or("CPU batch timing sample was empty")?,
+        batch_api: summarize_metal(&batch_api_samples)?,
         resident: summarize_metal(&resident)?,
         dense: summarize_metal(&dense)?,
         shared: summarize_metal(&shared)?,
@@ -298,11 +317,74 @@ fn summarize_metal(samples: &[MetalMeasurement]) -> Result<MetalSummary, Benchma
         .iter()
         .map(|sample| sample.execute)
         .collect::<Vec<_>>();
+    let stage = |select: fn(&MetalStageDiagnostics) -> Duration| {
+        let values = samples
+            .iter()
+            .map(|sample| select(&sample.stages))
+            .collect::<Vec<_>>();
+        summarize_timings(&values)
+            .map(|summary| summary.median)
+            .ok_or("Metal stage timing sample was empty")
+    };
     Ok(MetalSummary {
         total: summarize_timings(&totals).ok_or("Metal total timing sample was empty")?,
         prepare: summarize_timings(&preparation)
             .ok_or("Metal preparation timing sample was empty")?,
         execute: summarize_timings(&execution).ok_or("Metal execution timing sample was empty")?,
+        encode: stage(|stages| stages.encode)?,
+        wait: stage(|stages| stages.wait)?,
+        gpu: stage(|stages| stages.gpu)?,
+        readback: stage(|stages| stages.readback)?,
+    })
+}
+
+/// High-level batch API: owned inputs through `MetalBatchDecoder`, which
+/// prepares and submits pipelined chunks. Preparation is everything outside
+/// the session's encode, wait, and readback stages.
+fn run_batch_api(
+    workload: &Workload,
+    decoder: &MetalBatchDecoder,
+    batch_size: usize,
+    expected_checksum: u64,
+) -> Result<MetalMeasurement, BenchmarkError> {
+    let inputs = (0..batch_size)
+        .map(|_| {
+            EncodedImage::new(
+                Arc::clone(&workload.source),
+                request(workload, BackendRequest::Metal),
+            )
+        })
+        .collect();
+    let before = decoder.session().stage_diagnostics()?;
+    let start = Instant::now();
+    let batch = decoder.decode(inputs)?;
+    let total = start.elapsed();
+    let stages = decoder.session().stage_diagnostics()?.since(before);
+    if !batch.errors().is_empty() || !batch.group_errors().is_empty() || batch.groups().len() != 1 {
+        return Err(format!(
+            "Metal batch API returned {} groups, {} errors, and {} group errors",
+            batch.groups().len(),
+            batch.errors().len(),
+            batch.group_errors().len()
+        )
+        .into());
+    }
+    let images = batch.groups()[0].images();
+    if images.len() != batch_size {
+        return Err("Metal batch API returned the wrong output count".into());
+    }
+    for image in images {
+        check_checksum(
+            checksum_bytes(&decoder.session().readback(image)?),
+            expected_checksum,
+        )?;
+    }
+    let execute = stages.encode + stages.wait;
+    Ok(MetalMeasurement {
+        total,
+        prepare: total.saturating_sub(execute),
+        execute,
+        stages,
     })
 }
 
@@ -370,6 +452,7 @@ fn run_metal_batch(
     let start = Instant::now();
     let plans = prepare_metal_plans(workload, session, batch_size)?;
     let prepare = start.elapsed();
+    let before = session.stage_diagnostics()?;
     let execute_start = Instant::now();
     let (resident_count, dense, shared, host) = match output {
         MetalOutput::Resident => (
@@ -396,6 +479,7 @@ fn run_metal_batch(
     };
     let execute = execute_start.elapsed();
     let total = start.elapsed();
+    let stages = session.stage_diagnostics()?.since(before);
 
     if resident_count != batch_size {
         return Err(format!(
@@ -428,6 +512,7 @@ fn run_metal_batch(
         total,
         prepare,
         execute,
+        stages,
     })
 }
 
@@ -530,6 +615,7 @@ fn print_result(workload: &Workload, batch_size: usize, result: &BatchResult) {
     let batch_size_f64 = f64::from(u32::try_from(batch_size).expect("batch size fits u32"));
     let pixels = f64::from(workload.width) * f64::from(workload.height) * batch_size_f64;
     let cpu_rate = pixels / result.cpu.median.as_secs_f64() / 1_000_000.0;
+    let batch_api_rate = pixels / result.batch_api.total.median.as_secs_f64() / 1_000_000.0;
     let resident_rate = pixels / result.resident.total.median.as_secs_f64() / 1_000_000.0;
     let shared_rate = pixels / result.shared.total.median.as_secs_f64() / 1_000_000.0;
     let host_rate = pixels / result.host.total.median.as_secs_f64() / 1_000_000.0;
@@ -540,6 +626,7 @@ fn print_result(workload: &Workload, batch_size: usize, result: &BatchResult) {
     println!();
     println!("batch {batch_size}");
     print_route("CPU host", result.cpu, cpu_rate);
+    print_metal_route("Metal batch API", &result.batch_api, batch_api_rate);
     print_metal_route("Metal resident", &result.resident, resident_rate);
     let dense_rate = pixels / result.dense.total.median.as_secs_f64() / 1_000_000.0;
     print_metal_route("Metal dense", &result.dense, dense_rate);
@@ -552,26 +639,35 @@ fn print_result(workload: &Workload, batch_size: usize, result: &BatchResult) {
         pipeline_rate
     );
     println!(
-        "  host-output speedup {:.2}x; resident throughput ceiling {:.2}x CPU host",
+        "  host-output speedup {:.2}x; batch API speedup {:.2}x; resident throughput ceiling {:.2}x CPU host",
         result.cpu.median.as_secs_f64() / result.host.total.median.as_secs_f64(),
+        result.cpu.median.as_secs_f64() / result.batch_api.total.median.as_secs_f64(),
         resident_rate / cpu_rate
     );
 }
 
 fn print_metal_route(label: &str, summary: &MetalSummary, rate: f64) {
     println!(
-        "  {label:14} median {:8.3} ms | prep {:7.3} + Metal {:7.3} ms | p95 {:8.3} ms | {:8.1} MP/s",
+        "  {label:15} median {:8.3} ms | prep {:7.3} + Metal {:7.3} ms | p95 {:8.3} ms | {:8.1} MP/s",
         milliseconds(summary.total.median),
         milliseconds(summary.prepare.median),
         milliseconds(summary.execute.median),
         milliseconds(summary.total.p95),
         rate
     );
+    println!(
+        "  {:15} stages: encode/submit {:7.3} | wait {:7.3} | GPU {:7.3} | readback {:7.3} ms",
+        "",
+        milliseconds(summary.encode),
+        milliseconds(summary.wait),
+        milliseconds(summary.gpu),
+        milliseconds(summary.readback),
+    );
 }
 
 fn print_route(label: &str, summary: jxr_test_support::TimingSummary, rate: f64) {
     println!(
-        "  {label:14} median {:8.3} ms | p95 {:8.3} ms | {:8.1} MP/s",
+        "  {label:15} median {:8.3} ms | p95 {:8.3} ms | {:8.1} MP/s",
         milliseconds(summary.median),
         milliseconds(summary.p95),
         rate

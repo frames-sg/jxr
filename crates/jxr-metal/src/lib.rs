@@ -29,6 +29,7 @@ mod route;
 mod runtime;
 mod session;
 mod shared_image;
+mod stage_timing;
 mod submission;
 #[cfg(target_os = "macos")]
 mod upload_cache;
@@ -45,6 +46,7 @@ pub use resident::{MetalResidentBatch, ResidentMetalImage};
 pub use route::{METAL_AUTO_THRESHOLD, MetalRouteDecision, plan_metal_route};
 pub use session::MetalDecoderSession;
 pub use shared_image::SharedMetalImage;
+pub use stage_timing::MetalStageDiagnostics;
 #[cfg(target_os = "macos")]
 pub use submission::MetalConsumerWait;
 pub use submission::{

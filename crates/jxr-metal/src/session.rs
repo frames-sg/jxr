@@ -25,6 +25,8 @@ use objc2_metal::{
 
 #[cfg(target_os = "macos")]
 use crate::runtime::MetalRuntime;
+#[cfg(target_os = "macos")]
+use crate::stage_timing::HostStage;
 
 #[cfg(target_os = "macos")]
 pub(crate) const BATCH_SCRATCH_BUDGET: usize = 256 * 1024 * 1024;
@@ -40,6 +42,9 @@ pub struct MetalDecoderSession {
     /// by clones instead of creating a command queue per copy.
     #[cfg(target_os = "macos")]
     readback_queue: std::rc::Rc<std::cell::OnceCell<Retained<ProtocolObject<dyn MTLCommandQueue>>>>,
+    /// Coefficient staging reused across decodes and shared by clones.
+    #[cfg(target_os = "macos")]
+    staging_pool: std::sync::Arc<crate::buffer_pool::StagingPool>,
 }
 
 impl core::fmt::Debug for MetalDecoderSession {
@@ -51,6 +56,18 @@ impl core::fmt::Debug for MetalDecoderSession {
 }
 
 impl MetalDecoderSession {
+    #[cfg(target_os = "macos")]
+    fn staging_allocation(
+        &self,
+        bytes: usize,
+    ) -> Result<std::sync::Arc<crate::coefficient_staging::StagingAllocation>, MetalError> {
+        let buffer = self.staging_pool.take(self.runtime.device(), bytes)?;
+        Ok(crate::coefficient_staging::StagingAllocation::new(
+            buffer,
+            self.staging_pool.clone(),
+        ))
+    }
+
     #[cfg(target_os = "macos")]
     fn readback_queue(&self) -> Result<&ProtocolObject<dyn MTLCommandQueue>, MetalError> {
         if let Some(queue) = self.readback_queue.get() {
@@ -78,10 +95,12 @@ impl MetalDecoderSession {
         #[cfg(target_os = "macos")]
         {
             let runtime = j2k_metal_support::MetalRuntimeSession::system_default()?;
+            let staging_pool = staging_pool(runtime.device());
             Ok(Self {
                 runtime,
                 command_queue: None,
                 readback_queue: std::rc::Rc::default(),
+                staging_pool,
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -111,10 +130,12 @@ impl MetalDecoderSession {
     #[cfg(target_os = "macos")]
     #[must_use]
     pub fn new(device: Retained<ProtocolObject<dyn MTLDevice>>) -> Self {
+        let staging_pool = staging_pool(&device);
         Self {
             runtime: j2k_metal_support::MetalRuntimeSession::new(device),
             command_queue: None,
             readback_queue: std::rc::Rc::default(),
+            staging_pool,
         }
     }
 
@@ -129,10 +150,12 @@ impl MetalDecoderSession {
                 reason: "command queue belongs to a different Metal device",
             });
         }
+        let staging_pool = staging_pool(&device);
         Ok(Self {
             runtime: j2k_metal_support::MetalRuntimeSession::new(device),
             command_queue: Some(command_queue),
             readback_queue: std::rc::Rc::default(),
+            staging_pool,
         })
     }
 
@@ -155,7 +178,9 @@ impl MetalDecoderSession {
     pub fn buffer_pool_diagnostics(
         &self,
     ) -> Result<crate::MetalBufferPoolsDiagnostics, MetalError> {
-        self.initialized_runtime()?.buffer_pools.diagnostics()
+        let mut diagnostics = self.initialized_runtime()?.buffer_pools.diagnostics()?;
+        diagnostics.staging = self.staging_pool.diagnostics()?;
+        Ok(diagnostics)
     }
 
     /// Return immutable coefficient-upload cache reuse counters.
@@ -164,6 +189,18 @@ impl MetalDecoderSession {
         &self,
     ) -> Result<crate::MetalUploadCacheDiagnostics, MetalError> {
         self.initialized_runtime()?.upload_cache.diagnostics()
+    }
+
+    /// Return cumulative encode, wait, GPU-execution, and readback timings.
+    pub fn stage_diagnostics(&self) -> Result<crate::MetalStageDiagnostics, MetalError> {
+        #[cfg(target_os = "macos")]
+        {
+            Ok(self.initialized_runtime()?.stage_timings.snapshot())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(MetalError::Unavailable)
+        }
     }
 
     /// Number of command queues available to independent batch images.
@@ -177,6 +214,11 @@ impl MetalDecoderSession {
     }
 
     /// Allocate exact shared storage for direct CPU entropy output.
+    ///
+    /// Storage is recycled from earlier decodes once nothing references it,
+    /// so its contents are unspecified until written. Released staging stays
+    /// retained by the session for exact-size reuse, bounded like the scratch
+    /// pools (64 buffers and 256 MiB or the device's maximum buffer length).
     pub fn coefficient_staging(
         &self,
         element_count: usize,
@@ -193,9 +235,9 @@ impl MetalDecoderSession {
                 .ok_or(MetalError::InvalidPlan {
                     reason: "coefficient staging byte count overflows usize",
                 })?;
-            let buffer = checked_shared_buffer(self.runtime.device(), bytes)?;
+            let allocation = self.staging_allocation(bytes)?;
             Ok(crate::MetalCoefficientStaging::new(
-                buffer,
+                allocation,
                 element_count,
                 0,
             ))
@@ -258,12 +300,12 @@ impl MetalDecoderSession {
                 .ok_or(MetalError::InvalidPlan {
                     reason: "coefficient staging slice byte count overflows usize",
                 })?;
-            let buffer = checked_shared_buffer(self.runtime.device(), bytes)?;
+            let allocation = self.staging_allocation(bytes)?;
             let mut offset = 0_usize;
             let mut slices = Vec::with_capacity(element_counts.len());
             for &count in element_counts {
                 slices.push(crate::MetalCoefficientStaging::new(
-                    buffer.clone(),
+                    allocation.clone(),
                     count,
                     offset,
                 ));
@@ -288,7 +330,9 @@ impl MetalDecoderSession {
         #[cfg(target_os = "macos")]
         {
             let runtime = self.initialized_runtime()?;
-            let encoded = crate::encode::encode(runtime, plan)?;
+            let encoded = runtime
+                .stage_timings
+                .time(HostStage::Encode, || crate::encode::encode(runtime, plan))?;
             Ok(MetalSubmission::submitted(
                 encoded,
                 plan.decode_report(false),
@@ -368,7 +412,9 @@ impl MetalDecoderSession {
         {
             destination.validate_device(self.runtime.device())?;
             let runtime = self.initialized_runtime()?;
-            let encoded = crate::encode::encode_into(runtime, plan, destination.buffer_handle())?;
+            let encoded = runtime.stage_timings.time(HostStage::Encode, || {
+                crate::encode::encode_into(runtime, plan, destination.buffer_handle())
+            })?;
             let submission = MetalSubmission::submitted(encoded, plan.decode_report(false));
             Ok(MetalDestinationSubmission::new(
                 submission,
@@ -551,6 +597,13 @@ impl MetalDecoderSession {
 }
 
 #[cfg(target_os = "macos")]
+fn staging_pool(
+    device: &ProtocolObject<dyn MTLDevice>,
+) -> std::sync::Arc<crate::buffer_pool::StagingPool> {
+    std::sync::Arc::new(crate::buffer_pool::StagingPool::new(device))
+}
+
+#[cfg(target_os = "macos")]
 fn submit_dense(
     runtime: &MetalRuntime,
     plans: &[MetalDecodePlan],
@@ -560,7 +613,9 @@ fn submit_dense(
     let offsets = (0..plans.len())
         .map(|image| layout.image_offset(image))
         .collect::<Result<Vec<_>, _>>()?;
-    let encoded = crate::encode::encode_dense_into(runtime, plans, output, &offsets)?;
+    let encoded = runtime.stage_timings.time(HostStage::Encode, || {
+        crate::encode::encode_dense_into(runtime, plans, output, &offsets)
+    })?;
     let reports: Vec<_> = plans.iter().map(|plan| plan.decode_report(false)).collect();
     let submissions = encoded
         .into_iter()
@@ -576,7 +631,9 @@ fn append_batch_group(
     plans: &[MetalDecodePlan],
     submissions: &mut Vec<MetalSubmission>,
 ) -> Result<(), MetalError> {
-    let encoded = crate::encode::encode_batch(runtime, plans)?;
+    let encoded = runtime.stage_timings.time(HostStage::Encode, || {
+        crate::encode::encode_batch(runtime, plans)
+    })?;
     submissions.extend(
         encoded
             .into_iter()
@@ -594,13 +651,16 @@ fn append_host_batch_group(
 ) -> Result<(), MetalError> {
     let mut shared = Vec::with_capacity(plans.len());
     append_shared_batch_group(runtime, plans, &mut shared)?;
-    for (plan, image) in plans.iter().zip(shared) {
-        // Convert straight from the mapped shared allocation: one copy into
-        // the typed owner instead of a byte copy followed by a typed copy.
-        let samples = image.with_bytes(|bytes| decoded_samples(plan.output().format, bytes))??;
-        decoded.push(decoded_image(plan, samples)?);
-    }
-    Ok(())
+    runtime.stage_timings.time(HostStage::Readback, || {
+        for (plan, image) in plans.iter().zip(shared) {
+            // Convert straight from the mapped shared allocation: one copy into
+            // the typed owner instead of a byte copy followed by a typed copy.
+            let samples =
+                image.with_bytes(|bytes| decoded_samples(plan.output().format, bytes))??;
+            decoded.push(decoded_image(plan, samples)?);
+        }
+        Ok(())
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -609,19 +669,22 @@ fn append_shared_batch_group(
     plans: &[MetalDecodePlan],
     images: &mut Vec<SharedMetalImage>,
 ) -> Result<(), MetalError> {
-    let outputs = plans
-        .iter()
-        .map(|plan| {
-            runtime
-                .buffer_pools
-                .take_shared(&runtime.queue.device(), plan.output().byte_len)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let handles = outputs
-        .iter()
-        .map(crate::buffer_pool::PooledBuffer::handle)
-        .collect::<Vec<_>>();
-    let encoded = crate::encode::encode_batch_into(runtime, plans, &handles)?;
+    let (outputs, encoded) = runtime.stage_timings.time(HostStage::Encode, || {
+        let outputs = plans
+            .iter()
+            .map(|plan| {
+                runtime
+                    .buffer_pools
+                    .take_shared(&runtime.queue.device(), plan.output().byte_len)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let handles = outputs
+            .iter()
+            .map(crate::buffer_pool::PooledBuffer::handle)
+            .collect::<Vec<_>>();
+        let encoded = crate::encode::encode_batch_into(runtime, plans, &handles)?;
+        Ok::<_, MetalError>((outputs, encoded))
+    })?;
     let submissions = encoded
         .into_iter()
         .zip(plans)

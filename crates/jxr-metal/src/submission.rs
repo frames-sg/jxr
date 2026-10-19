@@ -27,9 +27,12 @@ struct PendingMetal {
     layout: jxr_core::SurfaceLayout,
     report: jxr_core::DecodeReport,
     uploads: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    staging: Vec<std::sync::Arc<crate::coefficient_staging::StagingAllocation>>,
     private_scratch: Vec<crate::buffer_pool::PooledBuffer>,
     shared_scratch: Vec<crate::buffer_pool::PooledBuffer>,
     buffer_pools: std::rc::Rc<crate::buffer_pool::MetalBufferPools>,
+    stage_timings: std::rc::Rc<crate::stage_timing::StageTimings>,
+    owns_command: bool,
     completion_event: Retained<ProtocolObject<dyn MTLEvent>>,
 }
 
@@ -272,9 +275,12 @@ impl MetalSubmission {
                 layout: encoded.layout,
                 report,
                 uploads: encoded.uploads,
+                staging: encoded.staging,
                 private_scratch: encoded.private_scratch,
                 shared_scratch: encoded.shared_scratch,
                 buffer_pools: encoded.buffer_pools,
+                stage_timings: encoded.stage_timings,
+                owns_command: encoded.owns_command,
                 completion_event: encoded.completion_event,
             }),
         }
@@ -351,7 +357,7 @@ impl MetalSubmission {
                     expected: "submitted",
                     actual: "completed",
                 })?;
-            j2k_metal_support::wait_for_completion(&pending.command)?;
+            wait_recorded(&pending)?;
             // SAFETY: Waiting the owning submission establishes completion of
             // every shader write to this shared status allocation.
             let status = unsafe {
@@ -381,16 +387,29 @@ impl Drop for MetalSubmission {
     fn drop(&mut self) {
         #[cfg(target_os = "macos")]
         if let Some(mut pending) = self.pending.take() {
-            let _ = j2k_metal_support::wait_for_completion(&pending.command);
+            let _ = wait_recorded(&pending);
             let _ = recycle_scratch(&mut pending);
         }
     }
 }
 
 #[cfg(target_os = "macos")]
+fn wait_recorded(pending: &PendingMetal) -> Result<(), MetalError> {
+    let start = std::time::Instant::now();
+    let result = j2k_metal_support::wait_for_completion(&pending.command);
+    pending.stage_timings.record_wait(
+        start.elapsed(),
+        pending.owns_command.then_some(&*pending.command),
+    );
+    result.map_err(MetalError::from)
+}
+
+#[cfg(target_os = "macos")]
 fn recycle_scratch(pending: &mut PendingMetal) -> Result<(), MetalError> {
-    // Keep all uploaded coefficient buffers alive through the completion wait.
+    // Keep all uploaded coefficient buffers alive through the completion wait,
+    // then let pooled staging return for reuse.
     let _ = pending.uploads.len();
+    pending.staging.clear();
     for buffer in pending.private_scratch.drain(..) {
         pending.buffer_pools.recycle_private(buffer)?;
     }

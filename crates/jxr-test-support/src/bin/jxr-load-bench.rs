@@ -8,7 +8,7 @@ use std::{
 
 use jxr::{
     AlphaHandling, BackendRequest, DecodeRequest, DecodedImage, JxrView, PixelFormat,
-    metal::MetalDecoderSession,
+    metal::{MetalDecoderSession, MetalStageDiagnostics},
 };
 use jxr_test_support::{TimingSummary, checksum_samples, oracle_format, summarize_timings};
 
@@ -33,6 +33,23 @@ struct Workload {
 struct RouteMeasurements {
     first: Duration,
     warm: TimingSummary,
+}
+
+/// One Metal decode split into CPU preparation and the session's stage counters.
+#[derive(Clone, Copy)]
+struct MetalStageSample {
+    total: Duration,
+    stages: MetalStageDiagnostics,
+}
+
+impl MetalStageSample {
+    /// Parse, planning, and CPU entropy: everything outside the session's stages.
+    fn prepare(self) -> Duration {
+        self.total
+            .saturating_sub(self.stages.encode)
+            .saturating_sub(self.stages.wait)
+            .saturating_sub(self.stages.readback)
+    }
 }
 
 fn main() {
@@ -111,6 +128,7 @@ fn benchmark_workload(
 
     let mut cpu_samples = Vec::with_capacity(options.iterations);
     let mut metal_samples = Vec::with_capacity(options.iterations);
+    let mut metal_stages = Vec::with_capacity(options.iterations);
     for iteration in 0..options.iterations {
         if iteration % 2 == 0 {
             measure_cpu(workload, &cpu_request, expected_checksum, &mut cpu_samples)?;
@@ -120,6 +138,7 @@ fn benchmark_workload(
                 session,
                 expected_checksum,
                 &mut metal_samples,
+                &mut metal_stages,
             )?;
         } else {
             measure_metal(
@@ -128,6 +147,7 @@ fn benchmark_workload(
                 session,
                 expected_checksum,
                 &mut metal_samples,
+                &mut metal_stages,
             )?;
             measure_cpu(workload, &cpu_request, expected_checksum, &mut cpu_samples)?;
         }
@@ -142,6 +162,7 @@ fn benchmark_workload(
         warm: summarize_timings(&metal_samples).ok_or("Metal timing sample was empty")?,
     };
     print_result(workload, &cpu_first, expected_checksum, &cpu, &metal);
+    print_metal_stages(&metal_stages)?;
     Ok(())
 }
 
@@ -162,8 +183,14 @@ fn measure_metal(
     session: &MetalDecoderSession,
     expected_checksum: u64,
     samples: &mut Vec<Duration>,
+    stages: &mut Vec<MetalStageSample>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let before = session.stage_diagnostics()?;
     let (decoded, elapsed) = time_decode_metal(&workload.source, request, session)?;
+    stages.push(MetalStageSample {
+        total: elapsed,
+        stages: session.stage_diagnostics()?.since(before),
+    });
     samples.push(elapsed);
     verify_checksum(&decoded, expected_checksum)
 }
@@ -257,6 +284,23 @@ fn print_result(
     print_route("CPU", cpu, workload.width, workload.height);
     print_route("Metal", metal, workload.width, workload.height);
     println!("winner: {winner}; Metal speedup at median: {speedup:.2}x");
+}
+
+fn print_metal_stages(samples: &[MetalStageSample]) -> Result<(), Box<dyn std::error::Error>> {
+    let median = |stage: fn(&MetalStageSample) -> Duration| {
+        summarize_timings(&samples.iter().map(stage).collect::<Vec<_>>())
+            .map(|summary| milliseconds(summary.median))
+            .ok_or("Metal stage sample was empty")
+    };
+    println!(
+        "  Metal stage medians: prepare {:.3} | encode/submit {:.3} | wait {:.3} (GPU {:.3}) | readback {:.3} ms",
+        median(|sample| sample.prepare())?,
+        median(|sample| sample.stages.encode)?,
+        median(|sample| sample.stages.wait)?,
+        median(|sample| sample.stages.gpu)?,
+        median(|sample| sample.stages.readback)?,
+    );
+    Ok(())
 }
 
 fn print_route(label: &str, measurements: &RouteMeasurements, width: u32, height: u32) {

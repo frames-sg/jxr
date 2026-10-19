@@ -25,6 +25,7 @@ use crate::{
 };
 
 struct BatchBuffers {
+    staging: Vec<super::StagingLease>,
     packed: BufferHandle,
     macroblocks: BufferHandle,
     planes: BufferHandle,
@@ -37,6 +38,7 @@ struct BatchBuffers {
 }
 
 struct BatchDescriptors {
+    staging: Vec<super::StagingLease>,
     packed: BufferHandle,
     macroblocks: BufferHandle,
     planes: BufferHandle,
@@ -151,6 +153,7 @@ fn build_buffers(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(BatchBuffers {
+        staging: descriptors.staging,
         packed: descriptors.packed,
         macroblocks: descriptors.macroblocks,
         planes: descriptors.planes,
@@ -187,6 +190,7 @@ fn build_descriptors(
         MetalCoefficientSource::Cpu(_) => None,
         MetalCoefficientSource::Shared(arena) => Some(arena.buffer_handle()),
     };
+    let mut staging = Vec::new();
     let mut macroblocks = Vec::new();
     let mut plane_inputs = Vec::with_capacity(plans.len());
     let mut plane_abis = Vec::new();
@@ -204,6 +208,7 @@ fn build_descriptors(
                 base
             }
             MetalCoefficientSource::Shared(coefficients) => {
+                staging.push(coefficients.lease());
                 u32::try_from(coefficients.element_offset())
                     .map_err(|_| invalid("shared coefficient offset exceeds u32"))?
             }
@@ -257,6 +262,7 @@ fn build_descriptors(
         None => checked_shared_buffer_with_slice(device, &packed)?,
     };
     Ok(BatchDescriptors {
+        staging,
         packed,
         macroblocks: checked_shared_buffer_with_slice(device, &macroblocks)?,
         planes: checked_shared_buffer_with_slice(device, &plane_abis)?,
@@ -485,6 +491,11 @@ fn finish_batch(
             } else {
                 Vec::new()
             },
+            staging: if index == 0 {
+                core::mem::take(&mut buffers.staging)
+            } else {
+                Vec::new()
+            },
             private_scratch: if index == 0 {
                 vec![
                     low.take().expect("first batch output owns low scratch"),
@@ -497,6 +508,8 @@ fn finish_batch(
             },
             shared_scratch: status_owner.take().into_iter().collect(),
             buffer_pools: runtime.buffer_pools.clone(),
+            stage_timings: runtime.stage_timings.clone(),
+            owns_command: index == 0,
             completion_event: completion_event.clone(),
         })
         .collect()

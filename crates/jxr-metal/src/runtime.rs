@@ -36,6 +36,7 @@ pub(crate) struct MetalRuntime {
     pub(crate) batch_queues: Vec<Retained<ProtocolObject<dyn MTLCommandQueue>>>,
     pub(crate) buffer_pools: Rc<crate::buffer_pool::MetalBufferPools>,
     pub(crate) upload_cache: Rc<crate::upload_cache::CoefficientUploadCache>,
+    pub(crate) stage_timings: Rc<crate::stage_timing::StageTimings>,
     pub(crate) overlap_schedules: crate::overlap_plan::OverlapScheduleCache,
     pub(crate) dequant_transform: Pipeline,
     pub(crate) batch_dequant_transform: Pipeline,
@@ -73,6 +74,7 @@ impl MetalRuntime {
             batch_queues,
             buffer_pools: Rc::new(crate::buffer_pool::MetalBufferPools::new(device)),
             upload_cache: Rc::new(crate::upload_cache::CoefficientUploadCache::new(device)),
+            stage_timings: Rc::default(),
             overlap_schedules: crate::overlap_plan::OverlapScheduleCache::new(),
             dequant_transform: j2k_metal_support::named_pipeline(
                 device,
