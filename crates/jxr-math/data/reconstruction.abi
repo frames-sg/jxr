@@ -1,4 +1,4 @@
-# Canonical reconstruction constants shared by Rust, CUDA C, and Metal.
+# Canonical reconstruction constants shared by Rust, CUDA Oxide, and Metal.
 inverse_permutation = 0,8,4,13,2,15,3,14,1,12,5,9,7,11,6,10
 abi.JxrMacroblockAbi = coefficient_offset:u32,quantizer_dc:u32,quantizer_low_pass:u32,quantizer_high_pass:u32,bands:u32,hp_prediction:u32,coded_x:u32,coded_y:u32
 abi.JxrPlaneAbi = macroblock_offset:u32,macroblock_count:u32,block_columns:u32,block_rows:u32,macroblock_origin_x:u32,macroblock_origin_y:u32,low_offset:u32,low_width:u32,sample_offset:u32,sample_width:u32,sample_height:u32,scale_after_first_transform:u32

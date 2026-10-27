@@ -87,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 For CUDA, replace the session with `jxr::cuda::CudaDecoderSession::new(0)?`
 (device 0), attach it with `with_cuda_session(&session)`, and request
-`BackendRequest::Cuda`. The CUDA Driver API and NVRTC bindings load at runtime.
+`BackendRequest::Cuda`. The CUDA driver loads embedded CUDA Oxide PTX at runtime.
 Enabling a feature alone does not attach a session. Keep the session alive for
 as long as the decoder borrows it.
 
@@ -146,10 +146,10 @@ container writer does not accept decoded pixels or synthesize entropy syntax.
 
 `jxr-math` is `no_std` and owns checked integer transforms, overlap operators,
 dequantization, HP prediction, interpolation, color, alpha, and RGBE arithmetic.
-Metal uses backend-local MSL and CUDA uses backend-local CUDA C compiled through
-NVRTC; their current
-HP phase consumes compact CPU-selected directions and resolves prediction with
-race-free per-block prefix sums before dequantization. Transform constants and
+Metal uses backend-local MSL. CUDA uses Rust kernels compiled by CUDA Oxide,
+calling the shared Rust transforms and overlap filters directly. The HP phase
+consumes compact CPU-selected directions and resolves prediction within each
+macroblock before dequantization. Transform constants and
 parameter indices are generated from `data/reconstruction.abi`, which also
 generates the Rust bindings used by both device encoders. All accelerator
 manifests describe the complete packaged Main-profile pipeline.

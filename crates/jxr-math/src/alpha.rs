@@ -5,19 +5,21 @@ use crate::arithmetic::MathError;
 /// Premultiply an unsigned channel with nearest rounding.
 pub fn premultiply_unsigned(value: u32, alpha: u32, maximum: u32) -> Result<u32, MathError> {
     if maximum == 0 {
-        return Err(MathError::overflow("zero alpha normalization range"));
+        return Err(crate::arithmetic::overflow(
+            "zero alpha normalization range",
+        ));
     }
     let value = value.min(maximum);
     let alpha = alpha.min(maximum);
     let product = u64::from(value) * u64::from(alpha);
     u32::try_from((product + u64::from(maximum / 2)) / u64::from(maximum))
-        .map_err(|_| MathError::overflow("unsigned alpha premultiplication"))
+        .map_err(|_| crate::arithmetic::overflow("unsigned alpha premultiplication"))
 }
 
 /// Premultiply a signed channel by a nonnegative signed alpha channel.
 pub fn premultiply_signed(value: i32, alpha: i32, alpha_maximum: i32) -> Result<i32, MathError> {
     if alpha_maximum <= 0 {
-        return Err(MathError::overflow(
+        return Err(crate::arithmetic::overflow(
             "invalid signed alpha normalization range",
         ));
     }
@@ -27,9 +29,9 @@ pub fn premultiply_signed(value: i32, alpha: i32, alpha_maximum: i32) -> Result<
     let maximum = u64::try_from(alpha_maximum).expect("validated alpha maximum is positive");
     let magnitude = (product + maximum / 2) / maximum;
     let signed = i64::try_from(magnitude)
-        .map_err(|_| MathError::overflow("signed alpha premultiplication"))?;
+        .map_err(|_| crate::arithmetic::overflow("signed alpha premultiplication"))?;
     let signed = if value < 0 { -signed } else { signed };
-    i32::try_from(signed).map_err(|_| MathError::overflow("signed alpha premultiplication"))
+    i32::try_from(signed).map_err(|_| crate::arithmetic::overflow("signed alpha premultiplication"))
 }
 
 /// Premultiply one T.832 BD16F sign-magnitude value by another used as alpha.

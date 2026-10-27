@@ -15,6 +15,8 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == 'jcwal1516' && github.triggering_actor == 'jcwal1516' }}
     runs-on: [self-hosted, Linux, X64, cuda]
     timeout-minutes: 180
+    env:
+      JXR_REQUIRE_CUDA_OXIDE: "1"
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -22,7 +24,7 @@ jobs:
         run: |
           mkdir -p target/t834-conformance/reports
           nvidia-smi | tee target/t834-conformance/reports/nvidia-smi.txt
-          nvcc --version | tee target/t834-conformance/reports/nvcc-version.txt
+          cargo oxide --version | tee target/t834-conformance/reports/cuda-oxide-version.txt
       - name: Install Rust checks
         run: rustup component add rustfmt clippy
       - name: Prepare T.834 vectors
@@ -30,7 +32,9 @@ jobs:
       - name: Build T.835 oracle
         run: tools/t835-oracle/build.sh
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all -- --check
+          rustfmt --edition 2024 --check crates/jxr-cuda/src/kernels/main.rs
       - name: Lint all targets and features
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Compile CUDA backend without static toolkit linkage
@@ -38,7 +42,9 @@ jobs:
       - name: Test full workspace
         run: cargo test --workspace --all-features
       - name: Run ignored CUDA lifecycle and differential tests
-        run: cargo test -p jxr --features cuda --test cuda_contracts -- --ignored --test-threads=1
+        run: |
+          cargo test -p jxr-cuda --lib -- --ignored --test-threads=1
+          cargo test -p jxr --features cuda --test cuda_contracts -- --ignored --test-threads=1
       - name: Differentially test the full CUDA corpus and ROI boundaries against CPU
         run: cargo test -p jxr-test-support --features cuda --test cuda_hardware -- --ignored --test-threads=1
       - name: Run complete CUDA T.834/T.835 conformance
@@ -65,7 +71,7 @@ jobs:
           name: jpeg-xr-cuda-hardware-reports
           path: |
             target/t834-conformance/reports/nvidia-smi.txt
-            target/t834-conformance/reports/nvcc-version.txt
+            target/t834-conformance/reports/cuda-oxide-version.txt
             target/t834-conformance/reports/ci-cuda.tsv
             target/t834-conformance/reports/cuda-pathology-bench.tsv
           if-no-files-found: warn

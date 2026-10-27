@@ -3,10 +3,12 @@ name = "jxr-math"
 description = "Exact integer building blocks for JPEG XR decoding"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Shared device code must support CUDA Oxide's pinned compiler.
+rust-version = "1.96"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+links = "jxr_math"
 
 [lints]
 workspace = true

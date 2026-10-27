@@ -28,14 +28,14 @@ impl core::fmt::Debug for CudaDecoderSession {
 }
 
 impl CudaDecoderSession {
-    /// Probe for both dynamically loaded CUDA driver and NVRTC libraries.
+    /// Probe for compiled CUDA Oxide kernels and the dynamically loaded CUDA driver.
     ///
     /// This performs no CUDA initialization and is safe on CPU-only hosts.
     #[must_use]
     pub fn is_available() -> bool {
         // SAFETY: These cudarc probes only attempt to open candidate shared
         // libraries and do not retain or dereference foreign handles.
-        unsafe { cudarc::driver::sys::is_culib_present() && cudarc::nvrtc::sys::is_culib_present() }
+        cfg!(jxr_cuda_oxide) && unsafe { cudarc::driver::sys::is_culib_present() }
     }
 
     /// Create a reusable session on device ordinal zero.

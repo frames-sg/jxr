@@ -26,7 +26,7 @@ workspace:
   device allocations rather than exposing Metal types or duplicating its
   platform adapter.
 - `jxr-math/data/reconstruction.abi` is the canonical transform permutation and
-  descriptor schema. Its build script now emits both MSL and CUDA C declarations;
+  descriptor schema. Its build script emits MSL and CUDA Oxide Rust descriptors;
   Rust layout assertions keep the host descriptors tied to the same source.
 - Existing tests place scalar math in `jxr-math`, syntax/reconstruction/output
   behavior in `jxr-native`, public routing and batches in `jxr`, and official
@@ -36,8 +36,7 @@ workspace:
 - Regular CI already exercises formatting, workspace Clippy/tests, minimal
   features, strict rustdoc, and fuzz-package compilation on Linux and macOS.
   Metal hardware validation is a serialized self-hosted workflow. CUDA follows
-  that split: dynamic-loading builds stay in regular CI, while compilation by
-  NVRTC, device execution, the 517-case differential suite, and benchmarks are
+  that split: dynamic-loading builds stay in regular CI, while CUDA Oxide compilation, device execution, the 517-case differential suite, and benchmarks are
   confined to the serialized NVIDIA runner.
 - The existing pathology benchmarks separate preparation, submission,
   synchronization, and readback while checking output checksums. The CUDA
@@ -48,64 +47,50 @@ The Annex-A writer remains outside every accelerator path. It still accepts an
 already encoded codestream and packages metadata and optional encoded alpha; no
 pixel-to-codestream encoder is introduced.
 
-## Dependency decision (September 2026)
+## CUDA Oxide build and runtime
 
-`jxr-cuda` pins `cudarc` 0.19.10 with only `std`, `driver`, `nvrtc`,
-`dynamic-loading`, and the CUDA 11.4 ABI baseline enabled. The decision is based
-on the following primary project and vendor documentation:
+All reconstruction kernels are Rust compiled to PTX by
+[NVIDIA CUDA Oxide](https://github.com/NVlabs/cuda-oxide). The device project
+pins the same CUDA Oxide revision and `nightly-2026-04-03` toolchain used by
+this organization's `j2k` backend. The main workspace retains its existing
+Rust toolchain. `jxr-math` supports the device compiler's Rust 1.96 baseline.
+Transforms and overlap filters call the allocation-free
+`jxr-math` implementation directly; device descriptors are generated from
+`jxr-math/data/reconstruction.abi`. The isolated device build uses numeric
+arithmetic errors, explicit error propagation, and indexed array operations to
+accommodate current CUDA Oxide code-generation limits. Host errors retain their
+operation descriptions.
 
-- [`cudarc` 0.19.10 API documentation](https://docs.rs/cudarc/0.19.10/cudarc/)
-  documents safe context, stream, event, slice, Driver API, and NVRTC wrappers;
-  its dynamic-loading mode requires no CUDA libraries at build time. The project
-  is MIT OR Apache-2.0 and its
-  [release history](https://github.com/chelsea0x3b/cudarc/releases) shows current
-  CUDA 13.x maintenance.
-- [`cust` 0.3.2 documentation](https://docs.rs/cust/0.3.2/cust/) describes a
-  capable Driver API wrapper, but requires CUDA development libraries on the
-  build system. The upstream
-  [Rust-CUDA README](https://github.com/Rust-GPU/rust-cuda/blob/main/README.md)
-  also characterizes the rebooted project as early development with expected
-  bugs and safety issues. Its Rust-device toolchain would add nightly/LLVM and
-  build-time CUDA requirements that conflict with this workspace's portable
-  all-feature checks.
-- The original
-  [RustaCUDA repository](https://github.com/bheisler/RustaCUDA) is no longer the
-  maintained direction; its ecosystem moved toward `cust`/Rust-CUDA.
-- NVIDIA documents NVRTC as the supported in-process CUDA C++ to PTX boundary
-  and states that its PTX can be loaded through the Driver API
-  ([NVRTC guide](https://docs.nvidia.com/cuda/nvrtc/)). NVIDIA also defines
-  streams and events as the core asynchronous execution primitives
-  ([CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/asynchronous-execution.html))
-  and documents stream-ordered allocation and memory-pool capability discovery
-  in the
-  [Driver API](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MALLOC__ASYNC.html).
+On Linux, install the pinned CUDA Oxide compiler and its documented build
+prerequisites before building an executable CUDA backend. This includes a
+working libclang and its builtin headers; custom installations may require
+`LIBCLANG_PATH`, `LD_LIBRARY_PATH`, and `BINDGEN_EXTRA_CLANG_ARGS`.
+The build script
+stages its standalone device project under `OUT_DIR`, invokes
+`cargo oxide build --arch sm_50 --no-fmad`, and embeds the resulting PTX.
+`JXR_CUDA_OXIDE_ARCH` selects another target architecture. Compiler failures
+are build errors; no CUDA C implementation is retained.
 
-The selected dependency adds no codec, image, neural-network, BLAS, or CUDA
-Runtime API layer. Disabling default `cudarc` features avoids cuBLAS, cuDNN,
-cuRAND, and their transitive/runtime surfaces. The lockfile adds `cudarc`,
-ISC-licensed `libloading`, `cfg-if`, and the Windows loader shim; every license
-is compatible with distribution under this workspace's terms. This keeps
-compile time and binary surface substantially smaller than a general GPU
-framework.
+```sh
+JXR_REQUIRE_CUDA_OXIDE=1 cargo test -p jxr --features cuda --test cuda_contracts -- --ignored --test-threads=1
+JXR_REQUIRE_CUDA_OXIDE=1 cargo test -p jxr-test-support --features cuda --test cuda_hardware -- --ignored --test-threads=1
+```
 
-Maintenance risk remains concentrated in one FFI wrapper and NVIDIA's Driver
-API/NVRTC compatibility. The version is pinned so an upstream ABI or safety
-change cannot silently alter builds. The dependency's dual license matches the
-workspace. Runtime loader failures and missing symbols become explicit session
-initialization errors; CPU-only builds and ordinary `jxr` builds do not link,
-load, or probe CUDA.
+For builds without the compiler, including cross-platform CI, the Rust
+adapter and its device-free contracts still compile, but
+`CudaDecoderSession::is_available()` returns false. Set
+`JXR_REQUIRE_CUDA_OXIDE=1` in hardware CI to make missing compiler support an
+error. Alternatively, `JXR_CUDA_OXIDE_PTX=/absolute/path/jxr_reconstruction.ptx`
+embeds a previously compiled module, without invoking the device compiler.
+The PTX target must be compatible with the deployment GPU.
 
-Enabling the feature embeds CUDA C source and compiles the small Rust/FFI
-adapter, but runs neither `nvcc` nor NVRTC at build time. Creating a session
-does incur one NVRTC compile and one Driver API module load for that device;
-cloning and reusing the session amortizes that startup cost. Linux and Windows
-use the NVIDIA libraries found by the platform loader, while macOS can compile
-the Rust feature but reports CUDA unavailable at runtime. Dynamic loading keeps
-the toolkit out of CPU deployments, but inherits the operating system's library
-search-path trust boundary: production processes must not search user-writable
-directories for `cuda`/`nvcuda` or `nvrtc`. Unsafe FFI representation is kept in
-the focused backend and `cudarc`; checked Rust constructors validate buffer
-extents, contexts, ABI widths, and kernel indexing metadata before submission.
+`cudarc` 0.19.10 supplies dynamically loaded Driver API contexts, streams,
+events, allocations, and launches. Its `nvrtc` Cargo feature remains enabled
+because this version gates its `Ptx` container and `load_module` method behind
+that feature. JXR never invokes NVRTC or loads its library. Session creation
+loads the embedded Rust-generated PTX through the CUDA driver; it performs no
+source compilation. Deployment requires the NVIDIA driver, not NVRTC or the
+CUDA Oxide compiler. The default target requires compute capability 5.0.
 
 ## Architecture and semantics
 
@@ -125,7 +110,7 @@ ABI offset before allocation or submission. Five ordered phases implement:
 5. chroma reconstruction, color conversion, alpha handling, crop, clipping, and
    typed or packed output storage.
 
-CUDA C kernels and Rust descriptors are generated from the same canonical ABI
+CUDA Oxide kernels and host descriptors follow the same canonical ABI
 schema used by Metal. Checked 64-bit intermediates set a device status word on
 any operation that would exceed the scalar `i32` contract. That status is read
 only after the completion event; it is never converted into a CPU retry.
@@ -158,7 +143,7 @@ submission is likewise returned to the caller and is never retried on CPU.
 The regular CI matrix compiles and lints the CUDA feature on CPU-only Linux and
 macOS hosts through dynamic loading. `.github/workflows/cuda-hardware.yml` is a
 serialized, manually dispatched self-hosted NVIDIA workflow. It records the GPU
-and toolkit, runs ignored lifecycle/destination tests, differentially compares
+and CUDA Oxide version, runs ignored lifecycle/destination tests, differentially compares
 all 517 in-scope T.834 cases and ROI boundary variants with CPU, compares the
 complete suite with T.835, and retains reports.
 

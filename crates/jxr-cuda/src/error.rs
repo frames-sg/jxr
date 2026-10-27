@@ -6,7 +6,7 @@ use jxr_core::BackendRequest;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CudaError {
-    /// The CUDA driver or NVRTC runtime is unavailable on this host.
+    /// The CUDA driver or compiled CUDA Oxide kernels are unavailable.
     #[error("CUDA is unavailable on this host")]
     Unavailable,
     /// The selected NVIDIA device does not meet the backend baseline.
@@ -42,10 +42,10 @@ pub enum CudaError {
         /// Stable description of the rejected representation.
         reason: &'static str,
     },
-    /// Runtime kernel compilation or module creation failed.
+    /// Device module creation failed.
     #[error("CUDA pipeline initialization failed: {message}")]
     RuntimeInitialization {
-        /// NVRTC or driver diagnostic.
+        /// CUDA driver diagnostic.
         message: String,
     },
     /// Checked device arithmetic exceeded the scalar contract.

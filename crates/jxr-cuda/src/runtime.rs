@@ -8,7 +8,7 @@ use std::{
 
 use cudarc::{
     driver::{CudaContext, CudaFunction, CudaModule, CudaStream},
-    nvrtc::{CompileOptions, compile_ptx_with_opts},
+    nvrtc::Ptx,
 };
 
 use crate::{CudaError, buffer_pool::CudaBufferPool, kernels, upload_cache::CudaUploadCache};
@@ -59,32 +59,17 @@ impl CudaRuntime {
 
     fn build_inner(device_ordinal: usize) -> Result<Arc<Self>, CudaError> {
         let context = CudaContext::new(device_ordinal)?;
-        let (major, minor) = context.compute_capability()?;
+        let (major, _) = context.compute_capability()?;
         if major < 5 {
             return Err(CudaError::UnsupportedDevice {
                 reason: "JPEG XR CUDA reconstruction requires compute capability 5.0 or newer",
             });
         }
-        let mut options = CompileOptions {
-            fmad: Some(false),
-            name: Some("jxr_reconstruction.cu".to_owned()),
-            ..CompileOptions::default()
-        };
-        options.options.push("--std=c++17".to_owned());
-        options
-            .options
-            .push(format!("--gpu-architecture=compute_{major}{minor}"));
-        let compiled = compile_ptx_with_opts(kernels::source(), options).map_err(|error| {
-            CudaError::RuntimeInitialization {
+        let module = context
+            .load_module(Ptx::from_src(kernels::PTX))
+            .map_err(|error| CudaError::RuntimeInitialization {
                 message: error.to_string(),
-            }
-        })?;
-        let module =
-            context
-                .load_module(compiled)
-                .map_err(|error| CudaError::RuntimeInitialization {
-                    message: error.to_string(),
-                })?;
+            })?;
         let mut functions = HashMap::with_capacity(ENTRYPOINTS.len());
         for entrypoint in ENTRYPOINTS {
             let function = module.load_function(entrypoint).map_err(|error| {

@@ -194,7 +194,7 @@ buffers, caller-owned destinations, and batches.
 | --- | --- | --- |
 | CPU | Default; no features needed | No GPU runtime |
 | Metal | `cargo add jxr --features metal` | Apple-silicon macOS (M1 or newer) |
-| CUDA | `cargo add jxr --features cuda` | Compatible NVIDIA GPU, driver, and NVRTC; hardware validation currently covers Linux |
+| CUDA | `cargo add jxr --features cuda` | Compatible NVIDIA GPU and driver; CUDA Oxide kernels built on Linux (see guide) |
 
 For single-image GPU decoding, attach a reusable session to the decoder;
 enabling a feature alone does not attach one. See the
