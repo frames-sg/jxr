@@ -14,6 +14,28 @@ use super::{CudaDecodePlan, build_arenas};
 use crate::CudaError;
 
 #[test]
+#[ignore = "requires compiled CUDA Oxide kernels and an NVIDIA GPU"]
+fn device_overflow_is_reported_and_does_not_poison_the_next_submission() {
+    let session = crate::CudaDecoderSession::system_default().unwrap();
+    let mut arena = luma_arena(&[(0, 0)]);
+    let input = Arc::get_mut(&mut arena).unwrap();
+    input.coefficients[0] = i32::MAX;
+    input.macroblocks.quantizers[0].dc = 2;
+    let prepared = prepared_plan(1, 1);
+    let plan = cuda_plan(arena, &prepared).unwrap();
+    assert!(matches!(
+        session.decode_to_host(&plan),
+        Err(CudaError::KernelArithmetic { status: 1 })
+    ));
+    let valid = cuda_plan(luma_arena(&[(0, 0)]), &prepared).unwrap();
+    let decoded = session.decode_to_host(&valid).unwrap();
+    assert_eq!(
+        decoded.samples,
+        jxr_core::DecodedSamples::U8(vec![128; 256])
+    );
+}
+
+#[test]
 fn rejects_invalid_prediction_before_any_cuda_resource_can_be_created() {
     let mut arena = luma_arena(&[(0, 0)]);
     Arc::get_mut(&mut arena).unwrap().macroblocks.hp_predictions[0] = PredictionMode::FromTopLeft;

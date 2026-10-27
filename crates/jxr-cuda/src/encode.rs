@@ -246,7 +246,7 @@ fn launch_second_transforms(
             launch.launch(LaunchConfig {
                 grid_dim: (abi.macroblock_count, 1, 1),
                 block_dim: (16, 1, 1),
-                shared_mem_bytes: 256 * 4,
+                shared_mem_bytes: 0,
             })?;
         }
     }

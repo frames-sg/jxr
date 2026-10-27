@@ -71,7 +71,7 @@ fn auto_without_an_attached_cuda_session_remains_on_cpu() {
 }
 
 #[test]
-#[ignore = "requires a compatible NVIDIA GPU, CUDA driver, and NVRTC"]
+#[ignore = "requires a compatible NVIDIA GPU, CUDA driver, and compiled CUDA Oxide kernels"]
 fn cuda_submission_resident_readback_and_host_decode_match_cpu() {
     let bytes = decodable_minimal_raw_codestream();
     let view = JxrView::parse(&bytes).unwrap();
@@ -131,7 +131,7 @@ fn cuda_submission_resident_readback_and_host_decode_match_cpu() {
 }
 
 #[test]
-#[ignore = "requires a compatible NVIDIA GPU, CUDA driver, and NVRTC"]
+#[ignore = "requires a compatible NVIDIA GPU, CUDA driver, and compiled CUDA Oxide kernels"]
 fn cuda_dense_batch_and_checked_destination_match_individual_output() {
     let bytes = decodable_minimal_raw_codestream();
     let view = JxrView::parse(&bytes).unwrap();
@@ -162,7 +162,7 @@ fn cuda_dense_batch_and_checked_destination_match_individual_output() {
 }
 
 #[test]
-#[ignore = "requires a compatible NVIDIA GPU, CUDA driver, and NVRTC"]
+#[ignore = "requires a compatible NVIDIA GPU, CUDA driver, and compiled CUDA Oxide kernels"]
 fn high_level_cuda_batch_preserves_native_groups_and_resident_outputs() {
     let source: Arc<[u8]> = decodable_minimal_raw_codestream().into();
     let session = jxr::cuda::CudaDecoderSession::system_default().unwrap();

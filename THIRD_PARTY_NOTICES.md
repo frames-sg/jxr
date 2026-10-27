@@ -9,8 +9,13 @@ must retain the applicable BSD-3-Clause copyright and disclaimer here.
 `fearless_simd` 1.0.0 is used through its safe capability-token API and is
 available under MIT or Apache-2.0 licensing.
 
-`cudarc` 0.19.10 provides dynamically loaded CUDA Driver API and NVRTC bindings
+`cudarc` 0.19.10 provides dynamically loaded CUDA Driver API bindings
 for the optional `jxr-cuda` crate and is available under MIT or Apache-2.0
 licensing. No NVIDIA toolkit code or headers are distributed by this repository.
 Its dynamic loader dependency, `libloading` 0.9.0, is available under the ISC
 license; `cfg-if` and the Windows loader shim are MIT OR Apache-2.0.
+
+CUDA Oxide supplies the Rust device compiler and device/runtime crates used
+only when building the optional CUDA kernels. The pinned upstream revision is
+Apache-2.0 licensed. JXR uses the upstream APIs; no compiler or toolkit sources
+are vendored in this repository.

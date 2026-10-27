@@ -56,7 +56,7 @@ pub(crate) struct JxrPlaneAbi {
 }
 
 // SAFETY: Twelve consecutive u32 fields have the asserted layout and every
-// bit pattern is valid for the matching CUDA C structure.
+// bit pattern is valid for the matching CUDA Oxide structure.
 unsafe impl DeviceRepr for JxrPlaneAbi {}
 // SAFETY: Every field is a u32, so an all-zero value is valid.
 unsafe impl ValidAsZeroBits for JxrPlaneAbi {}

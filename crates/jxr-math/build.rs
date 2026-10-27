@@ -3,6 +3,15 @@ use std::{env, fmt::Write, fs, io, path::PathBuf};
 const INPUT: &str = "data/reconstruction.abi";
 
 fn main() -> io::Result<()> {
+    println!(
+        "cargo::metadata=manifest_dir={}",
+        PathBuf::from(required_env("CARGO_MANIFEST_DIR")?).display()
+    );
+    println!("cargo:rustc-check-cfg=cfg(jxr_math_device)");
+    println!("cargo:rerun-if-env-changed=JXR_MATH_DEVICE");
+    if env::var_os("JXR_MATH_DEVICE").is_some() {
+        println!("cargo:rustc-cfg=jxr_math_device");
+    }
     println!("cargo:rerun-if-changed={INPUT}");
     let source = fs::read_to_string(INPUT)?;
     let permutation = parse_permutation(&source)?;
@@ -61,20 +70,24 @@ fn generate(
     writeln!(generated, "\";")?;
     writeln!(
         generated,
-        "pub const CUDA_RECONSTRUCTION_CONSTANTS: &str = r\""
+        "/// Canonical C-layout descriptors shared with CUDA Oxide kernels."
     )?;
-    writeln!(
-        generated,
-        "__device__ __constant__ unsigned int JXR_INVERSE_PERMUTATION[16] = {{{values}}};"
-    )?;
+    writeln!(generated, "pub mod reconstruction_abi {{")?;
     for abi in abi_structs {
-        writeln!(generated, "struct {} {{", abi.name)?;
+        writeln!(generated, "    /// Generated reconstruction descriptor.")?;
+        writeln!(generated, "    #[repr(C)]")?;
+        writeln!(
+            generated,
+            "    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]"
+        )?;
+        writeln!(generated, "    pub struct {} {{", abi.name)?;
         for field in &abi.fields {
-            writeln!(generated, "    unsigned int {field};")?;
+            writeln!(generated, "        /// Canonical ABI word.")?;
+            writeln!(generated, "        pub {field}: u32,")?;
         }
-        writeln!(generated, "}};")?;
+        writeln!(generated, "    }}")?;
     }
-    writeln!(generated, "\";")?;
+    writeln!(generated, "}}")?;
     Ok(generated)
 }
 

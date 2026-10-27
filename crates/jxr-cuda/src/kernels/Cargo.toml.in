@@ -1,0 +1,12 @@
+[package]
+name = "jxr-cuda-oxide-host"
+version = "0.1.0"
+edition = "2024"
+
+[[package.metadata.cuda-oxide.device-crates]]
+manifest-path = "simt/Cargo.toml"
+ptx-dir = "ptx"
+artifact-name = "jxr_reconstruction"
+
+[workspace]
+resolver = "2"

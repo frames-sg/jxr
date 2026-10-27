@@ -9,9 +9,17 @@ fn quantizer_rejects_zero_and_dequantize_overflow() {
 }
 
 #[test]
-fn cuda_reconstruction_abi_is_generated_from_the_canonical_schema() {
-    let source = jxr_math::tables::CUDA_RECONSTRUCTION_CONSTANTS;
-    assert!(source.contains("JXR_INVERSE_PERMUTATION[16]"));
-    assert!(source.contains("struct JxrMacroblockAbi"));
-    assert!(source.contains("struct JxrOutputAbi"));
+fn reconstruction_descriptors_match_the_canonical_word_layout() {
+    use core::mem::{offset_of, size_of};
+    use jxr_math::tables::{self, reconstruction_abi::*};
+    assert_eq!(
+        size_of::<JxrMacroblockAbi>(),
+        tables::ABI_JXRMACROBLOCKABI_SIZE
+    );
+    assert_eq!(size_of::<JxrPlaneAbi>(), tables::ABI_JXRPLANEABI_SIZE);
+    assert_eq!(size_of::<JxrOutputAbi>(), tables::ABI_JXROUTPUTABI_SIZE);
+    assert_eq!(
+        offset_of!(JxrOutputAbi, reserved0),
+        tables::ABI_JXROUTPUTABI_RESERVED0_OFFSET
+    );
 }

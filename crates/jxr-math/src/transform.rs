@@ -4,34 +4,42 @@ use crate::arithmetic::{MathError, checked_add, checked_mul, checked_sub};
 use crate::tables::INVERSE_PERMUTATION;
 
 /// Apply the reversible JPEG XR 4-by-4 inverse core transform in place.
+#[inline]
 pub fn inverse_core_transform(coefficients: &mut [i32; 16]) -> Result<(), MathError> {
     inverse_permute(coefficients);
-    transform_group(coefficients, [0, 1, 4, 5], |values| t2x2h(values, 1))?;
-    transform_group(coefficients, [2, 3, 6, 7], inverse_todd)?;
-    transform_group(coefficients, [8, 12, 9, 13], inverse_todd)?;
-    transform_group(coefficients, [10, 11, 14, 15], inverse_todd_odd)?;
-    transform_group(coefficients, [0, 3, 12, 15], |values| t2x2h(values, 0))?;
-    transform_group(coefficients, [5, 6, 9, 10], |values| t2x2h(values, 0))?;
-    transform_group(coefficients, [1, 2, 13, 14], |values| t2x2h(values, 0))?;
-    transform_group(coefficients, [4, 7, 8, 11], |values| t2x2h(values, 0))
+    math_try!(transform_group(coefficients, [0, 1, 4, 5], t2x2h_round));
+    math_try!(transform_group(coefficients, [2, 3, 6, 7], inverse_todd));
+    math_try!(transform_group(coefficients, [8, 12, 9, 13], inverse_todd));
+    math_try!(transform_group(
+        coefficients,
+        [10, 11, 14, 15],
+        inverse_todd_odd
+    ));
+    math_try!(transform_group(coefficients, [0, 3, 12, 15], t2x2h_zero));
+    math_try!(transform_group(coefficients, [5, 6, 9, 10], t2x2h_zero));
+    math_try!(transform_group(coefficients, [1, 2, 13, 14], t2x2h_zero));
+    transform_group(coefficients, [4, 7, 8, 11], t2x2h_zero)
 }
 
 /// Apply the four-value inverse Hadamard lifting operator used by transforms and postfilters.
+#[inline]
 pub fn inverse_hadamard_2x2(values: &mut [i32; 4], rounding: i32) -> Result<(), MathError> {
     t2x2h(values, rounding)
 }
 
 /// Apply the first-level inverse transform for one YUV 4:2:0 chroma macroblock.
+#[inline]
 pub fn inverse_chroma_420(coefficients: &mut [i32; 4]) -> Result<(), MathError> {
-    t2x2h(coefficients, 0)?;
-    coefficients.swap(1, 2);
+    math_try!(t2x2h(coefficients, 0));
+    [coefficients[1], coefficients[2]] = [coefficients[2], coefficients[1]];
     Ok(())
 }
 
 /// Apply the first-level inverse transform for one YUV 4:2:2 chroma macroblock.
+#[inline]
 pub fn inverse_chroma_422(coefficients: &mut [i32; 8]) -> Result<(), MathError> {
     let mut pair = [coefficients[0], coefficients[4]];
-    inverse_t2pt(&mut pair)?;
+    math_try!(inverse_t2pt(&mut pair));
     coefficients[0] = pair[0];
     coefficients[4] = pair[1];
 
@@ -41,9 +49,9 @@ pub fn inverse_chroma_422(coefficients: &mut [i32; 8]) -> Result<(), MathError> 
         coefficients[2],
         coefficients[3],
     ];
-    t2x2h(&mut first, 0)?;
+    math_try!(t2x2h(&mut first, 0));
     coefficients[..4].copy_from_slice(&first);
-    coefficients.swap(1, 2);
+    [coefficients[1], coefficients[2]] = [coefficients[2], coefficients[1]];
 
     let mut second = [
         coefficients[4],
@@ -51,90 +59,163 @@ pub fn inverse_chroma_422(coefficients: &mut [i32; 8]) -> Result<(), MathError> 
         coefficients[5],
         coefficients[7],
     ];
-    t2x2h(&mut second, 0)?;
+    math_try!(t2x2h(&mut second, 0));
     coefficients[4] = second[0];
     coefficients[6] = second[1];
     coefficients[5] = second[2];
     coefficients[7] = second[3];
-    coefficients.swap(5, 6);
+    [coefficients[5], coefficients[6]] = [coefficients[6], coefficients[5]];
     Ok(())
 }
 
+#[inline]
 fn inverse_t2pt(values: &mut [i32; 2]) -> Result<(), MathError> {
-    values[0] = checked_sub(values[0], checked_add(values[1], 1)? >> 1)?;
-    values[1] = checked_add(values[1], values[0])?;
+    values[0] = math_try!(checked_sub(
+        values[0],
+        math_try!(checked_add(values[1], 1)) >> 1
+    ));
+    values[1] = math_try!(checked_add(values[1], values[0]));
     Ok(())
 }
 
+#[inline]
 fn transform_group(
     coefficients: &mut [i32; 16],
     indices: [usize; 4],
     operation: impl FnOnce(&mut [i32; 4]) -> Result<(), MathError>,
 ) -> Result<(), MathError> {
-    let mut values = indices.map(|index| coefficients[index]);
-    operation(&mut values)?;
-    for (index, value) in indices.into_iter().zip(values) {
-        coefficients[index] = value;
+    let mut values = [
+        coefficients[indices[0]],
+        coefficients[indices[1]],
+        coefficients[indices[2]],
+        coefficients[indices[3]],
+    ];
+    math_try!(operation(&mut values));
+    for i in 0..4 {
+        coefficients[indices[i]] = values[i];
     }
     Ok(())
 }
 
+#[inline]
 fn inverse_permute(coefficients: &mut [i32; 16]) {
     let input = *coefficients;
-    for (source, destination) in INVERSE_PERMUTATION.into_iter().enumerate() {
-        coefficients[destination] = input[source];
-    }
+    // Constant subscripts let CUDA Oxide keep the permutation and temporary
+    // blocks in registers instead of materializing per-thread stack arrays.
+    coefficients[INVERSE_PERMUTATION[0]] = input[0];
+    coefficients[INVERSE_PERMUTATION[1]] = input[1];
+    coefficients[INVERSE_PERMUTATION[2]] = input[2];
+    coefficients[INVERSE_PERMUTATION[3]] = input[3];
+    coefficients[INVERSE_PERMUTATION[4]] = input[4];
+    coefficients[INVERSE_PERMUTATION[5]] = input[5];
+    coefficients[INVERSE_PERMUTATION[6]] = input[6];
+    coefficients[INVERSE_PERMUTATION[7]] = input[7];
+    coefficients[INVERSE_PERMUTATION[8]] = input[8];
+    coefficients[INVERSE_PERMUTATION[9]] = input[9];
+    coefficients[INVERSE_PERMUTATION[10]] = input[10];
+    coefficients[INVERSE_PERMUTATION[11]] = input[11];
+    coefficients[INVERSE_PERMUTATION[12]] = input[12];
+    coefficients[INVERSE_PERMUTATION[13]] = input[13];
+    coefficients[INVERSE_PERMUTATION[14]] = input[14];
+    coefficients[INVERSE_PERMUTATION[15]] = input[15];
 }
 
+#[inline]
+fn t2x2h_round(values: &mut [i32; 4]) -> Result<(), MathError> {
+    t2x2h(values, 1)
+}
+
+#[inline]
+fn t2x2h_zero(values: &mut [i32; 4]) -> Result<(), MathError> {
+    t2x2h(values, 0)
+}
+
+#[inline]
 fn t2x2h(values: &mut [i32; 4], rounding: i32) -> Result<(), MathError> {
-    values[0] = checked_add(values[0], values[3])?;
-    values[1] = checked_sub(values[1], values[2])?;
-    let difference = checked_sub(values[0], values[1])?;
-    let first = checked_add(difference, rounding)? >> 1;
+    values[0] = math_try!(checked_add(values[0], values[3]));
+    values[1] = math_try!(checked_sub(values[1], values[2]));
+    let difference = math_try!(checked_sub(values[0], values[1]));
+    let first = math_try!(checked_add(difference, rounding)) >> 1;
     let second = values[2];
-    values[2] = checked_sub(first, values[3])?;
-    values[3] = checked_sub(first, second)?;
-    values[0] = checked_sub(values[0], values[3])?;
-    values[1] = checked_add(values[1], values[2])?;
+    values[2] = math_try!(checked_sub(first, values[3]));
+    values[3] = math_try!(checked_sub(first, second));
+    values[0] = math_try!(checked_sub(values[0], values[3]));
+    values[1] = math_try!(checked_add(values[1], values[2]));
     Ok(())
 }
 
+#[inline]
 fn inverse_todd(values: &mut [i32; 4]) -> Result<(), MathError> {
-    values[1] = checked_add(values[1], values[3])?;
-    values[0] = checked_sub(values[0], values[2])?;
-    values[3] = checked_sub(values[3], values[1] >> 1)?;
-    values[2] = checked_add(values[2], checked_add(values[0], 1)? >> 1)?;
-    values[0] = checked_sub(values[0], checked_add(checked_mul(values[1], 3)?, 4)? >> 3)?;
-    values[1] = checked_add(values[1], checked_add(checked_mul(values[0], 3)?, 4)? >> 3)?;
-    values[2] = checked_sub(values[2], checked_add(checked_mul(values[3], 3)?, 4)? >> 3)?;
-    values[3] = checked_add(values[3], checked_add(checked_mul(values[2], 3)?, 4)? >> 3)?;
-    values[2] = checked_sub(values[2], checked_add(values[1], 1)? >> 1)?;
-    values[3] = checked_sub(checked_add(values[0], 1)? >> 1, values[3])?;
-    values[1] = checked_add(values[1], values[2])?;
-    values[0] = checked_sub(values[0], values[3])?;
+    values[1] = math_try!(checked_add(values[1], values[3]));
+    values[0] = math_try!(checked_sub(values[0], values[2]));
+    values[3] = math_try!(checked_sub(values[3], values[1] >> 1));
+    values[2] = math_try!(checked_add(
+        values[2],
+        math_try!(checked_add(values[0], 1)) >> 1
+    ));
+    values[0] = math_try!(checked_sub(
+        values[0],
+        math_try!(checked_add(math_try!(checked_mul(values[1], 3)), 4)) >> 3
+    ));
+    values[1] = math_try!(checked_add(
+        values[1],
+        math_try!(checked_add(math_try!(checked_mul(values[0], 3)), 4)) >> 3
+    ));
+    values[2] = math_try!(checked_sub(
+        values[2],
+        math_try!(checked_add(math_try!(checked_mul(values[3], 3)), 4)) >> 3
+    ));
+    values[3] = math_try!(checked_add(
+        values[3],
+        math_try!(checked_add(math_try!(checked_mul(values[2], 3)), 4)) >> 3
+    ));
+    values[2] = math_try!(checked_sub(
+        values[2],
+        math_try!(checked_add(values[1], 1)) >> 1
+    ));
+    values[3] = math_try!(checked_sub(
+        math_try!(checked_add(values[0], 1)) >> 1,
+        values[3]
+    ));
+    values[1] = math_try!(checked_add(values[1], values[2]));
+    values[0] = math_try!(checked_sub(values[0], values[3]));
     Ok(())
 }
 
+#[inline]
 fn inverse_todd_odd(values: &mut [i32; 4]) -> Result<(), MathError> {
-    values[3] = checked_add(values[3], values[0])?;
-    values[2] = checked_sub(values[2], values[1])?;
+    values[3] = math_try!(checked_add(values[3], values[0]));
+    values[2] = math_try!(checked_sub(values[2], values[1]));
     let first = values[3] >> 1;
     let second = values[2] >> 1;
-    values[0] = checked_sub(values[0], first)?;
-    values[1] = checked_add(values[1], second)?;
-    values[0] = checked_sub(values[0], checked_add(checked_mul(values[1], 3)?, 3)? >> 3)?;
-    values[1] = checked_add(values[1], checked_add(checked_mul(values[0], 3)?, 3)? >> 2)?;
-    values[0] = checked_sub(values[0], checked_add(checked_mul(values[1], 3)?, 4)? >> 3)?;
-    values[1] = checked_sub(values[1], second)?;
-    values[0] = checked_add(values[0], first)?;
-    values[2] = checked_add(values[2], values[1])?;
-    values[3] = checked_sub(values[3], values[0])?;
-    values[1] = values[1]
-        .checked_neg()
-        .ok_or_else(|| MathError::overflow("inverse Todd odd negation"))?;
-    values[2] = values[2]
-        .checked_neg()
-        .ok_or_else(|| MathError::overflow("inverse Todd odd negation"))?;
+    values[0] = math_try!(checked_sub(values[0], first));
+    values[1] = math_try!(checked_add(values[1], second));
+    values[0] = math_try!(checked_sub(
+        values[0],
+        math_try!(checked_add(math_try!(checked_mul(values[1], 3)), 3)) >> 3
+    ));
+    values[1] = math_try!(checked_add(
+        values[1],
+        math_try!(checked_add(math_try!(checked_mul(values[0], 3)), 3)) >> 2
+    ));
+    values[0] = math_try!(checked_sub(
+        values[0],
+        math_try!(checked_add(math_try!(checked_mul(values[1], 3)), 4)) >> 3
+    ));
+    values[1] = math_try!(checked_sub(values[1], second));
+    values[0] = math_try!(checked_add(values[0], first));
+    values[2] = math_try!(checked_add(values[2], values[1]));
+    values[3] = math_try!(checked_sub(values[3], values[0]));
+    values[1] = math_try!(
+        values[1]
+            .checked_neg()
+            .ok_or(crate::arithmetic::overflow("inverse Todd odd negation"))
+    );
+    values[2] = math_try!(
+        values[2]
+            .checked_neg()
+            .ok_or(crate::arithmetic::overflow("inverse Todd odd negation"))
+    );
     Ok(())
 }
 

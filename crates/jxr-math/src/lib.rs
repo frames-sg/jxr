@@ -7,6 +7,16 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+// CUDA Oxide cannot lower the nested ControlFlow layout produced by `?`.
+macro_rules! math_try {
+    ($value:expr) => {
+        match $value {
+            Ok(value) => value,
+            Err(error) => return Err(error),
+        }
+    };
+}
+
 pub mod alpha;
 pub mod arithmetic;
 pub mod color;
