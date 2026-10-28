@@ -91,11 +91,12 @@ dependencies = [
 
 [[package]]
 name = "j2k-core"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95fe1ed3855b263af459102af993bddc5d8f0689df7b38867831c7bdbd28848"
+version = "0.13.0"
+source = "git+https://github.com/frames-sg/j2k?branch=main#2c247a982dc1d154dc239f77fbbe3e1f0bd78134"
 dependencies = [
+ "libc",
  "thiserror",
+ "windows-sys",
 ]
 
 [[package]]
@@ -287,3 +288,12 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
+dependencies = [
+ "windows-link",
+]

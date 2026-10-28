@@ -59,6 +59,8 @@ jobs:
           persist-credentials: false
       - name: Install Rust checks
         run: rustup component add rustfmt clippy
+      - name: Take the latest J2K main
+        run: cargo latest
       - name: Prepare T.834 vectors
         run: tools/t834-conformance/build.sh
       - name: Build T.835 oracle

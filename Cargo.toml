@@ -23,8 +23,10 @@ keywords = ["jpeg", "jpeg-xr", "jxr", "gpu", "decoder"]
 categories = ["multimedia::images", "compression"]
 
 [workspace.dependencies]
-j2k-core = "=0.12.0"
-j2k-metal-support = "=0.12.0"
+# J2K main, the source wsi-rs names, so a slide reader builds one J2K;
+# `cargo latest` takes its newest commit. Publishing uses the crates.io version.
+j2k-core = { version = "0.13", git = "https://github.com/frames-sg/j2k", branch = "main" }
+j2k-metal-support = { version = "0.13", git = "https://github.com/frames-sg/j2k", branch = "main" }
 fearless_simd = "=1.0.0"
 cudarc = { version = "=0.19.10", default-features = false, features = [
     "std",
