@@ -19,6 +19,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: rustup component add rustfmt clippy
+      - name: Take the latest J2K main
+        run: cargo latest
       - run: python3 tools/test_corpus_build.py
       - run: |
           cargo fmt --all -- --check
@@ -35,5 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: rustup component add rustfmt clippy
+      - name: Take the latest J2K main
+        run: cargo latest && cargo latest --manifest-path crates/jxr/fuzz/Cargo.toml
       - run: cargo fmt --manifest-path crates/jxr/fuzz/Cargo.toml -- --check
       - run: cargo clippy --manifest-path crates/jxr/fuzz/Cargo.toml --all-targets -- -D warnings

@@ -1,3 +1,7 @@
 [alias]
 check-all = "check --workspace --all-targets --all-features"
 test-all = "test --workspace --all-features"
+# J2K follows its main branch. This moves Cargo.lock to its newest commit and
+# leaves every other dependency as locked; CI runs it before building. For the
+# fuzz workspace, add `--manifest-path crates/jxr/fuzz/Cargo.toml`.
+latest = "update -p j2k-core"
