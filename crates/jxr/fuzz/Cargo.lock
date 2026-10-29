@@ -91,8 +91,8 @@ dependencies = [
 
 [[package]]
 name = "j2k-core"
-version = "0.13.0"
-source = "git+https://github.com/frames-sg/j2k?branch=main#2c247a982dc1d154dc239f77fbbe3e1f0bd78134"
+version = "0.13.1"
+source = "git+https://github.com/frames-sg/j2k?branch=main#49b513c9d31b46d9e52aca5afbd2a9aeeb567343"
 dependencies = [
  "libc",
  "thiserror",
