@@ -112,7 +112,7 @@ dependencies = [
 [[package]]
 name = "j2k-core"
 version = "0.13.1"
-source = "git+https://github.com/frames-sg/j2k?branch=main#49b513c9d31b46d9e52aca5afbd2a9aeeb567343"
+source = "git+https://github.com/frames-sg/j2k?branch=main#0c6b6e474d2d96e911df94727787b9b0fb0db300"
 dependencies = [
  "libc",
  "thiserror",
@@ -122,7 +122,7 @@ dependencies = [
 [[package]]
 name = "j2k-metal-support"
 version = "0.13.1"
-source = "git+https://github.com/frames-sg/j2k?branch=main#49b513c9d31b46d9e52aca5afbd2a9aeeb567343"
+source = "git+https://github.com/frames-sg/j2k?branch=main#0c6b6e474d2d96e911df94727787b9b0fb0db300"
 dependencies = [
  "j2k-core",
  "log",
@@ -134,7 +134,7 @@ dependencies = [
 [[package]]
 name = "j2k-mpsgraph-support"
 version = "0.13.1"
-source = "git+https://github.com/frames-sg/j2k?branch=main#49b513c9d31b46d9e52aca5afbd2a9aeeb567343"
+source = "git+https://github.com/frames-sg/j2k?branch=main#0c6b6e474d2d96e911df94727787b9b0fb0db300"
 dependencies = [
  "block2",
  "objc2",
@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "jxr"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "jxr-core",
  "jxr-cuda",
@@ -157,14 +157,14 @@ dependencies = [
 
 [[package]]
 name = "jxr-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "j2k-core",
 ]
 
 [[package]]
 name = "jxr-cuda"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cudarc",
  "jxr-core",
@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-image"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "image",
  "jxr",
@@ -183,11 +183,11 @@ dependencies = [
 
 [[package]]
 name = "jxr-math"
-version = "0.1.1"
+version = "0.2.0"
 
 [[package]]
 name = "jxr-metal"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "j2k-core",
  "j2k-metal-support",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-mpsgraph"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "j2k-metal-support",
  "j2k-mpsgraph-support",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-native"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "fearless_simd",
  "jxr-core",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-test-support"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "jxr",
  "jxr-native",
