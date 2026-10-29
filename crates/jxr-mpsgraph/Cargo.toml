@@ -19,7 +19,7 @@ jxr-metal = { path = "../jxr-metal", version = "=0.3.1" }
 thiserror.workspace = true
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
-j2k-mpsgraph-support = { version = "0.13", git = "https://github.com/frames-sg/j2k", branch = "main" }
+j2k-mpsgraph-support = { version = "0.13.1", git = "https://github.com/frames-sg/j2k", branch = "main" }
 objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "std",
