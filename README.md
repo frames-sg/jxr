@@ -19,8 +19,8 @@ pixel-to-codestream encoding is not implemented.
 cargo add jxr
 ```
 
-Requires **Rust 1.99.0 or newer**. The current release is **0.3.1**; see the
-[release notes](docs/releasing.md#031-patch-release) for migration details.
+Requires **Rust 1.99.0 or newer**. The current release is **0.4.0**; see the
+[release notes](docs/releasing.md#040-release-line) for migration details.
 
 ## What it does
 
@@ -247,8 +247,8 @@ transforms. It preserves explicit alpha and output-format semantics, and rejects
 unsupported combinations instead of approximating another format.
 
 **API status.** JXR is under active development on the `0.x` release line.
-The 0.3 line uses exact J2K 0.12.0 dependencies; applications using the shared
-J2K types must update those dependencies together. Check the release notes
+The 0.4 line depends on J2K 0.13.1 or a later 0.13 patch release; applications
+using the shared J2K types must update those dependencies together. Check the release notes
 before upgrading.
 
 ## Documentation and contributing

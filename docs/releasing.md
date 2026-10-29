@@ -168,3 +168,41 @@ at their published versions. `jxr-image` changes only its exact `jxr` pin.
 `jxr-mpsgraph` moves to 0.4.0 because `MpsGraphPreparedGroup` and
 `MpsGraphPreparedBatch` now hold staged Metal plans and are no longer
 `UnwindSafe` or `RefUnwindSafe`; its other public API is unchanged.
+
+## 0.4.0 release line
+
+This release aligns JXR with J2K 0.13 and replaces the CUDA C kernels with
+CUDA Oxide Rust kernels.
+
+`jxr-core` re-exports `j2k_core::{BackendKind, BackendRequest, Rect}`, which now
+come from the 0.13 line, so downstream applications must move their direct J2K
+dependencies to 0.13 at the same time. The J2K requirements are `0.13.1` rather
+than exact pins, so later J2K 0.13 patch releases resolve without a JXR release.
+`jxr-mpsgraph` also requires `j2k-mpsgraph-support` 0.13.1.
+
+`jxr-cuda` compiles its 13 kernel entry points from Rust to embedded PTX at build
+time instead of embedding CUDA C for NVRTC, and the runtime no longer invokes
+NVRTC. CUDA execution builds need the Linux CUDA Oxide toolchain or
+`JXR_CUDA_OXIDE_PTX`; builds without either keep the device-free contracts and
+report CUDA as unavailable. Routing, output formats, asynchronous ownership and
+overflow reporting are unchanged. The kernels reuse the checked transform and
+overlap arithmetic in `jxr-math`, which adds `MathError`, removes the
+`CUDA_RECONSTRUCTION_CONSTANTS` table, and declares Rust 1.96 as its minimum so
+the device build's pinned compiler can use it.
+
+J2K 0.13.1 (`j2k-core`, `j2k-metal-support` and `j2k-mpsgraph-support`) must be
+on crates.io first. Then publish in this order:
+
+1. `jxr-math` 0.2.0
+2. `jxr-core` 0.4.0
+3. `jxr-native` 0.4.0
+4. `jxr-metal` 0.4.0
+5. `jxr-cuda` 0.4.0
+6. `jxr` 0.4.0
+7. `jxr-image` 0.4.0
+8. `jxr-mpsgraph` 0.5.0
+
+`jxr-math` moves to 0.2.0 because a public constant was removed, which
+`cargo semver-checks` reports. `jxr-mpsgraph` moves to 0.5.0 because its public
+API takes `jxr` types, such as `BatchDecodeOptions` and `Rect`, from the 0.4
+line.

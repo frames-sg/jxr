@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "jxr"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "jxr-core",
  "jxr-cuda",
@@ -122,14 +122,14 @@ dependencies = [
 
 [[package]]
 name = "jxr-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "j2k-core",
 ]
 
 [[package]]
 name = "jxr-cuda"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cudarc",
  "jxr-core",
@@ -148,11 +148,11 @@ dependencies = [
 
 [[package]]
 name = "jxr-math"
-version = "0.1.1"
+version = "0.2.0"
 
 [[package]]
 name = "jxr-native"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "fearless_simd",
  "jxr-core",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-test-support"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "jxr",
  "jxr-native",
