@@ -6,6 +6,9 @@
 [![downloads](https://img.shields.io/crates/d/jxr.svg)](https://crates.io/crates/jxr)
 [![license](https://img.shields.io/crates/l/jxr.svg)](#license)
 
+[Project website](https://frames-sg.com/rust-jpeg-xr-codec/) ·
+[API documentation](https://docs.rs/jxr)
+
 JXR decodes JPEG XR images in Rust, with optional Apple GPU (Metal) and
 NVIDIA GPU (CUDA) reconstruction. The default build runs on the CPU and needs
 no GPU runtime or reference codec.
