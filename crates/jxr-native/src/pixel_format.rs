@@ -6,19 +6,21 @@ use crate::{NativeError, ParsedCodestream};
 
 mod table;
 
-use table::known_descriptor;
+use table::{known_descriptor, wic_descriptor};
 
 const GUID_PREFIX: [u8; 15] = [
     0x24, 0xc3, 0xdd, 0x6f, 0x03, 0x4e, 0xfe, 0x4b, 0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9,
 ];
 
-/// Classify a raw Annex-A pixel-format identifier using T.832 Table A.6.
+/// Classify a raw Annex-A pixel-format identifier from T.832 Table A.6 or WIC.
 #[must_use]
 pub fn classify_annex_a_pixel_format(guid: [u8; 16]) -> AnnexAPixelFormat {
-    if guid[..15] != GUID_PREFIX {
-        return AnnexAPixelFormat::Unknown(guid);
-    }
-    known_descriptor(guid[15]).map_or(AnnexAPixelFormat::Unknown(guid), AnnexAPixelFormat::Known)
+    let descriptor = if guid[..15] == GUID_PREFIX {
+        known_descriptor(guid[15])
+    } else {
+        wic_descriptor(guid)
+    };
+    descriptor.map_or(AnnexAPixelFormat::Unknown(guid), AnnexAPixelFormat::Known)
 }
 
 pub(crate) fn validate_annex_a_pixel_format(parsed: &ParsedCodestream) -> Result<(), NativeError> {
