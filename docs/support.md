@@ -18,6 +18,8 @@ they use Advanced-only output syntax or a JPEG 2000 `.jpx` wrapper.
 - Complete typed classification of the Annex-A Table A.6 pixel GUIDs, including
   RGB/BGR storage padding and premultiplied separate alpha, lossless retention
   of unknown GUIDs, and consistency checks against parsed syntax.
+- WIC's additional 32-bit RGBA/PRGBA and 96-bit RGB float pixel GUIDs,
+  including premultiplied separate-alpha metadata.
 - Spatial and indexed frequency-mode Y-only, YUV420, YUV422, YUV444, YUVK, and
   Main-profile 2–16 channel N-component entropy decoding for DC-only, no-HP,
   no-flexbits, and all bands.
