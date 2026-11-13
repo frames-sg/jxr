@@ -211,8 +211,17 @@ fn parse_alpha_range(
             tag: TAG_ALPHA_OFFSET,
         }),
         (Some(offset), Some(count)) => {
-            checked_codestream_range(bytes, "ALPHA_BYTE_COUNT", offset as usize, count as usize)
-                .map(Some)
+            let offset = offset as usize;
+            let count = count as usize;
+            // Some Microsoft reference-encoder files store the absolute alpha
+            // end offset in `ALPHA_BYTE_COUNT`. Accept the end-of-file variant
+            // while retaining normal range and primary/alpha overlap checks.
+            let count = if count == bytes.len() && offset > 0 && offset < count {
+                count - offset
+            } else {
+                count
+            };
+            checked_codestream_range(bytes, "ALPHA_BYTE_COUNT", offset, count).map(Some)
         }
     }
 }
