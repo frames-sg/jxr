@@ -206,3 +206,29 @@ on crates.io first. Then publish in this order:
 `cargo semver-checks` reports. `jxr-mpsgraph` moves to 0.5.0 because its public
 API takes `jxr` types, such as `BatchDecodeOptions` and `Rect`, from the 0.4
 line.
+
+## 0.5.0 release line
+
+This release aligns JXR with J2K 0.14. Decoder source is unchanged.
+
+`jxr-core` re-exports `j2k_core::{BackendKind, BackendRequest, Rect}`, which now
+come from the 0.14 line, so downstream applications must move their direct J2K
+dependencies to 0.14 at the same time. As in 0.4, the J2K requirements are
+`0.14.0` rather than exact pins, so later J2K 0.14 patch releases resolve
+without a JXR release. `jxr-mpsgraph` also requires `j2k-mpsgraph-support`
+0.14.0.
+
+J2K 0.14.0 (`j2k-core`, `j2k-metal-support` and `j2k-mpsgraph-support`) is on
+crates.io. Publish in this order:
+
+1. `jxr-core` 0.5.0
+2. `jxr-native` 0.5.0
+3. `jxr-metal` 0.5.0
+4. `jxr-cuda` 0.5.0
+5. `jxr` 0.5.0
+6. `jxr-image` 0.5.0
+7. `jxr-mpsgraph` 0.6.0
+
+`jxr-math` 0.2.0 does not depend on J2K and stays at its published version.
+`jxr-mpsgraph` moves to 0.6.0 because its public API takes `jxr` types, such as
+`BatchDecodeOptions` and `Rect`, from the 0.5 line.
