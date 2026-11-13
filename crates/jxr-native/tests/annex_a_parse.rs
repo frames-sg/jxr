@@ -74,21 +74,61 @@ fn accepts_missing_final_pad_byte_in_even_rounded_image_count() {
     assert_eq!(image.codestream_range, 113..128);
 }
 
-#[test]
-fn zero_alpha_offset_and_count_mean_integrated_alpha() {
-    let mut bytes = annex_a_file(112, 16);
+fn annex_a_with_alpha(alpha_offset: u32, alpha_count: u32) -> Vec<u8> {
+    let mut bytes = annex_a_file(112, 8);
     bytes[8..10].copy_from_slice(&7_u16.to_le_bytes());
     bytes[18..22].copy_from_slice(&96_u32.to_le_bytes());
-    for (index, tag) in [0xBCC2_u16, 0xBCC3].into_iter().enumerate() {
+    for (index, (tag, value)) in [(0xBCC2_u16, alpha_offset), (0xBCC3, alpha_count)]
+        .into_iter()
+        .enumerate()
+    {
         let offset = 70 + index * 12;
         bytes[offset..offset + 2].copy_from_slice(&tag.to_le_bytes());
         bytes[offset + 2..offset + 4].copy_from_slice(&4_u16.to_le_bytes());
         bytes[offset + 4..offset + 8].copy_from_slice(&1_u32.to_le_bytes());
-        bytes[offset + 8..offset + 12].copy_from_slice(&0_u32.to_le_bytes());
+        bytes[offset + 8..offset + 12].copy_from_slice(&value.to_le_bytes());
     }
+    bytes
+}
 
+#[test]
+fn zero_alpha_offset_and_count_mean_integrated_alpha() {
+    let bytes = annex_a_with_alpha(0, 0);
     let image = parse_annex_a(&bytes).expect("zero separate-alpha range is absent");
     assert_eq!(image.alpha_range, None);
+}
+
+#[test]
+fn accepts_standard_and_reference_encoder_alpha_counts() {
+    // The reference encoder can write the absolute end offset instead of the
+    // alpha stream's byte count. Only the end-of-file variant is recognized.
+    for count in [8, 128] {
+        let bytes = annex_a_with_alpha(120, count);
+        let image = parse_annex_a(&bytes).unwrap();
+        assert_eq!(image.alpha_range, Some(120..128));
+    }
+}
+
+#[test]
+fn alpha_extent_compatibility_does_not_accept_other_invalid_ranges() {
+    for (offset, count) in [(120, 127), (120, 129), (128, 128), (129, 128)] {
+        let bytes = annex_a_with_alpha(offset, count);
+        assert!(
+            matches!(
+                parse_annex_a(&bytes),
+                Err(NativeError::RangeOutsideInput { .. })
+            ),
+            "offset={offset}, count={count}"
+        );
+    }
+    // A recognized end offset must still not overlap the primary stream.
+    let bytes = annex_a_with_alpha(116, 128);
+    assert!(matches!(
+        parse_annex_a(&bytes),
+        Err(NativeError::InvalidSyntax {
+            field: "overlapping primary and alpha codestream ranges"
+        })
+    ));
 }
 
 #[test]

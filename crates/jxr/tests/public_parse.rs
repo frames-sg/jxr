@@ -159,3 +159,32 @@ fn public_writer_produces_a_decodable_oriented_container() {
     assert_eq!(image.decoded_region.w, 16);
     assert_eq!(image.decoded_region.h, 16);
 }
+
+#[test]
+fn reference_encoder_alpha_end_offset_decodes_like_a_standard_count() {
+    let primary = decodable_minimal_raw_codestream();
+    let alpha = decodable_minimal_raw_codestream();
+    let options = AnnexAWriteOptions::new(16, 16, [0xa5; 16]).with_separate_alpha(&alpha);
+    let mut bytes = write_annex_a(&primary, &options).unwrap();
+    let request = DecodeRequest::new(PixelFormat::U8(ChannelLayout::LumaAlpha));
+    let expected = JxrView::parse(&bytes)
+        .unwrap()
+        .decoder()
+        .decode(&request)
+        .unwrap();
+
+    let root = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let count = u16::from_le_bytes(bytes[root..root + 2].try_into().unwrap()) as usize;
+    let alpha_count = (0..count)
+        .map(|index| root + 2 + index * 12)
+        .find(|&offset| bytes[offset..offset + 2] == 0xBCC3_u16.to_le_bytes())
+        .unwrap();
+    let end = u32::try_from(bytes.len()).unwrap();
+    bytes[alpha_count + 8..alpha_count + 12].copy_from_slice(&end.to_le_bytes());
+
+    let view = JxrView::parse(&bytes).unwrap();
+    assert_eq!(view.separate_alpha_codestream(), Some(alpha.as_slice()));
+    let actual = view.decoder().decode(&request).unwrap();
+    assert_eq!(actual.samples, expected.samples);
+    assert_eq!(actual.planes, expected.planes);
+}
