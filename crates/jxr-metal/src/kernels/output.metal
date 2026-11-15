@@ -364,8 +364,10 @@ kernel void jxr_output_f16(device const int *samples [[buffer(0)]], constant Jxr
     for (uint c = 0; c < params.channels; ++c) {
         device ushort *destination = reinterpret_cast<device ushort *>(output + jxr_output_index(surface, gid.x, gid.y, c, 2u));
         if (jxr_is_padding(c, params)) { *destination = 0; continue; }
+        // Sample first: `alpha` is set by jxr_channel_sample, and argument order is unspecified.
         bool alpha;
-        uint bits = jxr_f16_bits(jxr_channel_sample(samples, planes, c, x, y, params, converted, alpha), alpha, params, overflow);
+        int sample = jxr_channel_sample(samples, planes, c, x, y, params, converted, alpha);
+        uint bits = jxr_f16_bits(sample, alpha, params, overflow);
         if (params.premultiply_alpha != 0u && !alpha) {
             uint sign = bits & 0x8000u;
             bits = sign | jxr_unsigned_premultiply(bits & 0x7fffu, (alpha_bits & 0x8000u) == 0u ? alpha_bits & 0x7fffu : 0u, 0x7fffu);
@@ -392,8 +394,10 @@ kernel void jxr_output_f32(device const int *samples [[buffer(0)]], constant Jxr
     for (uint c = 0; c < params.channels; ++c) {
         device float *destination = reinterpret_cast<device float *>(output + jxr_output_index(surface, gid.x, gid.y, c, 4u));
         if (jxr_is_padding(c, params)) { *destination = 0.0f; continue; }
+        // Sample first: `alpha` is set by jxr_channel_sample, and argument order is unspecified.
         bool alpha;
-        float value = as_type<float>(jxr_f32_bits(jxr_channel_sample(samples, planes, c, x, y, params, converted, alpha), alpha, params, overflow));
+        int sample = jxr_channel_sample(samples, planes, c, x, y, params, converted, alpha);
+        float value = as_type<float>(jxr_f32_bits(sample, alpha, params, overflow));
         if (params.premultiply_alpha != 0u && !alpha) value *= alpha_value;
         *destination = value;
     }

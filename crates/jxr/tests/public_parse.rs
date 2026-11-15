@@ -32,15 +32,27 @@ fn minimal_raw_codestream() -> Vec<u8> {
 }
 
 fn decodable_minimal_raw_codestream() -> Vec<u8> {
+    dc_only_luma_codestream(false, [0, 0, 0])
+}
+
+/// Macroblock payload whose DC decodes to different samples under scaled and
+/// unscaled arithmetic (127..=128 versus 126..=127), so a plane decoded with the
+/// wrong flag is observable.
+const NONZERO_DC_MACROBLOCK: [u8; 3] = [0x0c, 0xc0, 0x00];
+
+/// 16x16 DC-only luma codestream. `scaled` sets the plane header's
+/// scaled-arithmetic bit; `macroblock` is the tile's entropy-coded payload.
+fn dc_only_luma_codestream(scaled: bool, macroblock: [u8; 3]) -> Vec<u8> {
     let mut bytes = b"WMPHOTO\0".to_vec();
     bytes.extend_from_slice(&[0x11, 0x00, 0x80, 0x01]);
     bytes.extend_from_slice(&15_u16.to_be_bytes());
     bytes.extend_from_slice(&15_u16.to_be_bytes());
     let mut bit_position = bytes.len() * 8;
-    for (value, count) in [(0, 3), (0, 1), (3, 4), (1, 1), (1, 8)] {
+    for (value, count) in [(0, 3), (u64::from(scaled), 1), (3, 4), (1, 1), (1, 8)] {
         push_bits(&mut bytes, &mut bit_position, value, count);
     }
-    bytes.extend_from_slice(&[0xFD, 0, 0, 1, 0x5a, 0, 0, 0]);
+    bytes.extend_from_slice(&[0xFD, 0, 0, 1, 0x5a]);
+    bytes.extend_from_slice(&macroblock);
     bytes
 }
 
@@ -187,4 +199,54 @@ fn reference_encoder_alpha_end_offset_decodes_like_a_standard_count() {
     let actual = view.decoder().decode(&request).unwrap();
     assert_eq!(actual.samples, expected.samples);
     assert_eq!(actual.planes, expected.planes);
+}
+
+fn decode_u8(bytes: &[u8], layout: ChannelLayout, alpha: AlphaHandling) -> Vec<u8> {
+    let request = DecodeRequest::new(PixelFormat::U8(layout)).with_alpha(alpha);
+    let image = JxrView::parse(bytes)
+        .expect("codestream must parse")
+        .decoder()
+        .decode(&request)
+        .expect("codestream must decode");
+    let jxr::DecodedSamples::U8(samples) = image.samples else {
+        panic!("expected U8 output");
+    };
+    samples
+}
+
+// Regression for frames-sg/jxr#29: JXRLib writers (e.g. ImageMagick) emit an
+// unscaled lossless alpha plane beside a scaled primary plane. SCALED_FLAG is a
+// per-plane field, so each plane must decode with its own value, in either
+// direction.
+#[test]
+fn separate_alpha_plane_decodes_with_its_own_scaled_flag() {
+    for (primary_scaled, alpha_scaled) in [(true, false), (false, true)] {
+        let primary = dc_only_luma_codestream(primary_scaled, NONZERO_DC_MACROBLOCK);
+        let alpha = dc_only_luma_codestream(alpha_scaled, NONZERO_DC_MACROBLOCK);
+        let standalone_primary = decode_u8(&primary, ChannelLayout::Luma, AlphaHandling::Drop);
+        let standalone_alpha = decode_u8(&alpha, ChannelLayout::Luma, AlphaHandling::Drop);
+        assert_ne!(
+            standalone_primary, standalone_alpha,
+            "fixture must make the scaled flag observable in decoded samples"
+        );
+
+        let options = AnnexAWriteOptions::new(16, 16, [0xa5; 16]).with_separate_alpha(&alpha);
+        let bytes = write_annex_a(&primary, &options).expect("valid container");
+        let samples = decode_u8(&bytes, ChannelLayout::LumaAlpha, AlphaHandling::Preserve);
+
+        let (pixels, remainder) = samples.as_chunks::<2>();
+        assert!(
+            remainder.is_empty(),
+            "LumaAlpha output must be whole pixels"
+        );
+        let (luma, alpha): (Vec<u8>, Vec<u8>) = pixels.iter().map(|&[y, a]| (y, a)).unzip();
+        assert_eq!(
+            luma, standalone_primary,
+            "primary scaled={primary_scaled}, alpha scaled={alpha_scaled}"
+        );
+        assert_eq!(
+            alpha, standalone_alpha,
+            "primary scaled={primary_scaled}, alpha scaled={alpha_scaled}"
+        );
+    }
 }
