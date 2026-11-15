@@ -22,8 +22,8 @@ pixel-to-codestream encoding is not implemented.
 cargo add jxr
 ```
 
-Requires **Rust 1.99.0 or newer**. The current release is **0.5.0**; see the
-[release notes](docs/releasing.md#050-release-line) for migration details.
+Requires **Rust 1.99.0 or newer**. The current release is **0.5.1**; see the
+[release notes](docs/releasing.md#051-patch-release) for migration details.
 
 ## What it does
 

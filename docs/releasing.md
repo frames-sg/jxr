@@ -232,3 +232,36 @@ crates.io. Publish in this order:
 `jxr-math` 0.2.0 does not depend on J2K and stays at its published version.
 `jxr-mpsgraph` moves to 0.6.0 because its public API takes `jxr` types, such as
 `BatchDecodeOptions` and `Rect`, from the 0.5 line.
+
+## 0.5.1 patch release
+
+This patch release decodes Annex-A files that 0.5.0 rejected or misclassified.
+The public API is unchanged, and images that already decoded produce the same
+output.
+
+- A separate alpha plane may declare a different `SCALED_FLAG` from the
+  primary plane. JXRLib-based encoders such as ImageMagick pair a scaled
+  primary plane with an unscaled lossless alpha plane, and those files were
+  rejected with "separate alpha output depth"
+  ([#29](https://github.com/frames-sg/jxr/issues/29)). The Metal F16 and F32
+  output kernels now select the alpha plane's flag deterministically.
+- Separate-alpha images whose `ALPHA_BYTE_COUNT` holds the absolute end offset,
+  as some Microsoft reference-encoder files do, are accepted when the value
+  equals the file length.
+- The WIC 32-bit RGBA, 32-bit premultiplied RGBA, and 96-bit RGB float pixel
+  GUIDs are classified, so premultiplied separate-alpha images take their
+  declaration from the container.
+
+The changes are in pull requests #27, #28, and #30.
+
+Publish the changed packages and their exact-version dependents in this order:
+
+1. `jxr-native` 0.5.1
+2. `jxr-metal` 0.5.1
+3. `jxr` 0.5.1
+4. `jxr-image` 0.5.1
+5. `jxr-mpsgraph` 0.6.1
+
+`jxr-math` 0.2.0, `jxr-core` 0.5.0, and `jxr-cuda` 0.5.0 are unchanged and stay
+at their published versions. `jxr-image` and `jxr-mpsgraph` change only their
+exact pins.
