@@ -160,11 +160,13 @@ fn validate_separate_alpha_compatibility(
             "separate alpha coded geometry",
         ));
     }
+    // SCALED_FLAG is deliberately not compared: it is a per-plane field, the alpha
+    // plane is reconstructed and packed with its own value, and JXRLib encoders
+    // routinely pair an unscaled (lossless) alpha plane with a scaled primary.
     if alpha_image.output_bit_depth != primary_image.output_bit_depth
         || alpha_plane.shift_bits != primary.headers.primary.shift_bits
         || alpha_plane.mantissa_length != primary.headers.primary.mantissa_length
         || alpha_plane.exponent_bias != primary.headers.primary.exponent_bias
-        || alpha_plane.scaled != primary.headers.primary.scaled
     {
         return Err(JxrError::new(
             JxrErrorKind::InvalidSyntax,
