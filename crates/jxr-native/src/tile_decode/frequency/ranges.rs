@@ -1,6 +1,6 @@
 use jxr_core::{BandPresence, ByteRange};
 
-use crate::ParsedCodestream;
+use crate::{ParsedCodestream, tail::PacketBand};
 
 use super::super::TileDecodeError;
 
@@ -18,7 +18,7 @@ pub(in crate::tile_decode) fn packet_ranges(
     bands: BandPresence,
     tile_count: usize,
 ) -> Result<Vec<FrequencyPacketRanges>, TileDecodeError> {
-    let bands_per_tile = band_count(bands);
+    let bands_per_tile = PacketBand::coded(bands).len();
     let expected =
         tile_count
             .checked_mul(bands_per_tile)
@@ -66,30 +66,28 @@ pub(in crate::tile_decode) fn packet_ranges(
         ));
     }
 
+    let coded = PacketBand::coded(bands);
+    let end = parsed.codestream_range.end;
     let mut ranges = Vec::with_capacity(tile_count);
     for tile in 0..tile_count {
         let first = tile * bands_per_tile;
-        let dc = range_at(first, &starts, &physical, parsed.codestream_range.end)?;
-        let low_pass = (bands_per_tile > 1)
-            .then(|| range_at(first + 1, &starts, &physical, parsed.codestream_range.end))
-            .transpose()?;
-        let high_pass = (bands_per_tile > 2)
-            .then(|| range_at(first + 2, &starts, &physical, parsed.codestream_range.end))
-            .transpose()?;
-        let flexbits = if bands_per_tile > 3 && starts[first + 3].is_some() {
-            Some(range_at(
-                first + 3,
-                &starts,
-                &physical,
-                parsed.codestream_range.end,
-            )?)
+        // The index lists a tile's packets in band order.
+        let required = |band: PacketBand| {
+            coded
+                .contains(&band)
+                .then(|| range_at(first + band.index(), &starts, &physical, end))
+                .transpose()
+        };
+        let flexbits_slot = first + PacketBand::Flexbits.index();
+        let flexbits = if coded.contains(&PacketBand::Flexbits) && starts[flexbits_slot].is_some() {
+            Some(range_at(flexbits_slot, &starts, &physical, end)?)
         } else {
             None
         };
         ranges.push(FrequencyPacketRanges {
-            dc,
-            low_pass,
-            high_pass,
+            dc: range_at(first + PacketBand::Dc.index(), &starts, &physical, end)?,
+            low_pass: required(PacketBand::LowPass)?,
+            high_pass: required(PacketBand::HighPass)?,
             flexbits,
         });
     }
@@ -97,16 +95,7 @@ pub(in crate::tile_decode) fn packet_ranges(
 }
 
 const fn is_flexbits_escape(index: usize, bands_per_tile: usize, relative: u64) -> bool {
-    bands_per_tile == 4 && index % bands_per_tile == 3 && relative == 0
-}
-
-const fn band_count(bands: BandPresence) -> usize {
-    match bands {
-        BandPresence::DcOnly => 1,
-        BandPresence::NoHighPass => 2,
-        BandPresence::NoFlexbits => 3,
-        BandPresence::All => 4,
-    }
+    bands_per_tile == 4 && index % bands_per_tile == PacketBand::Flexbits.index() && relative == 0
 }
 
 fn range_at(

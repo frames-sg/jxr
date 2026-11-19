@@ -1,43 +1,28 @@
+mod common;
+
 use jxr_native::{NativeError, parse_codestream_headers};
 
 fn minimal_header() -> Vec<u8> {
-    let mut bytes = b"WMPHOTO\0".to_vec();
-    // RESERVED_B=1, HARD_TILING=0, RESERVED_C=1
-    bytes.push(0x11);
-    // No tiling, spatial mode, orientation 0, no index, overlap mode 0.
-    bytes.push(0x00);
-    // Short header, all other flags clear.
-    bytes.push(0x80);
-    // Y-only, 8-bit.
-    bytes.push(0x01);
-    bytes.extend_from_slice(&15_u16.to_be_bytes());
-    bytes.extend_from_slice(&15_u16.to_be_bytes());
-    let mut bit_position = bytes.len() * 8;
-    // Y-only, unscaled, all bands.
-    push_bits(&mut bytes, &mut bit_position, 0, 3);
-    push_bits(&mut bytes, &mut bit_position, 0, 1);
-    push_bits(&mut bytes, &mut bit_position, 0, 4);
-    // Uniform DC, LP, and HP quantizers equal to one.
-    push_bits(&mut bytes, &mut bit_position, 1, 1);
-    push_bits(&mut bytes, &mut bit_position, 1, 8);
-    push_bits(&mut bytes, &mut bit_position, 0, 1);
-    push_bits(&mut bytes, &mut bit_position, 1, 1);
-    push_bits(&mut bytes, &mut bit_position, 1, 8);
-    push_bits(&mut bytes, &mut bit_position, 0, 1);
-    push_bits(&mut bytes, &mut bit_position, 1, 1);
-    push_bits(&mut bytes, &mut bit_position, 1, 8);
-    bytes
-}
-
-fn push_bits(bytes: &mut Vec<u8>, bit_position: &mut usize, value: u64, count: u8) {
-    for shift in (0..count).rev() {
-        if *bit_position / 8 == bytes.len() {
-            bytes.push(0);
-        }
-        let bit = ((value >> shift) & 1) as u8;
-        bytes[*bit_position / 8] |= bit << (7 - (*bit_position % 8));
-        *bit_position += 1;
-    }
+    // No tiling, spatial mode, orientation 0, no index, overlap mode 0, a
+    // short header, Y-only 8-bit output; a Y-only, unscaled plane of all
+    // bands with uniform DC, LP and HP quantizers equal to one.
+    common::codestream(
+        0x01,
+        &[
+            (0, 3),
+            (0, 1),
+            (0, 4),
+            (1, 1),
+            (1, 8),
+            (0, 1),
+            (1, 1),
+            (1, 8),
+            (0, 1),
+            (1, 1),
+            (1, 8),
+        ],
+        &[],
+    )
 }
 
 #[test]

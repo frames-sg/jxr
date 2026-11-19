@@ -1,3 +1,5 @@
+mod common;
+
 use jxr_core::{
     AlphaMode, AnnexABitDepth, AnnexAChannelOrder, AnnexANumericKind, AnnexAPixelFamily,
     AnnexAPixelFormat,
@@ -67,28 +69,14 @@ fn classifies_wic_formats_outside_table_a6() {
 
 // One 16x16 DC-only tile. RGB uses YUV444 internally; alpha uses Y-only.
 fn minimal_codestream(rgb: bool) -> Vec<u8> {
-    let mut bytes = b"WMPHOTO\0".to_vec();
-    bytes.extend_from_slice(&[0x11, 0x00, 0x80, if rgb { 0x71 } else { 0x01 }]);
-    bytes.extend_from_slice(&15_u16.to_be_bytes());
-    bytes.extend_from_slice(&15_u16.to_be_bytes());
-    let fields = if rgb {
-        vec![(3, 3), (0, 1), (3, 4), (0, 8), (1, 1), (0, 2), (1, 8)]
-    } else {
-        vec![(0, 3), (0, 1), (3, 4), (1, 1), (1, 8)]
-    };
-    let mut bit_position = bytes.len() * 8;
-    for (value, count) in fields {
-        for shift in (0..count).rev() {
-            if bit_position / 8 == bytes.len() {
-                bytes.push(0);
-            }
-            let bit = u8::from(((value >> shift) & 1) != 0);
-            bytes[bit_position / 8] |= bit << (7 - (bit_position % 8));
-            bit_position += 1;
-        }
+    if !rgb {
+        return common::dc_only_luma_codestream(false, [0; 3]);
     }
-    bytes.extend_from_slice(&[0xFD, 0, 0, 1, 0x5a, 0, 0, 0]);
-    bytes
+    common::codestream(
+        0x71,
+        &[(3, 3), (0, 1), (3, 4), (0, 8), (1, 1), (0, 2), (1, 8)],
+        &[0xFD, 0, 0, 1, 0x5a, 0, 0, 0],
+    )
 }
 
 #[test]

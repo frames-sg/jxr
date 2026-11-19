@@ -119,10 +119,7 @@ fn assert_native_batch(bytes: &[u8], request: DecodeRequest, expected: &DecodedI
     assert_eq!(batch.groups().len(), 1);
     let group = &batch.groups()[0];
     assert_eq!(group.source_indices(), [0, 1]);
-    assert_eq!(
-        group.image_stride_elements(),
-        storage_elements(&expected.samples)
-    );
+    assert_eq!(group.image_stride_elements(), expected.samples.len());
     macro_rules! compare_repeated {
         ($actual:expr, $expected:expr) => {{
             assert_eq!($actual.len(), $expected.len() * 2);
@@ -157,20 +154,6 @@ fn assert_native_batch(bytes: &[u8], request: DecodeRequest, expected: &DecodedI
             compare_repeated!(actual, expected);
         }
         _ => panic!("batch storage differs from successful owned decode"),
-    }
-}
-
-fn storage_elements(samples: &DecodedSamples) -> usize {
-    match samples {
-        DecodedSamples::BitPacked(values) | DecodedSamples::U8(values) => values.len(),
-        DecodedSamples::U16(values)
-        | DecodedSamples::F16(values)
-        | DecodedSamples::Rgb555(values)
-        | DecodedSamples::Rgb565(values) => values.len(),
-        DecodedSamples::I16(values) => values.len(),
-        DecodedSamples::I32(values) => values.len(),
-        DecodedSamples::F32(values) => values.len(),
-        DecodedSamples::Rgb101010(values) | DecodedSamples::Rgbe(values) => values.len(),
     }
 }
 

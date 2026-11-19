@@ -1,7 +1,7 @@
 [package]
 name = "jxr-math"
-description = "Exact integer building blocks for JPEG XR decoding"
-version.workspace = true
+description = "Exact integer building blocks for JPEG XR decoding and encoding"
+version = "0.2.1"
 edition.workspace = true
 # Shared device code must support CUDA Oxide's pinned compiler.
 rust-version = "1.96"

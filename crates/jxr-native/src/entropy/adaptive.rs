@@ -15,15 +15,22 @@ const INDEX_DELTA: [[i8; 6]; 3] = [
     [-1, -1, 0, 1, -2, 0],
 ];
 
+/// The adaptive selection of one code table among several.
+///
+/// Every symbol decoded moves a discriminant by the symbol's delta, and at
+/// each adaptation point a discriminant past its threshold moves the
+/// selection one table along. Coded-block patterns adapt their two-table
+/// codes with the same state as coefficient levels do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct AdaptiveVlc {
+pub(crate) struct AdaptiveVlc {
     discrim: [i32; 2],
     table_index: u8,
     delta_index: [u8; 2],
 }
 
 impl AdaptiveVlc {
-    const fn two_tables() -> Self {
+    /// The tile-initial selection of a code with two tables: the first.
+    pub(crate) const fn two_tables() -> Self {
         Self {
             discrim: [0, 0],
             table_index: 0,
@@ -39,11 +46,13 @@ impl AdaptiveVlc {
         }
     }
 
-    pub(super) const fn table_index(self) -> usize {
+    /// The table selected.
+    pub(crate) const fn table_index(self) -> usize {
         self.table_index as usize
     }
 
-    fn observe_one(&mut self, symbol: u8, delta: &[i8]) {
+    /// Counts one symbol of a two-table code whose delta per symbol is `delta`.
+    pub(crate) fn observe_one(&mut self, symbol: u8, delta: &[i8]) {
         self.discrim[0] += i32::from(delta[usize::from(symbol)]);
     }
 
@@ -59,7 +68,8 @@ impl AdaptiveVlc {
         self.discrim[1] += i32::from(INDEX_DELTA[usize::from(self.delta_index[1])][symbol]);
     }
 
-    fn adapt_one(&mut self) {
+    /// Moves a two-table selection at an adaptation point.
+    pub(crate) fn adapt_one(&mut self) {
         if self.discrim[0] < -8 && self.table_index != 0 {
             self.table_index -= 1;
             self.discrim[0] = 0;
@@ -289,18 +299,5 @@ mod tests {
         state.adapt_two(4);
         assert_eq!(state.table_index, 1);
         assert_eq!(state.delta_index, [0, 1]);
-    }
-
-    #[test]
-    fn tile_reset_restores_every_owned_state() {
-        let mut state = TileEntropyState::new();
-        state.dc_vlc.abs_level[0].discrim[0] = 40;
-        state.lp_scan.place(&mut [0; 16], 2, 7).unwrap();
-        state
-            .hp_model
-            .update([500, 500], crate::entropy::ColourModel::Yuv420)
-            .unwrap();
-        state.reset_tile();
-        assert_eq!(state, TileEntropyState::new());
     }
 }

@@ -2,15 +2,20 @@
 
 use std::{
     hint::black_box,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
 use jxr::{
-    AlphaHandling, BackendRequest, DecodeRequest, DecodedImage, JxrView, PixelFormat,
+    BackendRequest, DecodeRequest, DecodedImage, JxrView,
     metal::{MetalDecoderSession, MetalStageDiagnostics},
 };
-use jxr_test_support::{TimingSummary, checksum_samples, oracle_format, summarize_timings};
+use jxr_test_support::{
+    BenchmarkFile, TimingSummary, checksum_samples, exit_on_error, milliseconds, summarize_timings,
+    t834_suite, workspace_root,
+};
+
+type Workload = BenchmarkFile;
 
 const DEFAULT_WARMUPS: usize = 3;
 const DEFAULT_ITERATIONS: usize = 20;
@@ -19,15 +24,6 @@ struct Options {
     warmups: usize,
     iterations: usize,
     inputs: Vec<PathBuf>,
-}
-
-struct Workload {
-    path: PathBuf,
-    source: Vec<u8>,
-    format: PixelFormat,
-    alpha: AlphaHandling,
-    width: u32,
-    height: u32,
 }
 
 struct RouteMeasurements {
@@ -53,10 +49,7 @@ impl MetalStageSample {
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("jxr-load-bench: {error}");
-        std::process::exit(1);
-    }
+    exit_on_error("jxr-load-bench", run());
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,7 +57,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let workloads = options
         .inputs
         .iter()
-        .map(|path| load_workload(path))
+        .map(|path| BenchmarkFile::load(path))
         .collect::<Result<Vec<_>, _>>()?;
 
     let session_start = Instant::now();
@@ -94,8 +87,8 @@ fn benchmark_workload(
     session: &MetalDecoderSession,
     options: &Options,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cpu_request = request(workload, BackendRequest::Cpu);
-    let metal_request = request(workload, BackendRequest::Metal);
+    let cpu_request = workload.request(BackendRequest::Cpu);
+    let metal_request = workload.request(BackendRequest::Metal);
 
     let (cpu_first, cpu_first_elapsed) = time_decode_cpu(&workload.source, &cpu_request)?;
     let (metal_first, metal_first_elapsed) =
@@ -231,12 +224,6 @@ fn decode_metal(
     Ok(view.decoder().with_metal_session(session).decode(request)?)
 }
 
-fn request(workload: &Workload, backend: BackendRequest) -> DecodeRequest {
-    DecodeRequest::new(workload.format)
-        .with_alpha(workload.alpha)
-        .with_backend(backend)
-}
-
 fn verify_equivalent(cpu: &DecodedImage, metal: &DecodedImage) -> Result<(), String> {
     if cpu.info != metal.info
         || cpu.decoded_region != metal.decoded_region
@@ -317,27 +304,8 @@ fn print_route(label: &str, measurements: &RouteMeasurements, width: u32, height
     );
 }
 
-fn load_workload(path: &Path) -> Result<Workload, Box<dyn std::error::Error>> {
-    let source = std::fs::read(path)?;
-    let view = JxrView::parse(&source)?;
-    let format = oracle_format(view.info())?;
-    let width = view.info().width;
-    let height = view.info().height;
-    Ok(Workload {
-        path: path.to_owned(),
-        source,
-        format: format.pixel_format,
-        alpha: format.alpha,
-        width,
-        height,
-    })
-}
-
 fn parse_options() -> Result<Options, Box<dyn std::error::Error>> {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .ok_or("test-support crate is outside its workspace")?;
+    let workspace = workspace_root()?;
     let mut warmups = DEFAULT_WARMUPS;
     let mut iterations = DEFAULT_ITERATIONS;
     let mut inputs = Vec::new();
@@ -364,7 +332,7 @@ fn parse_options() -> Result<Options, Box<dyn std::error::Error>> {
         }
     }
     if inputs.is_empty() {
-        let suite = workspace.join("target/t834-conformance/suite-2014");
+        let suite = t834_suite(workspace);
         inputs = vec![
             suite.join("BasicAndOverlap_1x1Tile/Seattle_Spat_Ov2_1x1_YUV444_QP10.jxr"),
             suite.join("Entropy_Table_Coverage/Skyscraper_YONLY.jxr"),
@@ -389,8 +357,4 @@ fn parse_count(
     value
         .parse::<usize>()
         .map_err(|error| format!("invalid {option} value {value:?}: {error}").into())
-}
-
-fn milliseconds(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1_000.0
 }

@@ -58,3 +58,25 @@ pub enum OracleError {
         rust_len: usize,
     },
 }
+
+/// Ends the tool `tool` with status 1 and its error message when `result`
+/// is an error.
+pub fn exit_on_error(tool: &str, result: Result<(), impl std::fmt::Display>) {
+    if let Err(error) = result {
+        eprintln!("{tool}: {error}");
+        std::process::exit(1);
+    }
+}
+
+/// Ends the tool `tool` by its result: status 1 when it counted failures,
+/// and 2 with its error message when it could not run.
+pub fn exit_with_failures(tool: &str, result: Result<u64, impl std::fmt::Display>) {
+    match result {
+        Ok(0) => {}
+        Ok(_) => std::process::exit(1),
+        Err(error) => {
+            eprintln!("{tool}: {error}");
+            std::process::exit(2);
+        }
+    }
+}

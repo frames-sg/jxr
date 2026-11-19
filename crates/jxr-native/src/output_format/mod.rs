@@ -4,7 +4,7 @@
 //! upsampling is intentionally outside this module: callers must supply full-
 //! resolution YUV444 planes when requesting RGB output.
 
-mod color;
+pub(crate) mod color;
 mod error;
 mod interleave;
 mod packed_color;
@@ -12,7 +12,7 @@ mod packing;
 mod planar;
 mod premultiply;
 mod request;
-mod scaling;
+pub(crate) mod scaling;
 mod simd_pack;
 mod validate;
 
@@ -20,8 +20,15 @@ mod validate;
 mod tests;
 
 pub use error::OutputFormatError;
+pub(crate) use interleave::{InterleavedLoad, InterleavedSample};
+pub(crate) use packed_color::{bit_position, unpack_rgb555, unpack_rgb565, unpack_rgb101010};
 pub use packing::format_components;
-pub(crate) use packing::{format_components_into_with_cpu, format_components_with_cpu};
-pub(crate) use planar::{format_planar_yuv, format_planar_yuv_into};
+pub(crate) use packing::{
+    borrow_samples, format_components_into_with_cpu, is_direct, split_samples, stores_with_vectors,
+    zeroed_samples,
+};
+pub(crate) use planar::{
+    PlanarPlane, format_planar_plane_into, format_planar_yuv_into, planar_planes,
+};
 pub use request::{AlphaFormatRequest, ComponentPlane, OutputBitDepth, OutputFormatRequest};
 pub use validate::validate_output_policy;

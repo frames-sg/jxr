@@ -1,9 +1,12 @@
 //! Adaptive coefficient normalization from T.832 Tables 115 and 116.
 
 use super::{EntropyError, FrequencyBand};
+use crate::tile_decode::syntax::MAX_COMPONENTS;
 
 const LUMA_WEIGHT: [i32; 3] = [240, 12, 1];
-const OTHER_WEIGHT: [[i32; 16]; 3] = [
+/// Weight of the chroma mean of each band, by the number of chroma
+/// components.
+const OTHER_WEIGHT: [[i32; MAX_COMPONENTS]; 3] = [
     [
         0, 240, 120, 80, 60, 48, 40, 34, 30, 27, 24, 22, 20, 18, 17, 16,
     ],
@@ -88,7 +91,7 @@ impl CoefficientModel {
                 2
             }
             ColourModel::Other { components } => {
-                if !(2..=16).contains(&components) {
+                if !(2..=MAX_COMPONENTS).contains(&usize::from(components)) {
                     return Err(EntropyError::InvalidParameter {
                         parameter: "coefficient-model component count",
                         value: i64::from(components),

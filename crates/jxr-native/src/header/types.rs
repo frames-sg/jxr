@@ -25,6 +25,22 @@ pub struct CodestreamHeader {
     pub margins: [u8; 4],
 }
 
+impl CodestreamHeader {
+    /// Whether a decoder finds the tile packets only through the tile
+    /// index: those of a tiled image, or of a frequency-mode one, which has
+    /// a packet for each band. The one packet of an untiled spatial-mode
+    /// image follows the headers.
+    pub(crate) fn requires_index(&self) -> bool {
+        self.flags.frequency_mode() || self.tiled()
+    }
+
+    /// Whether the image has more than one tile, which `TILING_FLAG`
+    /// declares and the tile sizes after it describe.
+    pub(crate) fn tiled(&self) -> bool {
+        !(self.tile_widths_mb.is_empty() && self.tile_heights_mb.is_empty())
+    }
+}
+
 /// Boolean `IMAGE_HEADER` syntax represented without a many-boolean public struct.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HeaderFlags(u16);
@@ -40,7 +56,7 @@ impl HeaderFlags {
     const PREMULTIPLIED_ALPHA: u16 = 1 << 7;
     const ALPHA_PLANE: u16 = 1 << 8;
 
-    pub(super) fn from_parsed(values: [bool; 9]) -> Self {
+    pub(crate) fn from_parsed(values: [bool; 9]) -> Self {
         let masks = [
             Self::HARD_TILING,
             Self::FREQUENCY_MODE,

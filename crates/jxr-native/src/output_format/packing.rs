@@ -7,15 +7,13 @@ use super::{
     ComponentPlane, OutputBitDepth, OutputFormatError, OutputFormatRequest,
     color::convert,
     interleave,
-    packed_color::{
-        pack_rgb555, pack_rgb555_into, pack_rgb565, pack_rgb565_into, pack_rgb101010,
-        pack_rgb101010_into, pack_rgbe, pack_rgbe_into,
-    },
-    premultiply::{premultiply_output, premultiply_output_mut},
+    packed_color::{pack_rgb555_into, pack_rgb565_into, pack_rgb101010_into, pack_rgbe_into},
+    premultiply::premultiply_output_mut,
     scaling::{ChannelScale, float16_bits, float32_bits, scale_integer_component},
-    simd_pack::{append_u8, pack_u8_into},
+    simd_pack::pack_u8_into,
     validate::validate_request,
 };
+use crate::executor::Executor;
 
 /// Format reconstructed signed planes into typed host samples.
 ///
@@ -26,66 +24,29 @@ pub fn format_components(
     alpha: Option<ComponentPlane<'_>>,
     request: OutputFormatRequest,
 ) -> Result<DecodedSamples, OutputFormatError> {
-    format_components_with_cpu(planes, alpha, request, crate::CpuCapabilities::detect())
-        .map(|(samples, _)| samples)
-}
-
-pub(crate) fn format_components_with_cpu(
-    planes: &[ComponentPlane<'_>],
-    alpha: Option<ComponentPlane<'_>>,
-    request: OutputFormatRequest,
-    cpu: crate::CpuCapabilities,
-) -> Result<(DecodedSamples, bool), OutputFormatError> {
-    let component_count = validate_request(planes, alpha, request)?;
-    let width = usize::try_from(request.crop.width)
-        .map_err(|_| OutputFormatError::arithmetic("converting crop width"))?;
-    let height = usize::try_from(request.crop.height)
-        .map_err(|_| OutputFormatError::arithmetic("converting crop height"))?;
-    let pixels = width
-        .checked_mul(height)
-        .ok_or_else(|| OutputFormatError::arithmetic("calculating output pixel count"))?;
-    let channels = usize::from(request.pixel_format.channel_count());
-    let elements = pixels
-        .checked_mul(channels)
-        .ok_or_else(|| OutputFormatError::arithmetic("calculating output element count"))?;
-    let context = FormatContext {
+    // Checked before the output is allocated, as the store checks it.
+    validate_request(planes, alpha, request)?;
+    let (_, _, length) = output_extent(request)?;
+    let mut samples = zeroed_samples(request.pixel_format, length);
+    format_components_into_with_cpu(
         planes,
         alpha,
         request,
-        component_count,
-        width,
-        height,
-    };
-    let (mut samples, used_simd) = if request.pixel_format == PixelFormat::Rgbe {
-        (pack_rgbe(context, pixels)?, false)
-    } else {
-        match request.bit_depth {
-            OutputBitDepth::U8 => pack_u8(context, elements, cpu)?,
-            OutputBitDepth::Bit1White | OutputBitDepth::Bit1Black => (pack_bits(context)?, false),
-            OutputBitDepth::U10 | OutputBitDepth::U16 { .. } => {
-                (pack_u16(context, elements)?, false)
-            }
-            OutputBitDepth::I16 { .. } => (pack_i16(context, elements)?, false),
-            OutputBitDepth::I32 { .. } => (pack_i32(context, elements)?, false),
-            OutputBitDepth::F16 => (pack_f16(context, elements)?, false),
-            OutputBitDepth::F32 { .. } => (pack_f32(context, elements)?, false),
-            OutputBitDepth::Rgb555 => (pack_rgb555(context, pixels)?, false),
-            OutputBitDepth::Rgb565 => (pack_rgb565(context, pixels)?, false),
-            OutputBitDepth::Rgb101010 => (pack_rgb101010(context, pixels)?, false),
-        }
-    };
-    if request.premultiply_alpha {
-        premultiply_output(&mut samples, request.pixel_format)?;
-    }
-    Ok((samples, used_simd))
+        crate::CpuCapabilities::detect(),
+        borrow_samples(&mut samples),
+    )?;
+    Ok(samples)
 }
 
+/// Stores the output `request` describes of reconstructed signed planes in
+/// `destination`, which must have its type and length, as
+/// [`format_components`] does. Returns whether a vector kernel stored it.
 pub(crate) fn format_components_into_with_cpu(
     planes: &[ComponentPlane<'_>],
     alpha: Option<ComponentPlane<'_>>,
     request: OutputFormatRequest,
     cpu: crate::CpuCapabilities,
-    mut destination: DecodedSamplesMut<'_>,
+    destination: DecodedSamplesMut<'_>,
 ) -> Result<bool, OutputFormatError> {
     let component_count = validate_request(planes, alpha, request)?;
     if !destination.matches_format(request.pixel_format) {
@@ -93,27 +54,8 @@ pub(crate) fn format_components_into_with_cpu(
             combination: "direct destination type differs from the output format",
         });
     }
-    let width = usize::try_from(request.crop.width)
-        .map_err(|_| OutputFormatError::arithmetic("converting crop width"))?;
-    let height = usize::try_from(request.crop.height)
-        .map_err(|_| OutputFormatError::arithmetic("converting crop height"))?;
-    let pixels = width
-        .checked_mul(height)
-        .ok_or_else(|| OutputFormatError::arithmetic("calculating output pixel count"))?;
-    let elements = pixels
-        .checked_mul(usize::from(request.pixel_format.channel_count()))
-        .ok_or_else(|| OutputFormatError::arithmetic("calculating output element count"))?;
-    let expected = match request.pixel_format {
-        PixelFormat::BitPacked(_) => width
-            .div_ceil(8)
-            .checked_mul(height)
-            .ok_or_else(|| OutputFormatError::arithmetic("calculating bit-packed output size"))?,
-        PixelFormat::Rgb555 | PixelFormat::Rgb565 | PixelFormat::Rgb101010 | PixelFormat::Rgbe => {
-            pixels
-        }
-        _ => elements,
-    };
-    if destination.len() != expected {
+    let (width, height, length) = output_extent(request)?;
+    if destination.len() != length {
         return Err(OutputFormatError::UnsupportedCombination {
             combination: "direct destination length differs from the output contract",
         });
@@ -125,12 +67,142 @@ pub(crate) fn format_components_into_with_cpu(
         component_count,
         width,
         height,
+        executor: cpu.executor(),
     };
+    fill_destination(context, cpu, destination)
+}
+
+/// The width and height of the output `request` describes, and the
+/// elements of storage it takes: a byte for every eight pixels of a row of
+/// one-bit samples, a word for every pixel of a packed format, and a sample
+/// for every channel of every pixel otherwise.
+fn output_extent(request: OutputFormatRequest) -> Result<(usize, usize, usize), OutputFormatError> {
+    let width = usize::try_from(request.crop.width)
+        .map_err(|_| OutputFormatError::arithmetic("converting crop width"))?;
+    let height = usize::try_from(request.crop.height)
+        .map_err(|_| OutputFormatError::arithmetic("converting crop height"))?;
+    let length = request
+        .pixel_format
+        .row_elements(request.crop.width)
+        .and_then(|row| row.checked_mul(height))
+        .ok_or_else(|| OutputFormatError::arithmetic("calculating output element count"))?;
+    Ok((width, height, length))
+}
+
+/// Zeroed storage of `length` elements of the type `format` stores.
+pub(crate) fn zeroed_samples(format: PixelFormat, length: usize) -> DecodedSamples {
+    match format {
+        PixelFormat::BitPacked(_) => DecodedSamples::BitPacked(vec![0; length]),
+        PixelFormat::U8(_) => DecodedSamples::U8(vec![0; length]),
+        PixelFormat::U16(_) => DecodedSamples::U16(vec![0; length]),
+        PixelFormat::I16(_) => DecodedSamples::I16(vec![0; length]),
+        PixelFormat::I32(_) => DecodedSamples::I32(vec![0; length]),
+        PixelFormat::F16(_) => DecodedSamples::F16(vec![0; length]),
+        PixelFormat::F32(_) => DecodedSamples::F32(vec![0.0; length]),
+        PixelFormat::Rgb555 => DecodedSamples::Rgb555(vec![0; length]),
+        PixelFormat::Rgb565 => DecodedSamples::Rgb565(vec![0; length]),
+        PixelFormat::Rgb101010 => DecodedSamples::Rgb101010(vec![0; length]),
+        PixelFormat::Rgbe => DecodedSamples::Rgbe(vec![0; length]),
+    }
+}
+
+/// Borrows owned storage as a destination.
+pub(crate) fn borrow_samples(samples: &mut DecodedSamples) -> DecodedSamplesMut<'_> {
+    match samples {
+        DecodedSamples::BitPacked(values) => DecodedSamplesMut::BitPacked(values),
+        DecodedSamples::U8(values) => DecodedSamplesMut::U8(values),
+        DecodedSamples::U16(values) => DecodedSamplesMut::U16(values),
+        DecodedSamples::I16(values) => DecodedSamplesMut::I16(values),
+        DecodedSamples::I32(values) => DecodedSamplesMut::I32(values),
+        DecodedSamples::F16(values) => DecodedSamplesMut::F16(values),
+        DecodedSamples::F32(values) => DecodedSamplesMut::F32(values),
+        DecodedSamples::Rgb555(values) => DecodedSamplesMut::Rgb555(values),
+        DecodedSamples::Rgb565(values) => DecodedSamplesMut::Rgb565(values),
+        DecodedSamples::Rgb101010(values) => DecodedSamplesMut::Rgb101010(values),
+        DecodedSamples::Rgbe(values) => DecodedSamplesMut::Rgbe(values),
+    }
+}
+
+/// Splits a destination into its first `mid` elements and the rest.
+pub(crate) fn split_samples(
+    samples: DecodedSamplesMut<'_>,
+    mid: usize,
+) -> (DecodedSamplesMut<'_>, DecodedSamplesMut<'_>) {
+    macro_rules! split {
+        ($variant:ident, $values:expr) => {{
+            let (head, tail) = $values.split_at_mut(mid);
+            (
+                DecodedSamplesMut::$variant(head),
+                DecodedSamplesMut::$variant(tail),
+            )
+        }};
+    }
+    match samples {
+        DecodedSamplesMut::BitPacked(values) => split!(BitPacked, values),
+        DecodedSamplesMut::U8(values) => split!(U8, values),
+        DecodedSamplesMut::U16(values) => split!(U16, values),
+        DecodedSamplesMut::I16(values) => split!(I16, values),
+        DecodedSamplesMut::I32(values) => split!(I32, values),
+        DecodedSamplesMut::F16(values) => split!(F16, values),
+        DecodedSamplesMut::F32(values) => split!(F32, values),
+        DecodedSamplesMut::Rgb555(values) => split!(Rgb555, values),
+        DecodedSamplesMut::Rgb565(values) => split!(Rgb565, values),
+        DecodedSamplesMut::Rgb101010(values) => split!(Rgb101010, values),
+        DecodedSamplesMut::Rgbe(values) => split!(Rgbe, values),
+    }
+}
+
+/// Stores the output `context` describes into `destination`, which has its
+/// type and length, and premultiplies it if the request asks.
+fn fill_destination(
+    context: FormatContext<'_>,
+    cpu: crate::CpuCapabilities,
+    mut destination: DecodedSamplesMut<'_>,
+) -> Result<bool, OutputFormatError> {
     let used_simd = fill_direct_destination(context, cpu, &mut destination)?;
-    if request.premultiply_alpha {
-        premultiply_output_mut(destination, request.pixel_format)?;
+    if context.request.premultiply_alpha {
+        premultiply_output_mut(destination, context.request.pixel_format)?;
     }
     Ok(used_simd)
+}
+
+/// Whether formatting the whole output of `request` stores it with a vector
+/// kernel, as the decode report states it.
+///
+/// Only the plain eight-bit plane store reports itself: a luma image without
+/// alpha, and the planes of a native planar YUV image.
+pub(crate) fn stores_with_vectors(
+    request: OutputFormatRequest,
+    has_alpha: bool,
+    cpu: crate::CpuCapabilities,
+) -> bool {
+    if request.bit_depth != OutputBitDepth::U8
+        || !matches!(request.pixel_format, PixelFormat::U8(_))
+    {
+        return false;
+    }
+    let vectors = |crop: crate::reconstruct::CropWindow| {
+        super::simd_pack::packs_with_vectors(
+            cpu.level(),
+            [
+                usize::try_from(crop.width).unwrap_or(0),
+                usize::try_from(crop.height).unwrap_or(0),
+            ],
+        )
+    };
+    if let Ok(planes) = super::planar::planar_planes(request, has_alpha) {
+        return planes.iter().any(|plane| vectors(plane.crop));
+    }
+    is_luma_plane(request, has_alpha) && vectors(request.crop)
+}
+
+/// Whether an eight-bit output is a luma plane stored as it is, without
+/// alpha or colour conversion: the plane store [`pack_u8_into`] takes.
+fn is_luma_plane(request: OutputFormatRequest, has_alpha: bool) -> bool {
+    request.internal_color == ColorFormat::Luma
+        && request.output_color == ColorFormat::Luma
+        && !has_alpha
+        && request.pixel_format == PixelFormat::U8(ChannelLayout::Luma)
 }
 
 fn fill_direct_destination(
@@ -143,13 +215,7 @@ fn fill_direct_destination(
             fill_bits(context, output)?;
             Ok(false)
         }
-        DecodedSamplesMut::U8(output) => format_components_u8_into_with_cpu(
-            context.planes,
-            context.alpha,
-            context.request,
-            cpu,
-            output,
-        ),
+        DecodedSamplesMut::U8(output) => fill_u8(context, cpu, output),
         DecodedSamplesMut::U16(output) => {
             fill_u16(context, output)?;
             Ok(false)
@@ -193,11 +259,8 @@ fn fill_direct_destination(
 }
 
 fn fill_u16(context: FormatContext<'_>, output: &mut [u16]) -> Result<(), OutputFormatError> {
-    let maximum = if matches!(context.request.bit_depth, OutputBitDepth::U10) {
-        1_023
-    } else {
-        65_535
-    };
+    // A 16-bit store is validated to be of a 10- or 16-bit depth.
+    let maximum = i32::from(context.request.bit_depth.maximum().unwrap_or(u16::MAX));
     if interleave::try_store(context, output) {
         return Ok(());
     }
@@ -261,17 +324,40 @@ fn fill_f32(context: FormatContext<'_>, output: &mut [f32]) -> Result<(), Output
     })
 }
 
+/// Stores every sample of the output in order, as `format` makes it of
+/// the sample, its component and whether it is alpha.
+///
+/// A row of samples is gathered and colour-converted at a time by
+/// [`ordered_row`], which every output type shares; only the typed store of
+/// each row is particular to the type. An error is the first in output
+/// order, whether gathering or `format` met it.
 fn fill_ordered<T>(
     context: FormatContext<'_>,
     output: &mut [T],
     mut format: impl FnMut(i32, usize, bool) -> Result<T, OutputFormatError>,
 ) -> Result<(), OutputFormatError> {
-    let mut index = 0;
-    for_each_ordered(context, |sample, component, alpha| {
-        output[index] = format(sample, component, alpha)?;
-        index += 1;
-        Ok(())
-    })
+    if context.width == 0 || context.height == 0 {
+        return Ok(());
+    }
+    let channels = ordered_channels(context);
+    let row_length = context.width * channels.len();
+    let mut row = vec![0; row_length];
+    for (y, destination) in output.chunks_exact_mut(row_length).enumerate() {
+        let gathered = ordered_row(context, y, channels.len(), &mut row);
+        let complete = gathered
+            .as_ref()
+            .map_or_else(|(samples, _)| *samples, |()| row_length);
+        for (index, (destination, &sample)) in destination[..complete]
+            .iter_mut()
+            .zip(&row[..complete])
+            .enumerate()
+        {
+            let (component, alpha) = channels[index % channels.len()];
+            *destination = format(sample, component, alpha)?;
+        }
+        gathered.map_err(|(_, error)| error)?;
+    }
+    Ok(())
 }
 
 fn fill_bits(context: FormatContext<'_>, output: &mut [u8]) -> Result<(), OutputFormatError> {
@@ -293,54 +379,30 @@ fn fill_bits(context: FormatContext<'_>, output: &mut [u8]) -> Result<(), Output
                 OutputBitDepth::Bit1Black => 1 - clipped,
                 _ => unreachable!("bit packer selected only for 1-bit output"),
             };
-            output[y * row_bytes + x / 8] |=
-                u8::try_from(bit).expect("bit is zero or one") << (7 - x % 8);
+            let (byte, shift) = super::bit_position(x);
+            output[y * row_bytes + byte] |= u8::try_from(bit).expect("bit is zero or one") << shift;
         }
     }
     Ok(())
 }
 
-pub(crate) fn format_components_u8_into_with_cpu(
-    planes: &[ComponentPlane<'_>],
-    alpha: Option<ComponentPlane<'_>>,
-    request: OutputFormatRequest,
+/// Stores an eight-bit output, which the request's validation has made of
+/// eight-bit depth, into `output`, which has its length: a luma plane
+/// through the plane store, others through the interleaved store or, where
+/// that does not cover them, in order.
+fn fill_u8(
+    context: FormatContext<'_>,
     cpu: crate::CpuCapabilities,
     output: &mut [u8],
 ) -> Result<bool, OutputFormatError> {
-    let component_count = validate_request(planes, alpha, request)?;
-    if !matches!(request.pixel_format, PixelFormat::U8(_))
-        || request.bit_depth != OutputBitDepth::U8
-    {
-        return Err(OutputFormatError::UnsupportedCombination {
-            combination: "direct U8 output requires an eight-bit U8 pixel format",
-        });
-    }
-    let width = usize::try_from(request.crop.width)
-        .map_err(|_| OutputFormatError::arithmetic("converting crop width"))?;
-    let height = usize::try_from(request.crop.height)
-        .map_err(|_| OutputFormatError::arithmetic("converting crop height"))?;
-    let expected = width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(usize::from(request.pixel_format.channel_count())))
-        .ok_or_else(|| OutputFormatError::arithmetic("calculating direct U8 output size"))?;
-    if output.len() != expected {
-        return Err(OutputFormatError::UnsupportedCombination {
-            combination: "direct U8 destination length differs from the output contract",
-        });
-    }
-    let context = FormatContext {
+    let FormatContext {
         planes,
-        alpha,
         request,
-        component_count,
         width,
         height,
-    };
-    if request.internal_color == ColorFormat::Luma
-        && request.output_color == ColorFormat::Luma
-        && alpha.is_none()
-        && request.pixel_format == PixelFormat::U8(ChannelLayout::Luma)
-    {
+        ..
+    } = context;
+    if is_luma_plane(request, context.alpha.is_some()) {
         let plane = planes[0];
         let start_x = usize::try_from(request.crop.x - plane.origin_x)
             .map_err(|_| OutputFormatError::arithmetic("converting SIMD luma crop x"))?;
@@ -357,22 +419,13 @@ pub(crate) fn format_components_u8_into_with_cpu(
         );
     }
     if !interleave::try_store(context, output) {
-        let mut index = 0;
         let scaling = context.channel_scales();
-        for_each_ordered(context, |sample, component, alpha| {
+        fill_ordered(context, output, |sample, component, alpha| {
             let scaled = scaling.apply(sample, component, alpha)?;
-            output[index] =
-                u8::try_from(clamp_sample(scaled, 0, 255)).expect("sample is clipped to u8");
-            index += 1;
-            Ok(())
+            Ok(u8::try_from(clamp_sample(scaled, 0, 255)).expect("sample is clipped to u8"))
         })?;
     }
-    if request.premultiply_alpha {
-        super::premultiply::premultiply_u8(
-            output,
-            usize::from(request.pixel_format.channel_count()),
-        )?;
-    }
+    // The caller premultiplies, as it does for every other storage type.
     Ok(false)
 }
 
@@ -384,6 +437,8 @@ pub(super) struct FormatContext<'a> {
     pub(super) component_count: usize,
     pub(super) width: usize,
     pub(super) height: usize,
+    /// Where the rows of a large output are stored.
+    pub(super) executor: Executor,
 }
 
 impl FormatContext<'_> {
@@ -400,17 +455,16 @@ impl FormatContext<'_> {
         if self.is_padding(component, alpha) {
             return ChannelScale::Padding;
         }
-        let (color, depth, scaled) = if alpha {
+        if alpha {
             let format = self.alpha_format();
-            (ColorFormat::Luma, format.bit_depth, format.scaled)
-        } else {
-            (
-                self.request.output_color,
-                self.request.bit_depth,
-                self.request.scaled,
-            )
-        };
-        ChannelScale::resolve(component, color, depth, scaled)
+            return ChannelScale::alpha(format.bit_depth, format.scaled);
+        }
+        ChannelScale::resolve(
+            component,
+            self.request.output_color,
+            self.request.bit_depth,
+            self.request.scaled,
+        )
     }
 
     fn is_padding(self, component: usize, alpha: bool) -> bool {
@@ -595,247 +649,73 @@ impl ChannelScales<'_> {
     }
 }
 
-fn pack_bits(context: FormatContext<'_>) -> Result<DecodedSamples, OutputFormatError> {
-    let row_bytes = context.width.div_ceil(8);
-    let length = row_bytes
-        .checked_mul(context.height)
-        .ok_or_else(|| OutputFormatError::arithmetic("calculating bit-packed output size"))?;
-    let mut output = vec![0_u8; length];
-    for y in 0..context.height {
-        for x in 0..context.width {
-            let sample = context.color_components(x, y)?[0];
-            let scaled = scale_integer_component(
-                sample,
-                0,
-                ColorFormat::Luma,
-                context.request.bit_depth,
-                context.request.scaled,
-            )?;
-            let clipped = clamp_sample(scaled, 0, 1);
-            let bit = match context.request.bit_depth {
-                OutputBitDepth::Bit1White => clipped,
-                OutputBitDepth::Bit1Black => 1 - clipped,
-                _ => unreachable!("bit packer selected only for 1-bit output"),
-            };
-            output[y * row_bytes + x / 8] |=
-                u8::try_from(bit).expect("bit is zero or one") << (7 - x % 8);
-        }
-    }
-    Ok(DecodedSamples::BitPacked(output))
-}
-
-fn pack_u8(
-    context: FormatContext<'_>,
-    elements: usize,
-    cpu: crate::CpuCapabilities,
-) -> Result<(DecodedSamples, bool), OutputFormatError> {
-    if context.request.internal_color == ColorFormat::Luma
-        && context.request.output_color == ColorFormat::Luma
-        && context.alpha.is_none()
-        && context.request.pixel_format == PixelFormat::U8(ChannelLayout::Luma)
-    {
-        let plane = context.planes[0];
-        let start_x = usize::try_from(context.request.crop.x - plane.origin_x)
-            .map_err(|_| OutputFormatError::arithmetic("converting SIMD luma crop x"))?;
-        let start_y = usize::try_from(context.request.crop.y - plane.origin_y)
-            .map_err(|_| OutputFormatError::arithmetic("converting SIMD luma crop y"))?;
-        let mut output = Vec::new();
-        let used_simd = append_u8(
-            cpu.level(),
-            plane.samples,
-            plane.stride,
-            [start_x, start_y],
-            [context.width, context.height],
-            context.request.scaled,
-            &mut output,
-        )?;
-        return Ok((DecodedSamples::U8(output), used_simd));
-    }
-    let mut output = vec![0; elements];
-    if interleave::try_store(context, &mut output) {
-        return Ok((DecodedSamples::U8(output), false));
-    }
-    output.clear();
-    let scaling = context.channel_scales();
-    for_each_ordered(context, |sample, component, alpha| {
-        let scaled = scaling.apply(sample, component, alpha)?;
-        output.push(u8::try_from(clamp_sample(scaled, 0, 255)).expect("sample is clipped to u8"));
-        Ok(())
-    })?;
-    Ok((DecodedSamples::U8(output), false))
-}
-
-fn pack_u16(
-    context: FormatContext<'_>,
-    elements: usize,
-) -> Result<DecodedSamples, OutputFormatError> {
-    let mut output = vec![0; elements];
-    if interleave::try_store(context, &mut output) {
-        return Ok(DecodedSamples::U16(output));
-    }
-    output.clear();
-    let scaling = context.channel_scales();
-    let maximum = if matches!(context.request.bit_depth, OutputBitDepth::U10) {
-        1_023
+/// The component each sample of an ordered output pixel stores, in order,
+/// and whether it is alpha: the primaries in the layout's order, or every
+/// plane of an N-component image, then alpha if the output has it.
+fn ordered_channels(context: FormatContext<'_>) -> Vec<(usize, bool)> {
+    let primaries = if matches!(context.request.output_color, ColorFormat::NComponent(_)) {
+        context.planes.len()
     } else {
-        65_535
+        context.pixel_shape().primary_count
     };
-    for_each_ordered(context, |sample, component, alpha| {
-        let scaled = scaling.apply(sample, component, alpha)?;
-        output.push(
-            u16::try_from(clamp_sample(scaled, 0, maximum)).expect("sample is clipped to u16"),
-        );
-        Ok(())
-    })?;
-    Ok(DecodedSamples::U16(output))
-}
-
-fn pack_i16(
-    context: FormatContext<'_>,
-    elements: usize,
-) -> Result<DecodedSamples, OutputFormatError> {
-    let mut output = Vec::with_capacity(elements);
-    let scaling = context.channel_scales();
-    for_each_ordered(context, |sample, component, alpha| {
-        let scaled = scaling.apply(sample, component, alpha)?;
-        output.push(
-            i16::try_from(clamp_sample(scaled, -32_768, 32_767)).expect("sample is clipped to i16"),
-        );
-        Ok(())
-    })?;
-    Ok(DecodedSamples::I16(output))
-}
-
-fn pack_i32(
-    context: FormatContext<'_>,
-    elements: usize,
-) -> Result<DecodedSamples, OutputFormatError> {
-    let mut output = Vec::with_capacity(elements);
-    let scaling = context.channel_scales();
-    for_each_ordered(context, |sample, component, alpha| {
-        output.push(scaling.apply(sample, component, alpha)?);
-        Ok(())
-    })?;
-    Ok(DecodedSamples::I32(output))
-}
-
-fn pack_f16(
-    context: FormatContext<'_>,
-    elements: usize,
-) -> Result<DecodedSamples, OutputFormatError> {
-    let mut output = Vec::with_capacity(elements);
-    for_each_ordered(context, |sample, component, alpha| {
-        if context.is_padding(component, alpha) {
-            output.push(0);
-            return Ok(());
-        }
-        let scaled = if alpha {
-            context.alpha_format().scaled
-        } else {
-            context.request.scaled
-        };
-        output.push(float16_bits(sample, scaled)?);
-        Ok(())
-    })?;
-    Ok(DecodedSamples::F16(output))
-}
-
-fn pack_f32(
-    context: FormatContext<'_>,
-    elements: usize,
-) -> Result<DecodedSamples, OutputFormatError> {
-    let mut output = Vec::with_capacity(elements);
-    for_each_ordered(context, |sample, component, alpha| {
-        if context.is_padding(component, alpha) {
-            output.push(0.0);
-            return Ok(());
-        }
-        let format = if alpha {
-            context.alpha_format()
-        } else {
-            super::AlphaFormatRequest {
-                bit_depth: context.request.bit_depth,
-                scaled: context.request.scaled,
-            }
-        };
-        let OutputBitDepth::F32 {
-            mantissa_length,
-            exponent_bias,
-        } = format.bit_depth
-        else {
-            return Err(OutputFormatError::UnsupportedCombination {
-                combination: "alpha and primary floating-point depth",
-            });
-        };
-        output.push(f32::from_bits(float32_bits(
-            sample,
-            format.scaled,
-            mantissa_length,
-            exponent_bias,
-        )?));
-        Ok(())
-    })?;
-    Ok(DecodedSamples::F32(output))
-}
-
-fn for_each_ordered(
-    context: FormatContext<'_>,
-    mut format: impl FnMut(i32, usize, bool) -> Result<(), OutputFormatError>,
-) -> Result<(), OutputFormatError> {
-    if context.width == 0 || context.height == 0 {
-        return Ok(());
+    let mut channels: Vec<_> = (0..primaries).map(|component| (component, false)).collect();
+    if context.alpha.is_some() {
+        channels.push((primaries, true));
     }
+    channels
+}
+
+/// Gathers row `y` of the output into `samples`, `count` samples to a
+/// pixel in the order the output stores them: colour-converted, ordered
+/// and unscaled. On an error, returns how many samples were gathered before
+/// the pixel that failed.
+#[inline(never)]
+fn ordered_row(
+    context: FormatContext<'_>,
+    y: usize,
+    count: usize,
+    samples: &mut [i32],
+) -> Result<(), (usize, OutputFormatError)> {
+    let crop = |value: u32, what| {
+        usize::try_from(value).map_err(|_| (0, OutputFormatError::arithmetic(what)))
+    };
+    let source_x = crop(context.request.crop.x, "converting crop x")?;
+    let source_y = crop(context.request.crop.y, "converting crop y")? + y;
+    let pixels = samples.chunks_exact_mut(count).enumerate();
     if matches!(context.request.output_color, ColorFormat::NComponent(_)) {
-        let crop_x = usize::try_from(context.request.crop.x)
-            .map_err(|_| OutputFormatError::arithmetic("converting N-component crop x"))?;
-        let crop_y = usize::try_from(context.request.crop.y)
-            .map_err(|_| OutputFormatError::arithmetic("converting N-component crop y"))?;
-        for source_y in crop_y..crop_y + context.height {
-            for source_x in crop_x..crop_x + context.width {
-                for (component, plane) in context.planes.iter().enumerate() {
-                    format(plane.sample(source_x, source_y), component, false)?;
-                }
-                if let Some(alpha) = context.alpha {
-                    format(alpha.sample(source_x, source_y), context.planes.len(), true)?;
-                }
+        for (x, pixel) in pixels {
+            for (sample, plane) in pixel.iter_mut().zip(context.planes) {
+                *sample = plane.sample(source_x + x, source_y);
+            }
+            if let Some(alpha) = context.alpha {
+                pixel[count - 1] = alpha.sample(source_x + x, source_y);
             }
         }
         return Ok(());
     }
-    let crop_x = usize::try_from(context.request.crop.x)
-        .map_err(|_| OutputFormatError::arithmetic("converting crop x"))?;
-    let crop_y = usize::try_from(context.request.crop.y)
-        .map_err(|_| OutputFormatError::arithmetic("converting crop y"))?;
     let shape = context.pixel_shape();
-    let has_alpha = context.alpha.is_some();
-    for source_y in crop_y..crop_y + context.height {
-        for source_x in crop_x..crop_x + context.width {
-            let (samples, count) = context.ordered_components_at(source_x, source_y, shape)?;
-            for (component, &sample) in samples[..count].iter().enumerate() {
-                format(sample, component, has_alpha && component + 1 == count)?;
-            }
-        }
+    for (x, pixel) in pixels {
+        let (ordered, _) = context
+            .ordered_components_at(source_x + x, source_y, shape)
+            .map_err(|error| (x * count, error))?;
+        pixel.copy_from_slice(&ordered[..count]);
     }
     Ok(())
 }
 
-const fn is_direct(internal: ColorFormat, output: ColorFormat) -> bool {
+/// Whether the internal components are the output channels themselves, so
+/// that no colour conversion runs between them in either direction.
+pub(crate) const fn is_direct(internal: ColorFormat, output: ColorFormat) -> bool {
     matches!((internal, output), (ColorFormat::Luma, ColorFormat::Luma))
         || matches!((internal, output), (ColorFormat::Yuv(a), ColorFormat::Yuv(b)) if a as u8 == b as u8)
         || matches!((internal, output), (ColorFormat::NComponent(a), ColorFormat::NComponent(b)) if a == b)
 }
 
+/// The channels of each pixel of `format`: those of a packed format are
+/// RGB.
 pub(super) const fn layout(format: PixelFormat) -> ChannelLayout {
-    match format {
-        PixelFormat::BitPacked(layout)
-        | PixelFormat::U8(layout)
-        | PixelFormat::U16(layout)
-        | PixelFormat::I16(layout)
-        | PixelFormat::I32(layout)
-        | PixelFormat::F16(layout)
-        | PixelFormat::F32(layout) => layout,
-        PixelFormat::Rgb555 | PixelFormat::Rgb565 | PixelFormat::Rgb101010 | PixelFormat::Rgbe => {
-            ChannelLayout::Rgb
-        }
+    match format.channel_layout() {
+        Some(layout) => layout,
+        None => ChannelLayout::Rgb,
     }
 }

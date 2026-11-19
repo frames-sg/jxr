@@ -1,25 +1,7 @@
+mod common;
+
 use jxr_core::Orientation;
 use jxr_native::{AnnexAWriteOptions, NativeError, parse_annex_a, parse_codestream, write_annex_a};
-
-fn minimal_raw_codestream() -> Vec<u8> {
-    let mut bytes = b"WMPHOTO\0".to_vec();
-    bytes.extend_from_slice(&[0x11, 0x00, 0x80, 0x01]);
-    bytes.extend_from_slice(&15_u16.to_be_bytes());
-    bytes.extend_from_slice(&15_u16.to_be_bytes());
-    let mut bit_position = bytes.len() * 8;
-    for (value, count) in [(0, 3), (0, 1), (3, 4), (1, 1), (1, 8)] {
-        for shift in (0..count).rev() {
-            if bit_position / 8 == bytes.len() {
-                bytes.push(0);
-            }
-            let bit = u8::from(((value >> shift) & 1) != 0);
-            bytes[bit_position / 8] |= bit << (7 - (bit_position % 8));
-            bit_position += 1;
-        }
-    }
-    bytes.extend_from_slice(&[0xFD, 0, 0, 1, 0x5a, 0, 0, 0]);
-    bytes
-}
 
 fn annex_a_file(image_offset: u32, image_len: u32) -> Vec<u8> {
     const ENTRY_COUNT: u16 = 5;
@@ -133,8 +115,8 @@ fn alpha_extent_compatibility_does_not_accept_other_invalid_ranges() {
 
 #[test]
 fn writes_parseable_annex_a_with_exact_payloads() {
-    let primary = minimal_raw_codestream();
-    let alpha = minimal_raw_codestream();
+    let primary = common::dc_only_luma_codestream(false, [0; 3]);
+    let alpha = common::dc_only_luma_codestream(false, [0; 3]);
     let profile = [1, 3, 5, 7, 9];
     let guid = [0xa5; 16];
     let options = AnnexAWriteOptions::new(16, 16, guid)
@@ -169,7 +151,7 @@ fn writes_parseable_annex_a_with_exact_payloads() {
 
 #[test]
 fn writer_rejects_nested_or_inconsistent_codestreams() {
-    let primary = minimal_raw_codestream();
+    let primary = common::dc_only_luma_codestream(false, [0; 3]);
     let options = AnnexAWriteOptions::new(15, 16, [0xa5; 16]);
     assert!(matches!(
         write_annex_a(&primary, &options),
@@ -190,7 +172,7 @@ fn writer_rejects_nested_or_inconsistent_codestreams() {
 
 #[test]
 fn parser_rejects_non_float_resolution_entries() {
-    let primary = minimal_raw_codestream();
+    let primary = common::dc_only_luma_codestream(false, [0; 3]);
     let options = AnnexAWriteOptions::new(16, 16, [0xa5; 16]);
     let mut bytes = write_annex_a(&primary, &options).unwrap();
     // With no ICC entry, vertical resolution is the sixth sorted IFD entry.

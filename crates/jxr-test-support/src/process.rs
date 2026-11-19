@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::{
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
@@ -86,7 +87,17 @@ impl T835Oracle {
             .map_err(|source| io("canonicalize input", input, source))?;
         let output_dir = OracleTempDir::create()?;
         let raw_path = output_dir.path.join("decoded.raw");
-        let result = Command::new(&self.executable)
+        // The reference program stages each plane of a planar output in a
+        // fixed-name file in its working directory, so every decode gets a
+        // directory of its own. A bare program name is still found on PATH.
+        let executable = if self.executable.components().count() > 1 {
+            std::fs::canonicalize(&self.executable)
+                .map_err(|source| io("locate T.835 decoder", &self.executable, source))?
+        } else {
+            self.executable.clone()
+        };
+        let result = Command::new(&executable)
+            .current_dir(&output_dir.path)
             .arg("-P")
             .arg(self.profile_limit.argument())
             .arg("-L")
@@ -136,6 +147,44 @@ impl Drop for OracleTempDir {
     }
 }
 
+/// A file of given bytes, new in the temporary directory, and removed when
+/// dropped.
+///
+/// The file is created exclusively, so that it is never a file or a link
+/// that was there before, and only a file made here is removed.
+#[derive(Debug)]
+pub struct TempFile {
+    path: PathBuf,
+}
+
+impl TempFile {
+    /// Writes `bytes` to a new file whose name starts with `prefix`.
+    pub fn write(prefix: &str, bytes: &[u8]) -> std::io::Result<Self> {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("{prefix}-{}-{sequence}.jxr", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let written = Self { path };
+        file.write_all(bytes)?;
+        Ok(written)
+    }
+
+    /// Where the file is.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 fn io(operation: &'static str, path: &Path, source: std::io::Error) -> OracleError {
     OracleError::Io {
         operation,
@@ -147,6 +196,18 @@ fn io(operation: &'static str, path: &Path, source: std::io::Error) -> OracleErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_temporary_file_is_new_holds_its_bytes_and_goes_when_dropped() {
+        let first = TempFile::write("jxr-test-support-temp", b"first").unwrap();
+        let second = TempFile::write("jxr-test-support-temp", b"second").unwrap();
+        assert_ne!(first.path(), second.path());
+        assert_eq!(std::fs::read(first.path()).unwrap(), b"first");
+        let path = first.path().to_owned();
+        drop(first);
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(second.path()).unwrap(), b"second");
+    }
 
     #[test]
     fn profile_limit_uses_t835_profile_identifiers() {

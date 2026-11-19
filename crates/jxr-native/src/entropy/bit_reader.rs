@@ -1,4 +1,5 @@
-//! Packet-scoped, most-significant-bit-first reading.
+//! Packet-scoped, most-significant-bit-first reading, of tile packets and,
+//! through `bit_reader::BitReader`, of the codestream headers.
 
 use super::EntropyError;
 

@@ -13,30 +13,32 @@ pub(super) fn known_descriptor(code: u8) -> Option<AnnexAPixelFormatDescriptor> 
         .or_else(|| cmyk_yuv_descriptor(code))
 }
 
+// Windows SDK `wincodec.h` GUIDs with little-endian `Data1`/`Data2`/`Data3`.
+const WIC_RGBA: [u8; 16] = [
+    0x2d, 0xad, 0xc7, 0xf5, 0x8d, 0x6a, 0xdd, 0x43, 0xa7, 0xa8, 0xa2, 0x99, 0x35, 0x26, 0x1a, 0xe9,
+];
+const WIC_PRGBA: [u8; 16] = [
+    0x50, 0xa6, 0xc4, 0x3c, 0x27, 0xa5, 0x37, 0x4d, 0xa9, 0x16, 0x31, 0x42, 0xc7, 0xeb, 0xed, 0xba,
+];
+const WIC_RGB_FLOAT: [u8; 16] = [
+    0x8f, 0xd7, 0xfe, 0xe3, 0xdb, 0xe8, 0xcf, 0x4a, 0x84, 0xc1, 0xe9, 0x7f, 0x61, 0x36, 0xb3, 0x27,
+];
+
+/// Every identifier [`wic_descriptor`] classifies: the formats JPEG XR files
+/// declare that Table A.6 has no code for.
+pub(super) const WIC_GUIDS: [[u8; 16]; 3] = [WIC_RGBA, WIC_PRGBA, WIC_RGB_FLOAT];
+
 pub(super) fn wic_descriptor(guid: [u8; 16]) -> Option<AnnexAPixelFormatDescriptor> {
-    // Windows SDK `wincodec.h` GUIDs with little-endian `Data1`/`Data2`/`Data3`.
-    const RGBA: [u8; 16] = [
-        0x2d, 0xad, 0xc7, 0xf5, 0x8d, 0x6a, 0xdd, 0x43, 0xa7, 0xa8, 0xa2, 0x99, 0x35, 0x26, 0x1a,
-        0xe9,
-    ];
-    const PRGBA: [u8; 16] = [
-        0x50, 0xa6, 0xc4, 0x3c, 0x27, 0xa5, 0x37, 0x4d, 0xa9, 0x16, 0x31, 0x42, 0xc7, 0xeb, 0xed,
-        0xba,
-    ];
-    const RGB_FLOAT: [u8; 16] = [
-        0x8f, 0xd7, 0xfe, 0xe3, 0xdb, 0xe8, 0xcf, 0x4a, 0x84, 0xc1, 0xe9, 0x7f, 0x61, 0x36, 0xb3,
-        0x27,
-    ];
     match guid {
-        RGBA | PRGBA => Some(rgb(
+        WIC_RGBA | WIC_PRGBA => Some(rgb(
             4,
             true,
-            guid == PRGBA,
+            guid == WIC_PRGBA,
             AnnexABitDepth::U8,
             AnnexANumericKind::Unsigned,
             AnnexAChannelOrder::Rgba,
         )),
-        RGB_FLOAT => Some(rgb(
+        WIC_RGB_FLOAT => Some(rgb(
             3,
             false,
             false,

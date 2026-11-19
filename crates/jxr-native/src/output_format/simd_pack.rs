@@ -3,37 +3,9 @@
 use fearless_simd::{Bytes, Level, Simd, SimdBase, SimdNarrow};
 
 use super::OutputFormatError;
+use crate::cpu::{I32Vectors, with_i32_vectors};
 
 const MIN_VECTOR_SAMPLES: usize = 64;
-
-pub(super) fn append_u8(
-    level: Level,
-    input: &[i32],
-    stride: usize,
-    start: [usize; 2],
-    dimensions: [usize; 2],
-    scaled: bool,
-    output: &mut Vec<u8>,
-) -> Result<bool, OutputFormatError> {
-    let [width, height] = dimensions;
-    let count = width
-        .checked_mul(height)
-        .ok_or_else(|| OutputFormatError::arithmetic("calculating SIMD output length"))?;
-    let output_start = output.len();
-    let output_end = output_start
-        .checked_add(count)
-        .ok_or_else(|| OutputFormatError::arithmetic("growing SIMD output"))?;
-    output.resize(output_end, 0);
-    pack_u8_into(
-        level,
-        input,
-        stride,
-        start,
-        dimensions,
-        scaled,
-        &mut output[output_start..output_end],
-    )
-}
 
 pub(super) fn pack_u8_into(
     level: Level,
@@ -116,6 +88,25 @@ impl PackBias {
     }
 }
 
+/// Whether [`pack_u8_into`] stores an output of `dimensions` with a vector
+/// kernel at `level`.
+///
+/// A caller that stores an output a run of rows at a time reports the
+/// executor of the whole output, which is what this gives, rather than
+/// that of whichever run happened to be large enough.
+pub(super) fn packs_with_vectors(level: Level, [width, height]: [usize; 2]) -> bool {
+    if width.saturating_mul(height) < MIN_VECTOR_SAMPLES {
+        return false;
+    }
+    I32Vectors::of(level)
+        .is_some_and(|vectors| with_i32_vectors!(vectors, simd => width >= packed_lanes(simd)))
+}
+
+/// Samples one vector of packed bytes holds.
+const fn packed_lanes<S: Simd>(_simd: S) -> usize {
+    S::u8s::LEN
+}
+
 /// Returns the maximum input sample when a vector implementation packed the output.
 fn pack_accelerated(
     level: Level,
@@ -129,15 +120,10 @@ fn pack_accelerated(
     if output.len() < MIN_VECTOR_SAMPLES {
         return None;
     }
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if let Some(avx2) = level.as_avx2() {
-        return pack_vectorized(avx2, input, stride, start, dimensions, bias, output);
-    }
-    #[cfg(target_arch = "aarch64")]
-    if let Some(neon) = level.as_neon() {
-        return pack_vectorized(neon, input, stride, start, dimensions, bias, output);
-    }
-    None
+    let vectors = I32Vectors::of(level)?;
+    with_i32_vectors!(vectors, simd => {
+        pack_vectorized(simd, input, stride, start, dimensions, bias, output)
+    })
 }
 
 #[inline]
@@ -236,7 +222,37 @@ fn pack_scalar(
 mod tests {
     use fearless_simd::Level;
 
-    use super::append_u8;
+    use super::{OutputFormatError, pack_u8_into};
+
+    /// Packs onto the end of `output`, which grows by the packed samples.
+    fn append_u8(
+        level: Level,
+        input: &[i32],
+        stride: usize,
+        start: [usize; 2],
+        dimensions: [usize; 2],
+        scaled: bool,
+        output: &mut Vec<u8>,
+    ) -> Result<bool, OutputFormatError> {
+        let [width, height] = dimensions;
+        let count = width
+            .checked_mul(height)
+            .ok_or_else(|| OutputFormatError::arithmetic("calculating SIMD output length"))?;
+        let output_start = output.len();
+        let output_end = output_start
+            .checked_add(count)
+            .ok_or_else(|| OutputFormatError::arithmetic("growing SIMD output"))?;
+        output.resize(output_end, 0);
+        pack_u8_into(
+            level,
+            input,
+            stride,
+            start,
+            dimensions,
+            scaled,
+            &mut output[output_start..output_end],
+        )
+    }
 
     #[test]
     fn selected_simd_level_matches_scalar_u8_semantics() {

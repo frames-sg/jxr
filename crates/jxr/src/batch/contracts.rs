@@ -116,14 +116,7 @@ impl BatchGroupInfo {
     /// For bit-packed output, one storage element is one byte.
     #[must_use]
     pub const fn image_stride_elements(&self) -> usize {
-        let element_bytes = match self.storage_kind() {
-            StorageKind::BitPacked | StorageKind::U8 => 1,
-            StorageKind::U16 | StorageKind::I16 | StorageKind::F16Bits | StorageKind::PackedU16 => {
-                2
-            }
-            StorageKind::I32 | StorageKind::F32 | StorageKind::PackedU32 => 4,
-        };
-        self.layout.byte_len / element_bytes
+        self.layout.byte_len / self.storage_kind().element_bytes()
     }
 
     /// Per-image planar or interleaved surface layout.
@@ -310,59 +303,7 @@ pub enum CpuBatchSamples {
 /// Caller-owned storage for one prepared homogeneous CPU batch group.
 pub type CpuBatchDestination<'a> = jxr_core::DecodedSamplesMut<'a>;
 
-impl CpuBatchSamples {
-    /// Native storage type for this owner.
-    #[must_use]
-    pub const fn storage_kind(&self) -> StorageKind {
-        match self {
-            Self::BitPacked(_) => StorageKind::BitPacked,
-            Self::U8(_) => StorageKind::U8,
-            Self::U16(_) => StorageKind::U16,
-            Self::I16(_) => StorageKind::I16,
-            Self::I32(_) => StorageKind::I32,
-            Self::F16(_) => StorageKind::F16Bits,
-            Self::F32(_) => StorageKind::F32,
-            Self::Rgb555(_) | Self::Rgb565(_) => StorageKind::PackedU16,
-            Self::Rgb101010(_) | Self::Rgbe(_) => StorageKind::PackedU32,
-        }
-    }
-
-    /// Number of native storage elements across every image.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        match self {
-            Self::BitPacked(values) | Self::U8(values) => values.len(),
-            Self::U16(values) | Self::F16(values) | Self::Rgb555(values) | Self::Rgb565(values) => {
-                values.len()
-            }
-            Self::I16(values) => values.len(),
-            Self::I32(values) => values.len(),
-            Self::F32(values) => values.len(),
-            Self::Rgb101010(values) | Self::Rgbe(values) => values.len(),
-        }
-    }
-
-    /// Whether this owner contains no native storage elements.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Total bytes occupied by all native elements.
-    #[must_use]
-    pub fn byte_len(&self) -> usize {
-        match self {
-            Self::BitPacked(values) | Self::U8(values) => values.len(),
-            Self::U16(values) | Self::F16(values) | Self::Rgb555(values) | Self::Rgb565(values) => {
-                values.len().saturating_mul(2)
-            }
-            Self::I16(values) => values.len().saturating_mul(2),
-            Self::I32(values) => values.len().saturating_mul(4),
-            Self::F32(values) => values.len().saturating_mul(4),
-            Self::Rgb101010(values) | Self::Rgbe(values) => values.len().saturating_mul(4),
-        }
-    }
-}
+jxr_core::impl_sample_storage!(CpuBatchSamples);
 
 /// One successful homogeneous native CPU output group.
 #[derive(Debug, PartialEq)]
@@ -491,7 +432,7 @@ pub struct CpuBatchDiagnostics {
     pub direct_dense_images: u64,
     /// Images materialized through the general typed fallback.
     pub fallback_materialized_images: u64,
-    /// Reuses of a retained coefficient arena with sufficient capacity.
+    /// Reuses of retained coefficient storage with sufficient capacity.
     pub coefficient_workspace_reuses: u64,
     /// Aggregate bytes retained by coefficient arenas across workers.
     pub retained_coefficient_bytes: u64,

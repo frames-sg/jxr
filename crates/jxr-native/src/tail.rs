@@ -1,6 +1,8 @@
 //! Tile index and profile-level syntax between image headers and tile packets.
 
-use crate::{NativeError, ParsedHeaders};
+use jxr_core::BandPresence;
+
+use crate::{NativeError, ParsedHeaders, metadata::band_presence};
 
 /// One declared JPEG XR profile and level pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,8 +29,7 @@ impl CodestreamDirectory {
     pub fn parse(bytes: &[u8], headers: &ParsedHeaders) -> Result<Self, NativeError> {
         let mut cursor = ByteCursor::new(bytes, headers.bytes_consumed)?;
         let tile_count = tile_count(headers)?;
-        let index_required = headers.image.flags.frequency_mode() || tile_count > 1;
-        if index_required && !headers.image.flags.index_table_present() {
+        if headers.image.requires_index() && !headers.image.flags.index_table_present() {
             return Err(NativeError::ReservedValue {
                 field: "INDEX_TABLE_PRESENT_FLAG",
                 value: 0,
@@ -50,6 +51,97 @@ impl CodestreamDirectory {
             profiles,
             tile_data_offset: cursor.position(),
         })
+    }
+}
+
+/// The band a tile packet of a frequency-mode codestream carries.
+///
+/// A spatial-mode tile is one packet and has one index entry. A
+/// frequency-mode tile is one packet per band its image codes, and the tile
+/// index lists them tile by tile in the order of the variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PacketBand {
+    Dc,
+    LowPass,
+    HighPass,
+    Flexbits,
+}
+
+impl PacketBand {
+    /// The packets each tile of a frequency-mode image coding `bands` has,
+    /// in tile index order.
+    pub(crate) const fn coded(bands: BandPresence) -> &'static [Self] {
+        const ORDER: [PacketBand; 4] = [
+            PacketBand::Dc,
+            PacketBand::LowPass,
+            PacketBand::HighPass,
+            PacketBand::Flexbits,
+        ];
+        let count = match bands {
+            BandPresence::DcOnly => 1,
+            BandPresence::NoHighPass => 2,
+            BandPresence::NoFlexbits => 3,
+            BandPresence::All => 4,
+        };
+        ORDER.split_at(count).0
+    }
+
+    /// Packets, and index entries, of each tile of an image: one in spatial
+    /// mode, and one for each band it codes, [`Self::coded`], in frequency
+    /// mode.
+    pub(crate) const fn per_tile(frequency_mode: bool, bands: BandPresence) -> usize {
+        if frequency_mode {
+            Self::coded(bands).len()
+        } else {
+            1
+        }
+    }
+
+    /// Position of this band's packet among those of its tile, which is
+    /// also its position among the tile's index entries.
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Appends the tile index (when the image has one), `SubsequentBytes`, and a
+/// single profile-level record: the syntax [`CodestreamDirectory::parse`] reads.
+///
+/// `tile_offsets` are relative to the first byte after this directory, one
+/// for each tile of a spatial-mode image and one for each
+/// [`PacketBand::coded`] packet of each tile of a frequency-mode image.
+pub(crate) fn write_directory(
+    output: &mut Vec<u8>,
+    tile_offsets: Option<&[u64]>,
+    profile: ProfileLevel,
+) {
+    if let Some(offsets) = tile_offsets {
+        output.extend_from_slice(&INDEX_TABLE_START_CODE.to_be_bytes());
+        for &offset in offsets {
+            write_vlw(output, offset);
+        }
+    }
+    write_vlw(output, PROFILE_LEVEL_BYTES as u64);
+    // RESERVED_L is fifteen zero bits; the final bit marks the last record.
+    output.extend_from_slice(&[profile.profile_idc, profile.level_idc, 0, 1]);
+}
+
+const INDEX_TABLE_START_CODE: u16 = 1;
+/// Length of one `PROFILE_LEVEL_INFO` record.
+const PROFILE_LEVEL_BYTES: usize = 4;
+
+/// Writes a variable-length word in its shortest form.
+fn write_vlw(output: &mut Vec<u8>, value: u64) {
+    if let Ok(short) = u16::try_from(value)
+        && short < 0xfb00
+    {
+        output.extend_from_slice(&short.to_be_bytes());
+    } else if let Ok(medium) = u32::try_from(value) {
+        output.push(0xfb);
+        output.extend_from_slice(&medium.to_be_bytes());
+    } else {
+        output.push(0xfc);
+        output.extend_from_slice(&value.to_be_bytes());
     }
 }
 
@@ -78,19 +170,20 @@ fn parse_index(
     tile_count: usize,
 ) -> Result<Vec<u64>, NativeError> {
     let start_code = cursor.read_u16()?;
-    if start_code != 1 {
+    if start_code != INDEX_TABLE_START_CODE {
         return Err(NativeError::ReservedValue {
             field: "INDEX_TABLE_STARTCODE",
             value: u64::from(start_code),
         });
     }
-    let bands = if headers.image.flags.frequency_mode() {
-        4_usize.saturating_sub(usize::from(headers.primary.bands_present))
+    let frequency_mode = headers.image.flags.frequency_mode();
+    let bands = if frequency_mode {
+        band_presence(headers.primary.bands_present)?
     } else {
-        1
+        BandPresence::All
     };
     let count = tile_count
-        .checked_mul(bands)
+        .checked_mul(PacketBand::per_tile(frequency_mode, bands))
         .ok_or(NativeError::IntegerOverflow {
             operation: "computing tile index entry count",
         })?;
@@ -108,7 +201,7 @@ fn parse_profile_area(
     if subsequent_bytes == 0 {
         return Ok(Vec::new());
     }
-    if subsequent_bytes < 4 {
+    if subsequent_bytes < PROFILE_LEVEL_BYTES {
         return Err(NativeError::ReservedValue {
             field: "SubsequentBytes",
             value: subsequent_bytes as u64,
@@ -124,7 +217,7 @@ fn parse_profile_area(
     cursor.require_position(end)?;
     let mut profiles = Vec::new();
     loop {
-        if cursor.position().saturating_add(4) > end {
+        if cursor.position().saturating_add(PROFILE_LEVEL_BYTES) > end {
             return Err(NativeError::Truncated {
                 bit_position: cursor.position().saturating_mul(8),
                 requested_bits: 32,
@@ -231,7 +324,145 @@ impl<'a> ByteCursor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::ByteCursor;
+    use jxr_core::BandPresence;
+
+    use super::{
+        ByteCursor, CodestreamDirectory, PacketBand, ProfileLevel, write_directory, write_vlw,
+    };
+    use crate::{
+        CodestreamHeader, HeaderFlags, ImagePlaneHeader, QuantizerSet,
+        bit_writer::BitWriter,
+        header::{parse_codestream_headers, write_codestream_headers},
+    };
+
+    #[test]
+    fn a_tile_has_a_packet_for_each_band_its_image_codes_in_band_order() {
+        use PacketBand::{Dc, Flexbits, HighPass, LowPass};
+
+        assert_eq!(PacketBand::coded(BandPresence::DcOnly), [Dc]);
+        assert_eq!(PacketBand::coded(BandPresence::NoHighPass), [Dc, LowPass]);
+        assert_eq!(
+            PacketBand::coded(BandPresence::NoFlexbits),
+            [Dc, LowPass, HighPass]
+        );
+        let all = PacketBand::coded(BandPresence::All);
+        assert_eq!(all, [Dc, LowPass, HighPass, Flexbits]);
+        // A packet's place among its tile's packets is its band's.
+        for (place, band) in all.iter().enumerate() {
+            assert_eq!(band.index(), place);
+        }
+    }
+
+    /// The directory of a two-tile image in `frequency_mode` whose planes
+    /// declare the `bands_present` code, written with `offsets` and read
+    /// back.
+    fn written_directory(frequency_mode: bool, bands_present: u8, offsets: &[u64]) -> Vec<u64> {
+        let set = |present: bool| {
+            present.then(|| QuantizerSet {
+                components: vec![1],
+            })
+        };
+        let image = CodestreamHeader {
+            width: 32,
+            height: 16,
+            flags: HeaderFlags::from_parsed([
+                false,
+                frequency_mode,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+            ]),
+            orientation: 0,
+            overlap_mode: 0,
+            output_color_format: 0,
+            output_bit_depth: 1,
+            tile_widths_mb: vec![1],
+            tile_heights_mb: Vec::new(),
+            margins: [0; 4],
+        };
+        let plane = ImagePlaneHeader {
+            internal_color_format: 0,
+            scaled: false,
+            bands_present,
+            components: 1,
+            chroma_centering_x: 0,
+            chroma_centering_y: 0,
+            shift_bits: 0,
+            mantissa_length: 0,
+            exponent_bias: 0,
+            dc_quantizers: set(true),
+            lp_quantizers: set(bands_present < 3),
+            hp_quantizers: set(bands_present < 2),
+        };
+        let mut writer = BitWriter::new();
+        write_codestream_headers(&mut writer, &image, &plane, None).unwrap();
+        let mut bytes = writer.into_bytes();
+        let profile = ProfileLevel {
+            profile_idc: 111,
+            level_idc: 255,
+        };
+        write_directory(&mut bytes, Some(offsets), profile);
+        let headers = parse_codestream_headers(&bytes).unwrap();
+        let directory = CodestreamDirectory::parse(&bytes, &headers).unwrap();
+        assert_eq!(directory.profiles, [profile]);
+        // Every entry was read: the tile data starts where the bytes end.
+        assert_eq!(directory.tile_data_offset, bytes.len());
+        directory.tile_offsets
+    }
+
+    #[test]
+    fn a_frequency_mode_index_lists_every_band_packet_of_every_tile() {
+        // Offsets past the two-byte and five-byte word forms.
+        let offsets: Vec<u64> = (0..8).map(|entry| entry * 0x9000).collect();
+        for (bands_present, bands) in [
+            (0, BandPresence::All),
+            (1, BandPresence::NoFlexbits),
+            (2, BandPresence::NoHighPass),
+            (3, BandPresence::DcOnly),
+        ] {
+            let entries = 2 * PacketBand::coded(bands).len();
+            assert_eq!(
+                written_directory(true, bands_present, &offsets[..entries]),
+                offsets[..entries],
+                "{bands:?}"
+            );
+            // A spatial-mode tile is one packet whatever bands it codes.
+            assert_eq!(
+                written_directory(false, bands_present, &offsets[..2]),
+                offsets[..2],
+                "{bands:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn written_vlw_values_read_back_at_every_width_boundary() {
+        let values = [
+            0,
+            1,
+            0xfaff,
+            0xfb00,
+            0xffff,
+            u64::from(u32::MAX),
+            u64::from(u32::MAX) + 1,
+            u64::MAX,
+        ];
+        let mut bytes = Vec::new();
+        for value in values {
+            write_vlw(&mut bytes, value);
+        }
+        // 2 + 2 + 2 + 5 + 5 + 5 + 9 + 9 bytes: each value in its shortest form.
+        assert_eq!(bytes.len(), 39);
+        let mut cursor = ByteCursor::new(&bytes, 0).unwrap();
+        for value in values {
+            assert_eq!(cursor.read_vlw().unwrap(), value);
+        }
+        assert_eq!(cursor.position(), bytes.len());
+    }
 
     #[test]
     fn reads_all_vlw_encodings() {

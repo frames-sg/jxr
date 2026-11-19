@@ -1,34 +1,12 @@
 #![cfg(feature = "cuda")]
 
+mod common;
+
 use jxr::{
     BackendKind, BackendRequest, BatchDecodeOptions, ChannelLayout, CudaBatchDecoder,
     DecodeRequest, EncodedImage, JxrErrorKind, JxrView, PixelFormat,
 };
 use std::sync::Arc;
-
-fn decodable_minimal_raw_codestream() -> Vec<u8> {
-    let mut bytes = b"WMPHOTO\0".to_vec();
-    bytes.extend_from_slice(&[0x11, 0x00, 0x80, 0x01]);
-    bytes.extend_from_slice(&15_u16.to_be_bytes());
-    bytes.extend_from_slice(&15_u16.to_be_bytes());
-    let mut bit_position = bytes.len() * 8;
-    for (value, count) in [(0, 3), (0, 1), (3, 4), (1, 1), (1, 8)] {
-        push_bits(&mut bytes, &mut bit_position, value, count);
-    }
-    bytes.extend_from_slice(&[0xFD, 0, 0, 1, 0x5a, 0, 0, 0]);
-    bytes
-}
-
-fn push_bits(bytes: &mut Vec<u8>, bit_position: &mut usize, value: u64, count: u8) {
-    for shift in (0..count).rev() {
-        if *bit_position / 8 == bytes.len() {
-            bytes.push(0);
-        }
-        let bit = u8::from(((value >> shift) & 1) != 0);
-        bytes[*bit_position / 8] |= bit << (7 - (*bit_position % 8));
-        *bit_position += 1;
-    }
-}
 
 fn request(backend: BackendRequest) -> DecodeRequest {
     DecodeRequest::new(PixelFormat::U8(ChannelLayout::Luma)).with_backend(backend)
@@ -36,7 +14,7 @@ fn request(backend: BackendRequest) -> DecodeRequest {
 
 #[test]
 fn prepared_reconstruction_builds_an_executable_cuda_plan() {
-    let bytes = decodable_minimal_raw_codestream();
+    let bytes = common::dc_only_luma_codestream(false, [0; 3]);
     let view = JxrView::parse(&bytes).unwrap();
     let prepared = view
         .decoder()
@@ -50,7 +28,7 @@ fn prepared_reconstruction_builds_an_executable_cuda_plan() {
 
 #[test]
 fn strict_cuda_without_an_attached_session_never_falls_back() {
-    let bytes = decodable_minimal_raw_codestream();
+    let bytes = common::dc_only_luma_codestream(false, [0; 3]);
     let view = JxrView::parse(&bytes).unwrap();
     let error = view
         .decoder()
@@ -61,7 +39,7 @@ fn strict_cuda_without_an_attached_session_never_falls_back() {
 
 #[test]
 fn auto_without_an_attached_cuda_session_remains_on_cpu() {
-    let bytes = decodable_minimal_raw_codestream();
+    let bytes = common::dc_only_luma_codestream(false, [0; 3]);
     let view = JxrView::parse(&bytes).unwrap();
     let image = view
         .decoder()
@@ -73,7 +51,7 @@ fn auto_without_an_attached_cuda_session_remains_on_cpu() {
 #[test]
 #[ignore = "requires a compatible NVIDIA GPU, CUDA driver, and compiled CUDA Oxide kernels"]
 fn cuda_submission_resident_readback_and_host_decode_match_cpu() {
-    let bytes = decodable_minimal_raw_codestream();
+    let bytes = common::dc_only_luma_codestream(false, [0; 3]);
     let view = JxrView::parse(&bytes).unwrap();
     let cpu = view
         .decoder()
@@ -133,7 +111,7 @@ fn cuda_submission_resident_readback_and_host_decode_match_cpu() {
 #[test]
 #[ignore = "requires a compatible NVIDIA GPU, CUDA driver, and compiled CUDA Oxide kernels"]
 fn cuda_dense_batch_and_checked_destination_match_individual_output() {
-    let bytes = decodable_minimal_raw_codestream();
+    let bytes = common::dc_only_luma_codestream(false, [0; 3]);
     let view = JxrView::parse(&bytes).unwrap();
     let session = jxr::cuda::CudaDecoderSession::system_default().unwrap();
     let prepared = view
@@ -164,7 +142,7 @@ fn cuda_dense_batch_and_checked_destination_match_individual_output() {
 #[test]
 #[ignore = "requires a compatible NVIDIA GPU, CUDA driver, and compiled CUDA Oxide kernels"]
 fn high_level_cuda_batch_preserves_native_groups_and_resident_outputs() {
-    let source: Arc<[u8]> = decodable_minimal_raw_codestream().into();
+    let source: Arc<[u8]> = common::dc_only_luma_codestream(false, [0; 3]).into();
     let session = jxr::cuda::CudaDecoderSession::system_default().unwrap();
     let decoder = CudaBatchDecoder::with_session(session, BatchDecodeOptions::default()).unwrap();
     let inputs = (0..8)

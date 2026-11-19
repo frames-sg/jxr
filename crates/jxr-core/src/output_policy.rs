@@ -1,6 +1,6 @@
 //! Device-neutral reconstruction output policy shared by CPU and accelerators.
 
-use crate::{ColorFormat, PixelFormat};
+use crate::{AnnexABitDepth, ColorFormat, PixelFormat, SampleFormat};
 
 /// A checked crop window within reconstructed-plane coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -48,6 +48,94 @@ pub enum OutputBitDepth {
 }
 
 impl OutputBitDepth {
+    /// The `OUTPUT_BITDEPTH` code and the plane-header fields that qualify
+    /// it: `(code, SHIFT_BITS, mantissa length, exponent bias)`.
+    ///
+    /// This is the inverse of [`Self::from_header_fields`]; `Rgb101010` is
+    /// the RGB reading of the ten-bit code.
+    #[must_use]
+    pub const fn header_fields(self) -> (u8, u8, u8, i8) {
+        match self {
+            Self::Bit1White => (0, 0, 0, 0),
+            Self::U8 => (1, 0, 0, 0),
+            Self::U16 { shift_bits } => (2, shift_bits, 0, 0),
+            Self::I16 { shift_bits } => (3, shift_bits, 0, 0),
+            Self::F16 => (4, 0, 0, 0),
+            Self::I32 { shift_bits } => (6, shift_bits, 0, 0),
+            Self::F32 {
+                mantissa_length,
+                exponent_bias,
+            } => (7, 0, mantissa_length, exponent_bias),
+            Self::Rgb555 => (8, 0, 0, 0),
+            Self::U10 | Self::Rgb101010 => (9, 0, 0, 0),
+            Self::Rgb565 => (10, 0, 0, 0),
+            Self::Bit1Black => (15, 0, 0, 0),
+        }
+    }
+
+    /// The sample representation of this depth: for packed RGB, that of
+    /// its widest field, the six-bit green of RGB565, whose red and blue
+    /// fields are five bits.
+    #[must_use]
+    pub const fn sample_format(self) -> SampleFormat {
+        match self {
+            Self::Bit1White | Self::Bit1Black => SampleFormat::Bit1,
+            Self::U8 => SampleFormat::Unsigned { bits: 8 },
+            Self::U10 | Self::Rgb101010 => SampleFormat::Unsigned { bits: 10 },
+            Self::U16 { .. } => SampleFormat::Unsigned { bits: 16 },
+            Self::Rgb555 => SampleFormat::Unsigned { bits: 5 },
+            Self::Rgb565 => SampleFormat::Unsigned { bits: 6 },
+            Self::I16 { .. } => SampleFormat::Signed { bits: 16 },
+            Self::I32 { .. } => SampleFormat::Signed { bits: 32 },
+            Self::F16 => SampleFormat::Float16,
+            Self::F32 { .. } => SampleFormat::Float32,
+        }
+    }
+
+    /// The largest value an unsigned integer sample of this depth stores,
+    /// that of its [`Self::sample_format`]. `None` for signed and
+    /// floating-point depths.
+    #[must_use]
+    pub const fn maximum(self) -> Option<u16> {
+        match self.sample_format() {
+            SampleFormat::Bit1 => Some(1),
+            SampleFormat::Unsigned { bits } => Some(u16::MAX >> (16 - bits)),
+            SampleFormat::Signed { .. }
+            | SampleFormat::FixedPoint { .. }
+            | SampleFormat::Float16
+            | SampleFormat::Float32 => None,
+        }
+    }
+
+    /// The depth samples stored at the Annex-A depth `depth` are coded at,
+    /// qualified by the plane-header fields as [`Self::from_header_fields`]
+    /// takes them. A stored one-bit sample is the sample itself: one is the
+    /// brighter value.
+    #[must_use]
+    pub const fn from_annex_a(
+        depth: AnnexABitDepth,
+        shift_bits: u8,
+        mantissa_length: u8,
+        exponent_bias: i8,
+    ) -> Self {
+        match depth {
+            AnnexABitDepth::Bit1 => Self::Bit1White,
+            AnnexABitDepth::U8 => Self::U8,
+            AnnexABitDepth::U10 => Self::U10,
+            AnnexABitDepth::U16 => Self::U16 { shift_bits },
+            AnnexABitDepth::I16 => Self::I16 { shift_bits },
+            AnnexABitDepth::F16 => Self::F16,
+            AnnexABitDepth::I32 => Self::I32 { shift_bits },
+            AnnexABitDepth::F32 => Self::F32 {
+                mantissa_length,
+                exponent_bias,
+            },
+            AnnexABitDepth::Rgb555 => Self::Rgb555,
+            AnnexABitDepth::Rgb565 => Self::Rgb565,
+            AnnexABitDepth::Rgb101010 => Self::Rgb101010,
+        }
+    }
+
     /// Convert parsed T.832 header fields to a known output-depth policy.
     #[must_use]
     pub const fn from_header_fields(

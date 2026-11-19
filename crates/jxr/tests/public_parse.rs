@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::Arc;
 
 use jxr::{
@@ -6,66 +8,31 @@ use jxr::{
 };
 
 fn minimal_raw_codestream() -> Vec<u8> {
-    let mut bytes = b"WMPHOTO\0".to_vec();
-    bytes.extend_from_slice(&[0x11, 0x00, 0x80, 0x01]);
-    bytes.extend_from_slice(&15_u16.to_be_bytes());
-    bytes.extend_from_slice(&15_u16.to_be_bytes());
-    let mut bit_position = bytes.len() * 8;
-    for (value, count) in [
-        (0, 3),
-        (0, 1),
-        (0, 4),
-        (1, 1),
-        (1, 8),
-        (0, 1),
-        (1, 1),
-        (1, 8),
-        (0, 1),
-        (1, 1),
-        (1, 8),
-    ] {
-        push_bits(&mut bytes, &mut bit_position, value, count);
-    }
-    // VLW escape mode encodes zero subsequent bytes, followed by one tile packet.
-    bytes.extend_from_slice(&[0xFD, 0, 0, 1, 0]);
-    bytes
-}
-
-fn decodable_minimal_raw_codestream() -> Vec<u8> {
-    dc_only_luma_codestream(false, [0, 0, 0])
+    // Y-only, all bands, uniform DC, LP and HP quantizers of one; the VLW
+    // escape mode encodes zero subsequent bytes, followed by one tile packet.
+    common::codestream(
+        0x01,
+        &[
+            (0, 3),
+            (0, 1),
+            (0, 4),
+            (1, 1),
+            (1, 8),
+            (0, 1),
+            (1, 1),
+            (1, 8),
+            (0, 1),
+            (1, 1),
+            (1, 8),
+        ],
+        &[0xFD, 0, 0, 1, 0],
+    )
 }
 
 /// Macroblock payload whose DC decodes to different samples under scaled and
 /// unscaled arithmetic (127..=128 versus 126..=127), so a plane decoded with the
 /// wrong flag is observable.
 const NONZERO_DC_MACROBLOCK: [u8; 3] = [0x0c, 0xc0, 0x00];
-
-/// 16x16 DC-only luma codestream. `scaled` sets the plane header's
-/// scaled-arithmetic bit; `macroblock` is the tile's entropy-coded payload.
-fn dc_only_luma_codestream(scaled: bool, macroblock: [u8; 3]) -> Vec<u8> {
-    let mut bytes = b"WMPHOTO\0".to_vec();
-    bytes.extend_from_slice(&[0x11, 0x00, 0x80, 0x01]);
-    bytes.extend_from_slice(&15_u16.to_be_bytes());
-    bytes.extend_from_slice(&15_u16.to_be_bytes());
-    let mut bit_position = bytes.len() * 8;
-    for (value, count) in [(0, 3), (u64::from(scaled), 1), (3, 4), (1, 1), (1, 8)] {
-        push_bits(&mut bytes, &mut bit_position, value, count);
-    }
-    bytes.extend_from_slice(&[0xFD, 0, 0, 1, 0x5a]);
-    bytes.extend_from_slice(&macroblock);
-    bytes
-}
-
-fn push_bits(bytes: &mut Vec<u8>, bit_position: &mut usize, value: u64, count: u8) {
-    for shift in (0..count).rev() {
-        if *bit_position / 8 == bytes.len() {
-            bytes.push(0);
-        }
-        let bit = u8::from(((value >> shift) & 1) != 0);
-        bytes[*bit_position / 8] |= bit << (7 - (*bit_position % 8));
-        *bit_position += 1;
-    }
-}
 
 #[test]
 fn borrowed_view_reports_inferred_advanced_profile() {
@@ -147,8 +114,8 @@ fn borrowed_and_owned_views_expose_embedded_icc_bytes() {
 
 #[test]
 fn public_writer_produces_a_decodable_oriented_container() {
-    let codestream = decodable_minimal_raw_codestream();
-    let alpha = decodable_minimal_raw_codestream();
+    let codestream = common::dc_only_luma_codestream(false, [0; 3]);
+    let alpha = common::dc_only_luma_codestream(false, [0; 3]);
     let options = AnnexAWriteOptions::new(16, 16, [0xa5; 16])
         .with_orientation(Orientation::Rotate270)
         .with_icc_profile(b"profile")
@@ -174,8 +141,8 @@ fn public_writer_produces_a_decodable_oriented_container() {
 
 #[test]
 fn reference_encoder_alpha_end_offset_decodes_like_a_standard_count() {
-    let primary = decodable_minimal_raw_codestream();
-    let alpha = decodable_minimal_raw_codestream();
+    let primary = common::dc_only_luma_codestream(false, [0; 3]);
+    let alpha = common::dc_only_luma_codestream(false, [0; 3]);
     let options = AnnexAWriteOptions::new(16, 16, [0xa5; 16]).with_separate_alpha(&alpha);
     let mut bytes = write_annex_a(&primary, &options).unwrap();
     let request = DecodeRequest::new(PixelFormat::U8(ChannelLayout::LumaAlpha));
@@ -221,8 +188,8 @@ fn decode_u8(bytes: &[u8], layout: ChannelLayout, alpha: AlphaHandling) -> Vec<u
 #[test]
 fn separate_alpha_plane_decodes_with_its_own_scaled_flag() {
     for (primary_scaled, alpha_scaled) in [(true, false), (false, true)] {
-        let primary = dc_only_luma_codestream(primary_scaled, NONZERO_DC_MACROBLOCK);
-        let alpha = dc_only_luma_codestream(alpha_scaled, NONZERO_DC_MACROBLOCK);
+        let primary = common::dc_only_luma_codestream(primary_scaled, NONZERO_DC_MACROBLOCK);
+        let alpha = common::dc_only_luma_codestream(alpha_scaled, NONZERO_DC_MACROBLOCK);
         let standalone_primary = decode_u8(&primary, ChannelLayout::Luma, AlphaHandling::Drop);
         let standalone_alpha = decode_u8(&alpha, ChannelLayout::Luma, AlphaHandling::Drop);
         assert_ne!(
@@ -248,5 +215,44 @@ fn separate_alpha_plane_decodes_with_its_own_scaled_flag() {
             alpha, standalone_alpha,
             "primary scaled={primary_scaled}, alpha scaled={alpha_scaled}"
         );
+    }
+}
+
+/// A 16-by-16 three-component image of constant `[200, 60, 100]` pixels,
+/// coded by the T.835 reference encoder with quantization parameter 40, so
+/// with `SCALED_FLAG` set.
+const SCALED_THREE_COMPONENT_IMAGE: [u8; 152] = [
+    0x49, 0x49, 0xbc, 0x01, 0x08, 0x00, 0x00, 0x00, 0x05, 0x00, 0x01, 0xbc, 0x01, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x80, 0xbc, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x81, 0xbc, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0xc0, 0xbc,
+    0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x5a, 0x00, 0x00, 0x00, 0xc1, 0xbc, 0x04, 0x00, 0x01, 0x00,
+    0x00, 0x00, 0x3e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0xc3, 0xdd, 0x6f, 0x03, 0x4e,
+    0xfe, 0x4b, 0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x20, 0x57, 0x4d, 0x50, 0x48, 0x4f, 0x54,
+    0x4f, 0x00, 0x11, 0x01, 0xc0, 0x61, 0x00, 0x0f, 0x00, 0x0f, 0xd0, 0x20, 0x85, 0x08, 0x50, 0x85,
+    0x00, 0x00, 0x04, 0x42, 0xff, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x21, 0x07, 0xd0, 0xd4, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x44, 0x90,
+];
+
+// A scaled plane carries every component after the first at half weight
+// through its DC and low-pass bands, whatever its colour format; the T.834
+// suite only exercises that for YUV. The expected pixels are what the T.835
+// reference decoder returns for this image.
+#[test]
+fn scaled_n_component_planes_double_every_component_after_the_first() {
+    let view = JxrView::parse(&SCALED_THREE_COMPONENT_IMAGE).expect("reference image must parse");
+    assert!(view.info().primary.scaled);
+    assert_eq!(
+        view.info().primary.color_format,
+        jxr::ColorFormat::NComponent(3)
+    );
+    let samples = decode_u8(
+        &SCALED_THREE_COMPONENT_IMAGE,
+        ChannelLayout::NComponent(3),
+        AlphaHandling::Drop,
+    );
+    assert_eq!(samples.len(), 16 * 16 * 3);
+    for pixel in samples.as_chunks::<3>().0 {
+        assert_eq!(*pixel, [200, 60, 99]);
     }
 }

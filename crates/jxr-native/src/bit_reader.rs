@@ -1,23 +1,22 @@
-//! Bounds-checked JPEG XR bit reading.
+//! Header bit reading: the tile packets' reader, [`PacketBitReader`],
+//! reporting its errors as a header's.
 
-use crate::NativeError;
+use crate::{
+    NativeError,
+    entropy::{EntropyError, PacketBitReader},
+};
 
-/// Most-significant-bit-first reader used by T.832 syntax structures.
-pub(crate) struct BitReader<'a> {
-    bytes: &'a [u8],
-    bit_position: usize,
-}
+/// Most-significant-bit-first reader used by T.832 syntax structures: the
+/// packet reader of the tile decoder, reporting header errors.
+pub(crate) struct BitReader<'a>(PacketBitReader<'a>);
 
 impl<'a> BitReader<'a> {
     pub(crate) const fn new(bytes: &'a [u8]) -> Self {
-        Self {
-            bytes,
-            bit_position: 0,
-        }
+        Self(PacketBitReader::new(bytes))
     }
 
     pub(crate) const fn bit_position(&self) -> usize {
-        self.bit_position
+        self.0.bit_position()
     }
 
     pub(crate) fn read_flag(&mut self) -> Result<bool, NativeError> {
@@ -25,37 +24,20 @@ impl<'a> BitReader<'a> {
     }
 
     pub(crate) fn read_bits(&mut self, count: u8) -> Result<u64, NativeError> {
-        if count > 64 {
-            return Err(NativeError::ReservedValue {
-                field: "bit read width",
-                value: u64::from(count),
-            });
-        }
-        let end = self.bit_position.checked_add(usize::from(count)).ok_or(
-            NativeError::IntegerOverflow {
-                operation: "advancing bit reader",
-            },
-        )?;
-        if end > self.bytes.len().saturating_mul(8) {
-            return Err(NativeError::Truncated {
-                bit_position: self.bit_position,
-                requested_bits: count,
-            });
-        }
+        self.0
+            .read_bits(count)
+            .map_err(|error| header_error(&error))
+    }
 
-        let mut value = 0_u64;
-        while self.bit_position < end {
-            let byte = self.bytes[self.bit_position / 8];
-            let shift = 7 - (self.bit_position % 8);
-            value = (value << 1) | u64::from((byte >> shift) & 1);
-            self.bit_position += 1;
-        }
-        Ok(value)
+    /// The packet reader underneath, for syntax that a header and a tile
+    /// packet share, whose errors [`header_error`] reports as a header's.
+    pub(crate) const fn packet(&mut self) -> &mut PacketBitReader<'a> {
+        &mut self.0
     }
 
     pub(crate) fn align_zero(&mut self) -> Result<(), NativeError> {
-        while !self.bit_position.is_multiple_of(8) {
-            let position = self.bit_position;
+        while !self.bit_position().is_multiple_of(8) {
+            let position = self.bit_position();
             if self.read_flag()? {
                 return Err(NativeError::NonZeroAlignmentBit {
                     bit_position: position,
@@ -63,6 +45,29 @@ impl<'a> BitReader<'a> {
             }
         }
         Ok(())
+    }
+}
+
+/// A read error of the packet reader, as a header reports it.
+pub(crate) fn header_error(error: &EntropyError) -> NativeError {
+    match *error {
+        EntropyError::UnexpectedEnd {
+            bit_position,
+            requested_bits,
+            ..
+        } => NativeError::Truncated {
+            bit_position,
+            requested_bits,
+        },
+        // The one other error a read makes: a width above 64 bits.
+        EntropyError::InvalidParameter { value, .. } => NativeError::ReservedValue {
+            field: "bit read width",
+            value: value.unsigned_abs(),
+        },
+        // Not an error a read makes; reported rather than assumed away.
+        _ => NativeError::InvalidSyntax {
+            field: "header bit read",
+        },
     }
 }
 

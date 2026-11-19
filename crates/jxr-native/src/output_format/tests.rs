@@ -4,11 +4,35 @@ use jxr_core::{
 
 use super::{
     AlphaFormatRequest, ComponentPlane, OutputBitDepth, OutputFormatError, OutputFormatRequest,
-    format_components, format_components_into_with_cpu, format_components_with_cpu,
-    format_planar_yuv, format_planar_yuv_into,
+    borrow_samples, format_components, format_components_into_with_cpu, format_planar_yuv_into,
+    planar_planes, zeroed_samples,
 };
 use crate::CpuCapabilities;
 use crate::reconstruct::CropWindow;
+
+/// The native planar output of `planes` in storage of its own: every plane
+/// of [`planar_planes`], one after another.
+fn planar(
+    planes: &[ComponentPlane<'_>],
+    alpha: Option<ComponentPlane<'_>>,
+    request: OutputFormatRequest,
+) -> DecodedSamples {
+    let length = planar_planes(request, alpha.is_some())
+        .unwrap()
+        .iter()
+        .map(|plane| (plane.crop.width * plane.crop.height) as usize)
+        .sum();
+    let mut samples = zeroed_samples(request.pixel_format, length);
+    format_planar_yuv_into(
+        planes,
+        alpha,
+        request,
+        CpuCapabilities::detect(),
+        borrow_samples(&mut samples),
+    )
+    .unwrap();
+    samples
+}
 
 fn request(
     internal_color: ColorFormat,
@@ -52,25 +76,10 @@ fn yuv420_output_keeps_native_plane_geometry() {
     );
     output.crop.width = 4;
     output.crop.height = 2;
-    let decoded = format_planar_yuv(&planes, None, output, CpuCapabilities::detect()).unwrap();
     assert_eq!(
-        decoded.samples,
+        planar(&planes, None, output),
         DecodedSamples::U8(vec![0, 1, 2, 3, 4, 5, 6, 7, 128, 129, 130, 131])
     );
-    assert_eq!(decoded.planes.len(), 3);
-    assert_eq!(
-        (decoded.planes[0].byte_offset, decoded.planes[0].width),
-        (0, 4)
-    );
-    assert_eq!(
-        (decoded.planes[1].byte_offset, decoded.planes[1].width),
-        (8, 2)
-    );
-    assert_eq!(
-        (decoded.planes[2].byte_offset, decoded.planes[2].width),
-        (10, 2)
-    );
-    assert!(decoded.planes.iter().all(|plane| plane.channels == 1));
 }
 
 #[test]
@@ -92,25 +101,15 @@ fn yuv422_alpha_is_a_full_resolution_fourth_plane() {
     );
     output.crop.width = 4;
     output.crop.height = 2;
-    let decoded = format_planar_yuv(
+    let decoded = planar(
         &planes,
         Some(ComponentPlane::tightly_packed(4, 2, &alpha)),
         output,
-        CpuCapabilities::detect(),
-    )
-    .unwrap();
-    assert_eq!(decoded.planes.len(), 4);
-    assert_eq!(
-        decoded
-            .planes
-            .iter()
-            .map(|plane| (plane.byte_offset, plane.width, plane.height))
-            .collect::<Vec<_>>(),
-        [(0, 4, 2), (8, 2, 2), (12, 2, 2), (16, 4, 2)]
     );
-    let DecodedSamples::U8(samples) = decoded.samples else {
+    let DecodedSamples::U8(samples) = decoded else {
         panic!("expected u8 planar output")
     };
+    assert_eq!(samples.len(), 24);
     assert_eq!(&samples[16..], &[0, 32, 64, 96, 128, 160, 192, 255]);
 }
 
@@ -130,17 +129,14 @@ fn yuv422_u10_uses_one_typed_word_per_planar_sample() {
         OutputBitDepth::U10,
         PixelFormat::U16(ChannelLayout::Yuv(ChromaSampling::Cs422)),
     );
-    let decoded = format_planar_yuv(&planes, None, output, CpuCapabilities::detect()).unwrap();
     assert_eq!(
-        decoded.samples,
+        planar(&planes, None, output),
         DecodedSamples::U16(vec![0, 1023, 512, 1023])
     );
-    assert_eq!(decoded.planes[1].byte_offset, 4);
-    assert_eq!(decoded.planes[2].byte_offset, 6);
 }
 
 #[test]
-fn direct_planar_destination_matches_owned_typed_packing() {
+fn a_direct_planar_destination_must_have_the_output_type_and_length() {
     let y = [-512, 511];
     let u = [0];
     let v = [600];
@@ -155,9 +151,8 @@ fn direct_planar_destination_matches_owned_typed_packing() {
         OutputBitDepth::U10,
         PixelFormat::U16(ChannelLayout::Yuv(ChromaSampling::Cs422)),
     );
-    let expected = format_planar_yuv(&planes, None, output, CpuCapabilities::detect()).unwrap();
     let mut direct = [0_u16; 4];
-    let actual = format_planar_yuv_into(
+    format_planar_yuv_into(
         &planes,
         None,
         output,
@@ -165,8 +160,22 @@ fn direct_planar_destination_matches_owned_typed_packing() {
         DecodedSamplesMut::U16(&mut direct),
     )
     .unwrap();
-    assert_eq!(expected.samples, DecodedSamples::U16(direct.to_vec()));
-    assert_eq!(expected.planes, actual.planes);
+    assert_eq!(direct, [0, 1023, 512, 1023]);
+    for destination in [
+        DecodedSamplesMut::U16(&mut [0; 5]),
+        DecodedSamplesMut::U8(&mut [0; 4]),
+    ] {
+        assert!(matches!(
+            format_planar_yuv_into(
+                &planes,
+                None,
+                output,
+                CpuCapabilities::detect(),
+                destination,
+            ),
+            Err(OutputFormatError::UnsupportedCombination { .. })
+        ));
+    }
 }
 
 #[test]
@@ -198,8 +207,7 @@ fn session_selected_u8_path_is_bit_identical_to_scalar_formula() {
         PixelFormat::U8(ChannelLayout::Luma),
     );
     output.crop.width = 160;
-    let (decoded, _) =
-        format_components_with_cpu(&planes, None, output, CpuCapabilities::detect()).unwrap();
+    let decoded = format_components(&planes, None, output).unwrap();
     assert_eq!(
         decoded,
         DecodedSamples::U8(
@@ -848,4 +856,41 @@ fn rgba_u8_premultiplication_uses_formatted_alpha() {
         decoded,
         DecodedSamples::U8(vec![32, 32, 32, 64, 128, 128, 128, 255])
     );
+}
+
+/// A caller-owned destination is premultiplied once, as an allocated one
+/// is: opacity 64 of 255 takes mid-grey 128 to 32, not to 8.
+#[test]
+fn rgba_u8_premultiplication_into_a_destination_matches_the_allocated_result() {
+    let y = [0, 0];
+    let u = [0, 0];
+    let v = [0, 0];
+    let alpha = [-64, 127];
+    let planes = [
+        ComponentPlane::tightly_packed(2, 1, &y),
+        ComponentPlane::tightly_packed(2, 1, &u),
+        ComponentPlane::tightly_packed(2, 1, &v),
+    ];
+    let alpha = Some(ComponentPlane::tightly_packed(2, 1, &alpha));
+    for layout in [ChannelLayout::Rgba, ChannelLayout::Bgra] {
+        let mut req = request(
+            ColorFormat::Yuv(ChromaSampling::Cs444),
+            ColorFormat::Rgb,
+            OutputBitDepth::U8,
+            PixelFormat::U8(layout),
+        );
+        req.premultiply_alpha = true;
+        let allocated = format_components(&planes, alpha, req).unwrap();
+        let mut destination = [0xff_u8; 8];
+        format_components_into_with_cpu(
+            &planes,
+            alpha,
+            req,
+            CpuCapabilities::detect(),
+            DecodedSamplesMut::U8(&mut destination),
+        )
+        .unwrap();
+        assert_eq!(destination, [32, 32, 32, 64, 128, 128, 128, 255]);
+        assert_eq!(allocated, DecodedSamples::U8(destination.to_vec()));
+    }
 }

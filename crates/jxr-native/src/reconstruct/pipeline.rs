@@ -1,74 +1,42 @@
 //! Ordered CPU execution of the T.832 clause 9.9 reconstruction stages.
 
-use fearless_simd::Level;
 use jxr_core::{DecodeScale, OverlapMode, QuantizerSet};
 use jxr_math::quantization::Quantizer;
-use rayon::prelude::*;
 
 use crate::CpuCapabilities;
 
 use super::{
     PlanarSamples, QuantizedMacroblock, ReconstructionConfig, ReconstructionError,
-    overlap::apply_overlap,
-    simd_dequant::scale_coefficients,
-    subsampled_overlap::apply_subsampled_first_overlap,
-    transform::{inverse_chroma_420, inverse_chroma_422, inverse_core_transform},
+    lanes::{
+        InverseTransform, PARALLEL_MACROBLOCKS, Postfilter, SimdReporter, apply_block, simd_used,
+    },
+    sample_scale::{BLOCK_DC_GAIN_BITS, ReducedPicture, SampleScale, macroblock_dc_gain_bits},
+    strip::{ComponentStrip, RasterMacroblocks, ReconstructionSimd, StripPlan},
+    transform::{inverse_chroma_420, inverse_chroma_422},
 };
-
-/// Raster-ordered quantized macroblocks of one component, read by index.
-///
-/// Slices serve stored macroblocks; the CPU decoder materializes each one from
-/// the coefficient arena on demand so no component-sized copy is retained.
-pub(crate) trait MacroblockSource: Sync {
-    /// Number of macroblocks in raster order.
-    fn macroblock_count(&self) -> usize;
-
-    /// Passes macroblock `index` to `visit`.
-    fn with_macroblock<R>(
-        &self,
-        index: usize,
-        visit: impl FnOnce(&QuantizedMacroblock) -> Result<R, ReconstructionError>,
-    ) -> Result<R, ReconstructionError>;
-}
-
-impl MacroblockSource for [QuantizedMacroblock] {
-    fn macroblock_count(&self) -> usize {
-        self.len()
-    }
-
-    #[inline]
-    fn with_macroblock<R>(
-        &self,
-        index: usize,
-        visit: impl FnOnce(&QuantizedMacroblock) -> Result<R, ReconstructionError>,
-    ) -> Result<R, ReconstructionError> {
-        visit(&self[index])
-    }
-}
 
 /// Retained per-component transform buffers and recyclable output plane.
 #[derive(Debug, Default)]
 pub(crate) struct ReconstructionPipelineWorkspace {
+    /// Block DC coefficients of a reduced reconstruction.
     dc_low_pass: Vec<[i32; 16]>,
-    high_pass: Vec<[i32; 256]>,
-    low_plane: Vec<i32>,
+    /// The strip a full reconstruction runs down the plane.
+    strip: ComponentStrip,
     output_samples: Vec<i32>,
+    /// One geometry's calibrated reduced scale, reused with different coefficients.
+    sample_scale: Option<(ReconstructionConfig, DecodeScale, SampleScale)>,
+    simd: ReconstructionSimd,
     reuses: u64,
     output_reuses: u64,
-}
-
-#[derive(Clone, Copy)]
-struct ReconstructionGeometry {
-    macroblocks_x: usize,
-    macroblocks_y: usize,
-    block_columns: usize,
-    block_rows: usize,
-    level: Level,
 }
 
 impl ReconstructionPipelineWorkspace {
     pub(crate) const fn reuses(&self) -> u64 {
         self.reuses.saturating_add(self.output_reuses)
+    }
+
+    pub(crate) const fn simd(&self) -> ReconstructionSimd {
+        self.simd
     }
 
     #[cfg(test)]
@@ -93,21 +61,58 @@ impl ReconstructionPipelineWorkspace {
         self.dc_low_pass
             .capacity()
             .saturating_mul(core::mem::size_of::<[i32; 16]>())
-            .saturating_add(
-                self.high_pass
-                    .capacity()
-                    .saturating_mul(core::mem::size_of::<[i32; 256]>()),
-            )
-            .saturating_add(
-                self.low_plane
-                    .capacity()
-                    .saturating_mul(core::mem::size_of::<i32>()),
-            )
+            .saturating_add(self.strip.retained_bytes())
             .saturating_add(self.retained_output_bytes())
+            .saturating_add(self.sample_scale.as_ref().map_or(0, |(config, _, scale)| {
+                config
+                    .tiles
+                    .column_boundaries
+                    .capacity()
+                    .saturating_add(config.tiles.row_boundaries.capacity())
+                    .saturating_mul(core::mem::size_of::<u32>())
+                    .saturating_add(scale.retained_bytes())
+            }))
     }
 
     fn take_output_samples(&mut self) -> Vec<i32> {
         core::mem::take(&mut self.output_samples)
+    }
+
+    fn scale_reduced_samples(
+        &mut self,
+        config: &ReconstructionConfig,
+        resolution: DecodeScale,
+        cpu: CpuCapabilities,
+        picture: &ReducedPicture<'_>,
+    ) -> Result<(), ReconstructionError> {
+        let (gain_bits, units) = match resolution {
+            DecodeScale::Quarter => (BLOCK_DC_GAIN_BITS, component_block_geometry(config)?),
+            DecodeScale::Sixteenth => (
+                macroblock_dc_gain_bits(config)? + BLOCK_DC_GAIN_BITS,
+                (1, 1),
+            ),
+            DecodeScale::Full => {
+                return Err(ReconstructionError::InvalidPlaneGeometry(
+                    "full reconstruction has no reduced sample scale",
+                ));
+            }
+        };
+        if config.overlap == OverlapMode::None {
+            return SampleScale::Shift(gain_bits).apply(cpu.executor(), &mut self.output_samples);
+        }
+        let matches = self
+            .sample_scale
+            .as_ref()
+            .is_some_and(|(held, scale, _)| held == config && *scale == resolution);
+        if !matches {
+            let scale = SampleScale::new(config, gain_bits, units, cpu, picture)?;
+            self.sample_scale = Some((config.clone(), resolution, scale));
+        }
+        self.sample_scale
+            .as_ref()
+            .expect("the reduced sample scale is initialized")
+            .2
+            .apply(cpu.executor(), &mut self.output_samples)
     }
 }
 
@@ -159,57 +164,34 @@ fn reconstruct_luma_scaled_impl(
     cpu: Option<CpuCapabilities>,
     workspace: &mut ReconstructionPipelineWorkspace,
 ) -> Result<PlanarSamples, ReconstructionError> {
+    workspace.simd = ReconstructionSimd::default();
     match scale {
         DecodeScale::Full => reconstruct_luma_impl(macroblocks, config, cpu, workspace),
-        DecodeScale::Quarter => reconstruct_quarter(macroblocks, config, workspace),
-        DecodeScale::Sixteenth => reconstruct_sixteenth(macroblocks, config, workspace),
+        DecodeScale::Quarter => reconstruct_quarter(macroblocks, config, cpu, workspace),
+        DecodeScale::Sixteenth => reconstruct_sixteenth(macroblocks, config, cpu, workspace),
     }
 }
 
 fn reconstruct_quarter(
     macroblocks: &[QuantizedMacroblock],
     config: &ReconstructionConfig,
+    cpu: Option<CpuCapabilities>,
     workspace: &mut ReconstructionPipelineWorkspace,
 ) -> Result<PlanarSamples, ReconstructionError> {
-    let (macroblocks_x, macroblocks_y, block_columns, block_rows) =
-        validated_geometry(macroblocks, config)?;
-    let block_count = block_columns * block_rows;
+    let cpu = cpu.unwrap_or_else(CpuCapabilities::detect);
     let reused = workspace.dc_low_pass.capacity() >= macroblocks.len();
-    workspace.dc_low_pass.resize(macroblocks.len(), [0; 16]);
-    if macroblocks.len() >= 64 {
-        workspace
-            .dc_low_pass
-            .par_iter_mut()
-            .zip(macroblocks.par_iter())
-            .try_for_each(|(low, macroblock)| {
-                reconstruct_low_into(macroblock, block_count, config, low)
-            })?;
-    } else {
-        for (low, macroblock) in workspace.dc_low_pass.iter_mut().zip(macroblocks) {
-            reconstruct_low_into(macroblock, block_count, config, low)?;
-        }
-    }
-    let width =
-        macroblocks_x
-            .checked_mul(block_columns)
-            .ok_or(ReconstructionError::ArithmeticOverflow(
-                "quarter-resolution width",
-            ))?;
-    let height =
-        macroblocks_y
-            .checked_mul(block_rows)
-            .ok_or(ReconstructionError::ArithmeticOverflow(
-                "quarter-resolution height",
-            ))?;
-    let output_reused = workspace.output_samples.capacity() >= width.saturating_mul(height);
-    combine_low_pass_into(
-        &workspace.dc_low_pass,
-        macroblocks_x,
-        macroblocks_y,
-        block_columns,
-        block_rows,
-        &mut workspace.output_samples,
-    )?;
+    let output_capacity = workspace.output_samples.capacity();
+    let bands = LowBands::DcAndLowPass;
+    let (width, height) = block_dc_plane(macroblocks, config, bands, cpu, workspace)?;
+    let output_reused = output_capacity >= width.saturating_mul(height);
+    // One sample stands for a block: its DC, less the gain of the block
+    // transform and of the overlap filtering that follows it, neither of
+    // which was run.
+    workspace.scale_reduced_samples(config, DecodeScale::Quarter, cpu, &|flat, flat_config| {
+        let mut workspace = ReconstructionPipelineWorkspace::default();
+        block_dc_plane(flat, flat_config, bands, cpu, &mut workspace)?;
+        Ok(workspace.take_output_samples())
+    })?;
     let samples = workspace.take_output_samples();
     workspace.reuses = workspace.reuses.saturating_add(u64::from(reused));
     workspace.output_reuses = workspace
@@ -241,23 +223,25 @@ fn reconstruct_quarter(
 fn reconstruct_sixteenth(
     macroblocks: &[QuantizedMacroblock],
     config: &ReconstructionConfig,
+    cpu: Option<CpuCapabilities>,
     workspace: &mut ReconstructionPipelineWorkspace,
 ) -> Result<PlanarSamples, ReconstructionError> {
-    let (macroblocks_x, macroblocks_y, _, _) = validated_geometry(macroblocks, config)?;
+    let cpu = cpu.unwrap_or_else(CpuCapabilities::detect);
     let output_reused = workspace.output_samples.capacity() >= macroblocks.len();
-    workspace.output_samples.clear();
-    for macroblock in macroblocks {
-        let quantizer = quantizer(macroblock.quantizers.dc, "DC")?;
-        let mut value = scale(quantizer, macroblock.dc_low_pass[0])?;
-        if config.scale_after_first_transform {
-            value = value
-                .checked_mul(2)
-                .ok_or(ReconstructionError::ArithmeticOverflow(
-                    "sixteenth-resolution chroma normalization",
-                ))?;
-        }
-        workspace.output_samples.push(value >> 4);
-    }
+    let (width, height) = macroblock_dc_plane(macroblocks, config, cpu, workspace)?;
+    // One sample stands for a macroblock: its DC, less the gain of both
+    // transform stages and of the overlap filtering after the second,
+    // none of which was run.
+    workspace.scale_reduced_samples(
+        config,
+        DecodeScale::Sixteenth,
+        cpu,
+        &|flat, flat_config| {
+            let mut workspace = ReconstructionPipelineWorkspace::default();
+            macroblock_dc_plane(flat, flat_config, cpu, &mut workspace)?;
+            Ok(workspace.take_output_samples())
+        },
+    )?;
     let samples = workspace.take_output_samples();
     workspace.output_reuses = workspace
         .output_reuses
@@ -265,10 +249,10 @@ fn reconstruct_sixteenth(
     Ok(PlanarSamples {
         origin_x: config.macroblock_origin_x,
         origin_y: config.macroblock_origin_y,
-        width: u32::try_from(macroblocks_x).map_err(|_| {
+        width: u32::try_from(width).map_err(|_| {
             ReconstructionError::ArithmeticOverflow("sixteenth-resolution width conversion")
         })?,
-        height: u32::try_from(macroblocks_y).map_err(|_| {
+        height: u32::try_from(height).map_err(|_| {
             ReconstructionError::ArithmeticOverflow("sixteenth-resolution height conversion")
         })?,
         samples,
@@ -299,170 +283,35 @@ fn validated_geometry_for(
             actual: count,
         });
     }
+    let (block_columns, block_rows) = validated_block_geometry(config)?;
+    Ok((macroblocks_x, macroblocks_y, block_columns, block_rows))
+}
+
+/// Checks the tile partition of the plane `config` describes, and returns
+/// the blocks across and down one of its macroblocks.
+pub(crate) fn validated_block_geometry(
+    config: &ReconstructionConfig,
+) -> Result<(usize, usize), ReconstructionError> {
     validate_partition(
         &config.tiles.column_boundaries,
         config.macroblocks_x,
         "column",
     )?;
     validate_partition(&config.tiles.row_boundaries, config.macroblocks_y, "row")?;
-    let (block_columns, block_rows) = component_block_geometry(config)?;
-    Ok((macroblocks_x, macroblocks_y, block_columns, block_rows))
+    component_block_geometry(config)
 }
 
-/// Full-resolution reconstruction from macroblocks materialized on demand.
-pub(crate) fn reconstruct_luma_from_source(
-    macroblocks: &(impl MacroblockSource + ?Sized),
-    config: &ReconstructionConfig,
-    cpu: CpuCapabilities,
-    workspace: &mut ReconstructionPipelineWorkspace,
-) -> Result<PlanarSamples, ReconstructionError> {
-    reconstruct_luma_impl(macroblocks, config, Some(cpu), workspace)
-}
-
+/// Full-resolution reconstruction: the strip that covers the plane and is
+/// never released, so that its window ends as the plane itself.
 fn reconstruct_luma_impl(
-    macroblocks: &(impl MacroblockSource + ?Sized),
+    macroblocks: &[QuantizedMacroblock],
     config: &ReconstructionConfig,
     cpu: Option<CpuCapabilities>,
     workspace: &mut ReconstructionPipelineWorkspace,
 ) -> Result<PlanarSamples, ReconstructionError> {
-    let expected = macroblocks.macroblock_count();
+    workspace.simd = ReconstructionSimd::default();
     let (macroblocks_x, macroblocks_y, block_columns, block_rows) =
-        validated_geometry_for(expected, config)?;
-    let block_count = block_columns * block_rows;
-
-    let low_plane_length = macroblocks_x
-        .checked_mul(block_columns)
-        .and_then(|width| width.checked_mul(macroblocks_y))
-        .and_then(|length| length.checked_mul(block_rows))
-        .ok_or(ReconstructionError::ArithmeticOverflow(
-            "low-pass plane size",
-        ))?;
-    let reused = workspace.dc_low_pass.capacity() >= expected
-        && workspace.high_pass.capacity() >= expected
-        && workspace.low_plane.capacity() >= low_plane_length;
-    workspace.dc_low_pass.resize(expected, [0; 16]);
-    workspace.high_pass.resize(expected, [0; 256]);
-
-    let first_level = |index: usize, low: &mut [i32; 16], high: &mut [i32; 256]| {
-        macroblocks.with_macroblock(index, |macroblock| {
-            reconstruct_first_level_into(macroblock, block_count, config, cpu, low, high)
-        })
-    };
-    if expected >= 64 {
-        workspace
-            .dc_low_pass
-            .par_iter_mut()
-            .zip(workspace.high_pass.par_iter_mut())
-            .enumerate()
-            .try_for_each(|(index, (low, high))| first_level(index, low, high))?;
-    } else {
-        for (index, (low, high)) in workspace
-            .dc_low_pass
-            .iter_mut()
-            .zip(&mut workspace.high_pass)
-            .enumerate()
-        {
-            first_level(index, low, high)?;
-        }
-    }
-
-    combine_low_pass_into(
-        &workspace.dc_low_pass,
-        macroblocks_x,
-        macroblocks_y,
-        block_columns,
-        block_rows,
-        &mut workspace.low_plane,
-    )?;
-    let level = cpu.map_or_else(Level::new, CpuCapabilities::level);
-    if config.overlap == OverlapMode::Two {
-        if block_columns == 4 {
-            apply_configured_overlap(
-                level,
-                &mut workspace.low_plane,
-                macroblocks_x * block_columns,
-                macroblocks_y * block_rows,
-                config,
-                block_columns,
-                block_rows,
-            )?;
-        } else {
-            apply_configured_subsampled_overlap(
-                &mut workspace.low_plane,
-                macroblocks_x * block_columns,
-                macroblocks_y * block_rows,
-                config,
-                block_columns,
-                block_rows,
-            )?;
-        }
-    }
-    scatter_low_pass(
-        &workspace.low_plane,
-        &mut workspace.dc_low_pass,
-        macroblocks_x,
-        macroblocks_y,
-        block_columns,
-        block_rows,
-    );
-
-    let geometry = ReconstructionGeometry {
-        macroblocks_x,
-        macroblocks_y,
-        block_columns,
-        block_rows,
-        level,
-    };
-    let (result, output_reused) = finish_component(
-        &workspace.dc_low_pass,
-        &workspace.high_pass,
-        geometry,
-        config,
-        &mut workspace.output_samples,
-    )?;
-    workspace.reuses = workspace.reuses.saturating_add(u64::from(reused));
-    workspace.output_reuses = workspace
-        .output_reuses
-        .saturating_add(u64::from(output_reused));
-    Ok(result)
-}
-
-fn reconstruct_first_level_into(
-    macroblock: &QuantizedMacroblock,
-    block_count: usize,
-    config: &ReconstructionConfig,
-    cpu: Option<CpuCapabilities>,
-    low: &mut [i32; 16],
-    high: &mut [i32; 256],
-) -> Result<(), ReconstructionError> {
-    dequantize_into(macroblock, block_count, cpu, low, high)?;
-    inverse_first_level(low, config)
-}
-
-fn reconstruct_low_into(
-    macroblock: &QuantizedMacroblock,
-    block_count: usize,
-    config: &ReconstructionConfig,
-    low: &mut [i32; 16],
-) -> Result<(), ReconstructionError> {
-    *low = dequantize_low(macroblock, block_count)?;
-    inverse_first_level(low, config)
-}
-
-fn finish_component(
-    dc_low_pass: &[[i32; 16]],
-    high_pass: &[[i32; 256]],
-    geometry: ReconstructionGeometry,
-    config: &ReconstructionConfig,
-    samples: &mut Vec<i32>,
-) -> Result<(PlanarSamples, bool), ReconstructionError> {
-    let ReconstructionGeometry {
-        macroblocks_x,
-        macroblocks_y,
-        block_columns,
-        block_rows,
-        level,
-    } = geometry;
+        validated_geometry(macroblocks, config)?;
     let width = macroblocks_x.checked_mul(block_columns * 4).ok_or(
         ReconstructionError::ArithmeticOverflow("reconstructed width"),
     )?;
@@ -475,72 +324,285 @@ fn finish_component(
             .ok_or(ReconstructionError::ArithmeticOverflow(
                 "reconstructed plane size",
             ))?;
-    let output_reused = samples.capacity() >= output_length;
-    second_level_transform_into(dc_low_pass, high_pass, geometry, samples)?;
-    if config.overlap != OverlapMode::None {
-        apply_configured_overlap(
-            level,
-            samples,
-            width,
-            height,
-            config,
-            block_columns * 4,
-            block_rows * 4,
-        )?;
-    }
-    Ok((
-        PlanarSamples {
-            origin_x: config
-                .macroblock_origin_x
-                .checked_mul(u32::from(config.block_columns) * 4)
-                .ok_or(ReconstructionError::ArithmeticOverflow("output x origin"))?,
-            origin_y: config
-                .macroblock_origin_y
-                .checked_mul(u32::from(config.block_rows) * 4)
-                .ok_or(ReconstructionError::ArithmeticOverflow("output y origin"))?,
-            width: u32::try_from(width)
-                .map_err(|_| ReconstructionError::ArithmeticOverflow("output width conversion"))?,
-            height: u32::try_from(height)
-                .map_err(|_| ReconstructionError::ArithmeticOverflow("output height conversion"))?,
-            samples: core::mem::take(samples),
-        },
-        output_reused,
-    ))
+    let reused = workspace.strip.retained_bytes() > 0;
+    let output_reused = workspace.output_samples.capacity() >= output_length;
+    let strip = &mut workspace.strip;
+    strip.begin(config, cpu, 0, macroblocks_y)?;
+    strip.reserve_plane(
+        core::mem::take(&mut workspace.output_samples),
+        macroblocks_y,
+    );
+    let source = RasterMacroblocks {
+        macroblocks,
+        width: macroblocks_x,
+    };
+    strip.push_rows(&source, 0..macroblocks_y)?;
+    let simd = strip.simd();
+    let samples = strip.take_samples();
+    workspace.simd = simd;
+    workspace.reuses = workspace.reuses.saturating_add(u64::from(reused));
+    workspace.output_reuses = workspace
+        .output_reuses
+        .saturating_add(u64::from(output_reused));
+    Ok(PlanarSamples {
+        origin_x: config
+            .macroblock_origin_x
+            .checked_mul(u32::from(config.block_columns) * 4)
+            .ok_or(ReconstructionError::ArithmeticOverflow("output x origin"))?,
+        origin_y: config
+            .macroblock_origin_y
+            .checked_mul(u32::from(config.block_rows) * 4)
+            .ok_or(ReconstructionError::ArithmeticOverflow("output y origin"))?,
+        width: u32::try_from(width)
+            .map_err(|_| ReconstructionError::ArithmeticOverflow("output width conversion"))?,
+        height: u32::try_from(height)
+            .map_err(|_| ReconstructionError::ArithmeticOverflow("output height conversion"))?,
+        samples,
+    })
 }
 
-fn dequantize_into(
-    macroblock: &QuantizedMacroblock,
-    block_count: usize,
-    cpu: Option<CpuCapabilities>,
-    low: &mut [i32; 16],
-    high: &mut [i32; 256],
+/// The coefficients of a macroblock that a plane of block DC coefficients
+/// is made from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LowBands {
+    /// Both bands, as full reconstruction takes them.
+    DcAndLowPass,
+    /// The DC band alone, as if the low-pass band were zero: all that a
+    /// sixteenth-size decode has read.
+    Dc,
+}
+
+/// Fills the output plane of `workspace` with one value for each
+/// macroblock, made of its DC coefficient alone, and returns the size of
+/// the plane. A sixteenth-size picture is this plane, scaled.
+///
+/// The low-pass-level overlap filter, which only [`OverlapMode::Two`] has,
+/// reaches half a macroblock into each neighbour, so it is not left to the
+/// scale: the DC coefficients are spread over their blocks, the filter is
+/// run over the plane as [`block_dc_plane`] runs it, and each macroblock
+/// takes the sum of its blocks. What the plane holds there is the
+/// quarter-size picture of the DC band, a macroblock at a time. Elsewhere it
+/// holds the DC coefficient itself, at the weight the first-level transform
+/// would give it.
+fn macroblock_dc_plane(
+    macroblocks: &[QuantizedMacroblock],
+    config: &ReconstructionConfig,
+    cpu: CpuCapabilities,
+    workspace: &mut ReconstructionPipelineWorkspace,
+) -> Result<(usize, usize), ReconstructionError> {
+    if config.overlap != OverlapMode::Two {
+        let (macroblocks_x, macroblocks_y, _, _) = validated_geometry(macroblocks, config)?;
+        workspace.output_samples.clear();
+        for macroblock in macroblocks {
+            let dc = dequantize_dc(macroblock)?;
+            let dc = if config.scale_after_first_transform {
+                dc.checked_mul(2)
+                    .ok_or(ReconstructionError::ArithmeticOverflow(
+                        "sixteenth-resolution chroma normalization",
+                    ))?
+            } else {
+                dc
+            };
+            workspace.output_samples.push(dc);
+        }
+        return Ok((macroblocks_x, macroblocks_y));
+    }
+    let (width, height) = block_dc_plane(macroblocks, config, LowBands::Dc, cpu, workspace)?;
+    let (block_columns, block_rows) = component_block_geometry(config)?;
+    sum_macroblocks(
+        &mut workspace.output_samples,
+        width,
+        block_columns,
+        block_rows,
+    )?;
+    Ok((width / block_columns, height / block_rows))
+}
+
+/// Replaces a plane of one value for each block by the sum of the blocks of
+/// each macroblock, in macroblock raster order.
+fn sum_macroblocks(
+    plane: &mut Vec<i32>,
+    width: usize,
+    block_columns: usize,
+    block_rows: usize,
 ) -> Result<(), ReconstructionError> {
-    let QuantizerSet { high_pass, .. } = macroblock.quantizers;
-    *low = dequantize_low(macroblock, block_count)?;
-    let high_pass = quantizer(high_pass, "high-pass")?;
-    high.fill(0);
-    if macroblock.bands.has_high_pass() {
-        let coefficient_count = block_count * 16;
-        if let Some(cpu) = cpu {
-            scale_coefficients(
-                cpu,
-                high_pass,
-                &macroblock.high_pass[..coefficient_count],
-                &mut high[..coefficient_count],
-            )?;
-        } else {
-            for block in 0..block_count {
-                for coefficient in 1..16 {
-                    let index = block * 16 + coefficient;
-                    high[index] = scale(high_pass, macroblock.high_pass[index])?;
+    let macroblocks_x = width / block_columns;
+    let macroblocks_y = plane.len() / (width * block_rows);
+    // A macroblock is written at or before the first of its own blocks, so
+    // no block is overwritten before it is summed.
+    for macroblock_y in 0..macroblocks_y {
+        for macroblock_x in 0..macroblocks_x {
+            let mut sum = 0_i32;
+            for row in 0..block_rows {
+                let start =
+                    (macroblock_y * block_rows + row) * width + macroblock_x * block_columns;
+                for &block in &plane[start..start + block_columns] {
+                    sum = sum
+                        .checked_add(block)
+                        .ok_or(ReconstructionError::ArithmeticOverflow(
+                            "sixteenth-resolution macroblock sum",
+                        ))?;
                 }
             }
+            plane[macroblock_y * macroblocks_x + macroblock_x] = sum;
+        }
+    }
+    plane.truncate(macroblocks_x * macroblocks_y);
+    Ok(())
+}
+
+/// Fills the output plane of `workspace` with the DC coefficient of every
+/// block, as full reconstruction of the `bands` of each macroblock holds
+/// them before its block transform: the first-level inverse transform of
+/// each macroblock, and the overlap filter of that level over the whole
+/// plane. Returns the size of the plane.
+fn block_dc_plane(
+    macroblocks: &[QuantizedMacroblock],
+    config: &ReconstructionConfig,
+    bands: LowBands,
+    cpu: CpuCapabilities,
+    workspace: &mut ReconstructionPipelineWorkspace,
+) -> Result<(usize, usize), ReconstructionError> {
+    let (macroblocks_x, macroblocks_y, block_columns, block_rows) =
+        validated_geometry(macroblocks, config)?;
+    let block_count = block_columns * block_rows;
+    workspace.dc_low_pass.resize(macroblocks.len(), [0; 16]);
+    cpu.executor()
+        .if_worth(macroblocks.len() >= PARALLEL_MACROBLOCKS)
+        .try_for_each(&mut workspace.dc_low_pass, |index, low| {
+            block_dc_into(&macroblocks[index], block_count, bands, config, low)
+        })?;
+    let width =
+        macroblocks_x
+            .checked_mul(block_columns)
+            .ok_or(ReconstructionError::ArithmeticOverflow(
+                "quarter-resolution width",
+            ))?;
+    let height =
+        macroblocks_y
+            .checked_mul(block_rows)
+            .ok_or(ReconstructionError::ArithmeticOverflow(
+                "quarter-resolution height",
+            ))?;
+    combine_low_pass_into(
+        &workspace.dc_low_pass,
+        macroblocks_x,
+        macroblocks_y,
+        block_columns,
+        block_rows,
+        &mut workspace.output_samples,
+    )?;
+    if config.overlap == OverlapMode::Two {
+        // The overlap filter of the low-pass level, which only second-level
+        // overlap has: the strip that covers the plane.
+        let plan = StripPlan::new(config, Some(cpu))?;
+        let used_simd = SimdReporter::new(false);
+        plan.filter_low::<Postfilter>(
+            &mut workspace.output_samples,
+            0..height,
+            cpu.executor(),
+            Some(&used_simd),
+        )?;
+        workspace.simd.first_overlap |= simd_used(&used_simd);
+    }
+    Ok((width, height))
+}
+
+/// The DC coefficient of each block of one macroblock: the first-level
+/// inverse transform of its DC coefficient and, where `bands` has them, its
+/// low-pass coefficients.
+fn block_dc_into(
+    macroblock: &QuantizedMacroblock,
+    block_count: usize,
+    bands: LowBands,
+    config: &ReconstructionConfig,
+    low: &mut [i32; 16],
+) -> Result<(), ReconstructionError> {
+    *low = match bands {
+        LowBands::DcAndLowPass => dequantize_low(macroblock, block_count)?,
+        LowBands::Dc => {
+            let mut low = [0; 16];
+            low[0] = dequantize_dc(macroblock)?;
+            low
+        }
+    };
+    inverse_first_level(low, config)
+}
+
+/// Dequantizes the high-pass blocks of `macroblock`, `block_count` blocks
+/// of which `block_columns` are across, straight into their places in
+/// `rows`, the sample rows of its macroblock row, `width` samples across,
+/// with its first block in block column `column`: zero where it codes no
+/// high-pass band. Element zero of each block, which its block DC
+/// coefficient replaces, is placed as zero.
+///
+/// The products wrap, and a coefficient that the checked
+/// [`Quantizer::dequantize`] cannot scale fails the macroblock with its
+/// error once every block is placed: the macroblock's samples are then
+/// never read.
+pub(super) fn dequantize_high_pass_into(
+    macroblock: &QuantizedMacroblock,
+    block_columns: usize,
+    block_count: usize,
+    rows: &mut [i32],
+    width: usize,
+    column: usize,
+) -> Result<(), ReconstructionError> {
+    let quantizer = quantizer(macroblock.quantizers.high_pass, "high-pass")?;
+    let blocks = &macroblock.high_pass.as_chunks::<16>().0[..block_count];
+    let coded = macroblock.bands.has_high_pass();
+    // The product of a step beyond `i32` wraps to the exact product where
+    // that is within `i32`, as for any other step.
+    let multiplier = i32::from_ne_bytes(quantizer.step().to_ne_bytes());
+    // Each value with its bits inverted when negative is its magnitude,
+    // less one for a negative value: their OR bounds every magnitude.
+    let mut magnitude = 0_i32;
+    for (block, coefficients) in blocks.iter().enumerate() {
+        let origin = block / block_columns * 4 * width + (column + block % block_columns) * 4;
+        let mut values = if coded { *coefficients } else { [0; 16] };
+        values[0] = 0;
+        for (line, values) in values.as_chunks::<4>().0.iter().enumerate() {
+            let start = origin + line * width;
+            let samples: &mut [i32; 4] = (&mut rows[start..start + 4])
+                .try_into()
+                .expect("a block line spans four samples");
+            for (sample, &value) in samples.iter_mut().zip(values) {
+                magnitude |= value ^ (value >> 31);
+                *sample = value.wrapping_mul(multiplier);
+            }
+        }
+    }
+    // Below `i32::MAX / step`, every magnitude scales within `i32`.
+    if multiplier > 0 && magnitude < i32::MAX / multiplier {
+        return Ok(());
+    }
+    // A coefficient near the bound, or a step beyond `i32`: the oracle.
+    for coefficients in blocks.iter().filter(|_| coded) {
+        for &coefficient in &coefficients[1..] {
+            scale(quantizer, coefficient)?;
         }
     }
     Ok(())
 }
 
-fn dequantize_low(
+/// Places the block DC coefficients `low` of one macroblock, `COLUMNS`
+/// blocks across, in `low_rows`, `low_width` samples across, from column
+/// `column`. A copy of a fixed size is a few loads and stores where a copy
+/// of a size known only when it runs is a call in WebAssembly without bulk
+/// memory.
+pub(super) fn place_low<const COLUMNS: usize>(
+    low: &[i32],
+    low_rows: &mut [i32],
+    low_width: usize,
+    column: usize,
+) {
+    for (block_row, values) in low.as_chunks::<COLUMNS>().0.iter().enumerate() {
+        let start = block_row * low_width + column;
+        low_rows[start..start + COLUMNS].copy_from_slice(values);
+    }
+}
+
+pub(super) fn dequantize_low(
     macroblock: &QuantizedMacroblock,
     block_count: usize,
 ) -> Result<[i32; 16], ReconstructionError> {
@@ -560,7 +622,13 @@ fn dequantize_low(
     Ok(low)
 }
 
-fn component_block_geometry(
+/// The DC coefficient of a macroblock alone, as [`dequantize_low`] scales it.
+fn dequantize_dc(macroblock: &QuantizedMacroblock) -> Result<i32, ReconstructionError> {
+    let quantizer = quantizer(macroblock.quantizers.dc, "DC")?;
+    scale(quantizer, macroblock.dc_low_pass[0])
+}
+
+pub(crate) fn component_block_geometry(
     config: &ReconstructionConfig,
 ) -> Result<(usize, usize), ReconstructionError> {
     let columns = usize::from(config.block_columns);
@@ -573,12 +641,12 @@ fn component_block_geometry(
     }
 }
 
-fn inverse_first_level(
+pub(super) fn inverse_first_level(
     low: &mut [i32; 16],
     config: &ReconstructionConfig,
 ) -> Result<(), ReconstructionError> {
     match (config.block_columns, config.block_rows) {
-        (4, 4) => inverse_core_transform(low)?,
+        (4, 4) => apply_block::<InverseTransform>(low)?,
         (2, 4) => {
             let mut coefficients = [0; 8];
             coefficients.copy_from_slice(&low[..8]);
@@ -621,7 +689,7 @@ fn scale(quantizer: Quantizer, coefficient: i32) -> Result<i32, ReconstructionEr
         .map_err(|_| ReconstructionError::ArithmeticOverflow("coefficient dequantization"))
 }
 
-fn combine_low_pass_into(
+pub(crate) fn combine_low_pass_into(
     macroblocks: &[[i32; 16]],
     macroblocks_x: usize,
     macroblocks_y: usize,
@@ -655,130 +723,10 @@ fn combine_low_pass_into(
     Ok(())
 }
 
-fn scatter_low_pass(
-    plane: &[i32],
-    macroblocks: &mut [[i32; 16]],
-    macroblocks_x: usize,
-    macroblocks_y: usize,
-    block_columns: usize,
-    block_rows: usize,
-) {
-    let width = macroblocks_x * block_columns;
-    for macroblock_y in 0..macroblocks_y {
-        for macroblock_x in 0..macroblocks_x {
-            let block = &mut macroblocks[macroblock_y * macroblocks_x + macroblock_x];
-            for row in 0..block_rows {
-                let source =
-                    (macroblock_y * block_rows + row) * width + macroblock_x * block_columns;
-                block[row * block_columns..row * block_columns + block_columns]
-                    .copy_from_slice(&plane[source..source + block_columns]);
-            }
-        }
-    }
-}
-
-fn second_level_transform_into(
-    low: &[[i32; 16]],
-    high: &[[i32; 256]],
-    geometry: ReconstructionGeometry,
-    plane: &mut Vec<i32>,
-) -> Result<(), ReconstructionError> {
-    let ReconstructionGeometry {
-        macroblocks_x,
-        macroblocks_y,
-        block_columns,
-        block_rows,
-        level,
-    } = geometry;
-    let macroblock_width = block_columns * 4;
-    let macroblock_height = block_rows * 4;
-    let width = macroblocks_x * macroblock_width;
-    let height = macroblocks_y * macroblock_height;
-    let length = width
-        .checked_mul(height)
-        .ok_or(ReconstructionError::ArithmeticOverflow(
-            "reconstructed plane size",
-        ))?;
-    plane.clear();
-    plane.resize(length, 0);
-    if width == 0 {
-        return Ok(());
-    }
-    // Place each block in raster position with its DC first, then transform
-    // the plane in place so adjacent blocks share vector lanes.
-    let place_blocks = |(macroblock_y, rows): (usize, &mut [i32])| {
-        for macroblock_x in 0..macroblocks_x {
-            let index = macroblock_y * macroblocks_x + macroblock_x;
-            for block in 0..block_columns * block_rows {
-                let coefficients = &high[index][block * 16..block * 16 + 16];
-                let block_x = macroblock_x * macroblock_width + block % block_columns * 4;
-                let block_y = block / block_columns * 4;
-                for row in 0..4 {
-                    let destination = (block_y + row) * width + block_x;
-                    rows[destination..destination + 4]
-                        .copy_from_slice(&coefficients[row * 4..row * 4 + 4]);
-                }
-                rows[block_y * width + block_x] = low[index][block];
-            }
-        }
-    };
-    if plane.len() < super::lanes::PARALLEL_SAMPLES {
-        plane
-            .chunks_mut(width * macroblock_height)
-            .enumerate()
-            .for_each(place_blocks);
-    } else {
-        plane
-            .par_chunks_mut(width * macroblock_height)
-            .enumerate()
-            .for_each(place_blocks);
-    }
-    super::lanes::transform_plane(level, plane, width)
-}
-
-fn apply_configured_overlap(
-    level: Level,
-    samples: &mut [i32],
-    width: usize,
-    height: usize,
-    config: &ReconstructionConfig,
-    horizontal_scale: usize,
-    vertical_scale: usize,
-) -> Result<(), ReconstructionError> {
-    let columns = scale_boundaries(&config.tiles.column_boundaries, horizontal_scale)?;
-    let rows = scale_boundaries(&config.tiles.row_boundaries, vertical_scale)?;
-    apply_overlap(
-        level,
-        samples,
-        width,
-        height,
-        &columns,
-        &rows,
-        config.tiles.hard_boundaries,
-    )
-}
-
-fn apply_configured_subsampled_overlap(
-    samples: &mut [i32],
-    width: usize,
-    height: usize,
-    config: &ReconstructionConfig,
-    horizontal_scale: usize,
-    vertical_scale: usize,
-) -> Result<(), ReconstructionError> {
-    let columns = scale_boundaries(&config.tiles.column_boundaries, horizontal_scale)?;
-    let rows = scale_boundaries(&config.tiles.row_boundaries, vertical_scale)?;
-    apply_subsampled_first_overlap(
-        samples,
-        width,
-        height,
-        &columns,
-        &rows,
-        config.tiles.hard_boundaries,
-    )
-}
-
-fn scale_boundaries(boundaries: &[u32], scale: usize) -> Result<Vec<usize>, ReconstructionError> {
+pub(crate) fn scale_boundaries(
+    boundaries: &[u32],
+    scale: usize,
+) -> Result<Vec<usize>, ReconstructionError> {
     boundaries
         .iter()
         .map(|&value| {

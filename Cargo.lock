@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "jxr"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "jxr-core",
  "jxr-cuda",
@@ -156,15 +156,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "jxr-alloc-probe"
+version = "0.2.0"
+dependencies = [
+ "jxr",
+ "jxr-test-support",
+ "rayon",
+]
+
+[[package]]
 name = "jxr-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "j2k-core",
 ]
 
 [[package]]
 name = "jxr-cuda"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "cudarc",
  "jxr-core",
@@ -174,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-image"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "image",
  "jxr",
@@ -183,11 +192,11 @@ dependencies = [
 
 [[package]]
 name = "jxr-math"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "jxr-metal"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "j2k-core",
  "j2k-metal-support",
@@ -201,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-mpsgraph"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "j2k-metal-support",
  "j2k-mpsgraph-support",
@@ -219,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "jxr-native"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "fearless_simd",
  "jxr-core",
@@ -235,6 +244,13 @@ dependencies = [
  "jxr-native",
  "rayon",
  "thiserror",
+]
+
+[[package]]
+name = "jxr-wasm-size"
+version = "0.2.0"
+dependencies = [
+ "jxr",
 ]
 
 [[package]]

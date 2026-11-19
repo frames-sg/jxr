@@ -2,18 +2,19 @@
 
 use std::{
     hint::black_box,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use jxr::{
-    AlphaHandling, BackendRequest, BatchDecodeOptions, CpuBatchDecoder, DecodeRequest,
-    DecodedImage, EncodedImage, JxrView, MetalBatchDecoder, PixelFormat,
+    BackendRequest, BatchDecodeOptions, CpuBatchDecoder, DecodedImage, EncodedImage, JxrView,
+    MetalBatchDecoder,
     metal::{MetalDecodePlan, MetalDecoderSession, MetalStageDiagnostics},
 };
 use jxr_test_support::{
-    checksum_bytes, checksum_cpu_batch_image, checksum_samples, oracle_format, summarize_timings,
+    BenchmarkFile, check_checksum, checksum_bytes, checksum_cpu_batch_image, checksum_samples,
+    exit_on_error, milliseconds, summarize_timings, t834_suite, workspace_root,
 };
 use rayon::prelude::*;
 
@@ -23,15 +24,7 @@ const ITERATIONS: usize = 10;
 const PIPELINE_BATCHES: usize = 4;
 
 type BenchmarkError = Box<dyn std::error::Error + Send + Sync>;
-
-struct Workload {
-    path: PathBuf,
-    source: Arc<[u8]>,
-    format: PixelFormat,
-    alpha: AlphaHandling,
-    width: u32,
-    height: u32,
-}
+type Workload = BenchmarkFile;
 
 #[derive(Clone, Copy)]
 enum MetalOutput {
@@ -42,22 +35,16 @@ enum MetalOutput {
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("jxr-pathology-bench: {error}");
-        std::process::exit(1);
-    }
+    exit_on_error("jxr-pathology-bench", run());
 }
 
 fn run() -> Result<(), BenchmarkError> {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .ok_or("test-support crate is outside its workspace")?;
+    let workspace = workspace_root()?;
     let path = std::env::args_os().nth(1).map_or_else(
-        || workspace.join("target/t834-conformance/suite-2014/MBLevel_QP_Coverage/Boat_MBQP7.jxr"),
+        || t834_suite(workspace).join("MBLevel_QP_Coverage/Boat_MBQP7.jxr"),
         PathBuf::from,
     );
-    let workload = load_workload(&path)?;
+    let workload = BenchmarkFile::load(&path)?;
     let cpu = CpuBatchDecoder::new(BatchDecodeOptions::default())?;
     let session = MetalDecoderSession::system_default()?;
     let batch_api = MetalBatchDecoder::system_default(BatchDecodeOptions::default())?;
@@ -351,7 +338,7 @@ fn run_batch_api(
         .map(|_| {
             EncodedImage::new(
                 Arc::clone(&workload.source),
-                request(workload, BackendRequest::Metal),
+                workload.request(BackendRequest::Metal),
             )
         })
         .collect();
@@ -375,6 +362,7 @@ fn run_batch_api(
     }
     for image in images {
         check_checksum(
+            "batch output",
             checksum_bytes(&decoder.session().readback(image)?),
             expected_checksum,
         )?;
@@ -415,7 +403,7 @@ fn run_cpu_batch(
         .map(|_| {
             EncodedImage::new(
                 Arc::clone(&workload.source),
-                request(workload, BackendRequest::Cpu),
+                workload.request(BackendRequest::Cpu),
             )
         })
         .collect();
@@ -437,7 +425,7 @@ fn run_cpu_batch(
         let checksum =
             checksum_cpu_batch_image(group.samples(), image, group.image_stride_elements())
                 .ok_or("native CPU batch image range is invalid")?;
-        check_checksum(checksum, expected_checksum)?;
+        check_checksum("batch output", checksum, expected_checksum)?;
     }
     Ok(elapsed)
 }
@@ -498,13 +486,17 @@ fn run_metal_batch(
         MetalOutput::Shared => {
             for image in shared {
                 image.with_bytes(|bytes| {
-                    check_checksum(checksum_bytes(bytes), expected_checksum)
+                    check_checksum("batch output", checksum_bytes(bytes), expected_checksum)
                 })??;
             }
         }
         MetalOutput::Host => {
             for image in host {
-                check_checksum(checksum_samples(&image.samples), expected_checksum)?;
+                check_checksum(
+                    "batch output",
+                    checksum_samples(&image.samples),
+                    expected_checksum,
+                )?;
             }
         }
     }
@@ -528,7 +520,11 @@ fn validate_metal_batch(
         return Err("Metal validation batch returned the wrong output count".into());
     }
     for image in &resident {
-        check_checksum(checksum_bytes(&session.readback(image)?), expected_checksum)?;
+        check_checksum(
+            "batch output",
+            checksum_bytes(&session.readback(image)?),
+            expected_checksum,
+        )?;
     }
     let dense = session.submit_dense_batch(&plans)?.wait()?;
     if dense.layout().image_count() != batch_size {
@@ -536,6 +532,7 @@ fn validate_metal_batch(
     }
     for image in 0..batch_size {
         check_checksum(
+            "batch output",
             checksum_bytes(&session.readback_batch_image(&dense, image)?),
             expected_checksum,
         )?;
@@ -555,14 +552,14 @@ fn prepare_metal_plans(
     batch_size: usize,
 ) -> Result<Vec<MetalDecodePlan>, BenchmarkError> {
     let view = JxrView::parse(&workload.source)?;
-    let prepared_request = request(workload, BackendRequest::Metal);
+    let prepared_request = workload.request(BackendRequest::Metal);
     let coefficient_count = view.decoder().metal_coefficient_count(&prepared_request)?;
     let staging = session.coefficient_staging_batch(coefficient_count, batch_size)?;
     let plans = staging
         .into_par_iter()
         .map(|staging| {
             let view = JxrView::parse(&workload.source)?;
-            let request = request(workload, BackendRequest::Metal);
+            let request = workload.request(BackendRequest::Metal);
             Ok(view
                 .decoder()
                 .prepare_metal_with_staging(&request, staging)?)
@@ -575,40 +572,7 @@ fn decode_cpu(workload: &Workload) -> Result<DecodedImage, BenchmarkError> {
     let view = JxrView::parse(&workload.source)?;
     Ok(view
         .decoder()
-        .decode(&request(workload, BackendRequest::Cpu))?)
-}
-
-fn request(workload: &Workload, backend: BackendRequest) -> DecodeRequest {
-    DecodeRequest::new(workload.format)
-        .with_alpha(workload.alpha)
-        .with_backend(backend)
-}
-
-fn check_checksum(actual: u64, expected: u64) -> Result<(), BenchmarkError> {
-    black_box(actual);
-    if actual != expected {
-        return Err(format!(
-            "batch output checksum changed: expected {expected:016x}, got {actual:016x}"
-        )
-        .into());
-    }
-    Ok(())
-}
-
-fn load_workload(path: &Path) -> Result<Workload, BenchmarkError> {
-    let source: Arc<[u8]> = std::fs::read(path)?.into();
-    let view = JxrView::parse(&source)?;
-    let format = oracle_format(view.info())?;
-    let width = view.info().width;
-    let height = view.info().height;
-    Ok(Workload {
-        path: path.to_owned(),
-        source,
-        format: format.pixel_format,
-        alpha: format.alpha,
-        width,
-        height,
-    })
+        .decode(&workload.request(BackendRequest::Cpu))?)
 }
 
 fn print_result(workload: &Workload, batch_size: usize, result: &BatchResult) {
@@ -672,8 +636,4 @@ fn print_route(label: &str, summary: jxr_test_support::TimingSummary, rate: f64)
         milliseconds(summary.p95),
         rate
     );
-}
-
-fn milliseconds(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1_000.0
 }

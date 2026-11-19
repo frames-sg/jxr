@@ -1,36 +1,11 @@
 //! Typed output-storage alpha premultiplication.
 
-use jxr_core::{DecodedSamples, DecodedSamplesMut, PixelFormat};
+use jxr_core::{DecodedSamplesMut, PixelFormat};
 use jxr_math::alpha::{
     premultiply_f32, premultiply_sign_magnitude_15, premultiply_signed, premultiply_unsigned,
 };
 
 use super::OutputFormatError;
-
-pub(super) fn premultiply_output(
-    samples: &mut DecodedSamples,
-    format: PixelFormat,
-) -> Result<(), OutputFormatError> {
-    let channels = usize::from(format.channel_count());
-    match samples {
-        DecodedSamples::U8(values) => premultiply_u8(values, channels)?,
-        DecodedSamples::U16(values) => premultiply_u16(values, channels)?,
-        DecodedSamples::I16(values) => premultiply_i16(values, channels)?,
-        DecodedSamples::I32(values) => premultiply_i32(values, channels)?,
-        DecodedSamples::F16(values) => premultiply_f16(values, channels)?,
-        DecodedSamples::F32(values) => premultiply_float(values, channels),
-        DecodedSamples::BitPacked(_)
-        | DecodedSamples::Rgb555(_)
-        | DecodedSamples::Rgb565(_)
-        | DecodedSamples::Rgb101010(_)
-        | DecodedSamples::Rgbe(_) => {
-            return Err(OutputFormatError::UnsupportedCombination {
-                combination: "alpha premultiplication for packed output",
-            });
-        }
-    }
-    Ok(())
-}
 
 pub(super) fn premultiply_output_mut(
     samples: DecodedSamplesMut<'_>,

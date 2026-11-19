@@ -3,12 +3,14 @@
 mod adaptive;
 mod bit_reader;
 mod coefficients;
+pub(crate) mod encode;
 mod error;
 mod model;
 mod refinement;
 mod scan;
 mod vlc;
 
+pub(crate) use adaptive::AdaptiveVlc;
 pub use adaptive::{AcVlcState, DcVlcState, TileEntropyState};
 pub use bit_reader::PacketBitReader;
 pub use coefficients::{
@@ -17,10 +19,12 @@ pub use coefficients::{
 pub(crate) use coefficients::{decode_hp_block, decode_lp_block};
 pub use error::EntropyError;
 pub use model::{CoefficientModel, ColourModel};
+pub(crate) use refinement::refine_flex_block;
 pub use refinement::{
     decode_flex, decode_flex_block, decode_lp_refinement, decode_lp_refinement_at,
 };
 pub use scan::{AdaptiveHpScan, AdaptiveLpScan, HpScanDirection};
 #[cfg(test)]
 pub(crate) use vlc::tests::assert_matches_serial;
+pub(crate) use vlc::{CodeTable, encode as encode_prefix};
 pub(crate) use vlc::{PrefixTable, decode as decode_prefix};

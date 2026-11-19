@@ -1,13 +1,17 @@
 //! T.832 `IMAGE_HEADER` parsing.
 
-use crate::{NativeError, bit_reader::BitReader};
+use crate::{
+    NativeError,
+    bit_reader::BitReader,
+    metadata::{output_color, overlap_mode},
+};
 
 use super::{
-    fields::{read_dimension, read_u8, read_u16, require_value},
+    fields::{read_dimension, read_u8, read_u16, require_value, reserved_bit_depth},
     types::{CodestreamHeader, HeaderFlags},
 };
 
-const GDI_SIGNATURE: u64 = 0x574D_5048_4F54_4F00;
+pub(super) const GDI_SIGNATURE: u64 = 0x574D_5048_4F54_4F00;
 
 pub(super) fn parse_image_header(
     reader: &mut BitReader<'_>,
@@ -22,7 +26,8 @@ pub(super) fn parse_image_header(
     let frequency_mode = reader.read_flag()?;
     let orientation = read_u8(reader, 3)?;
     let index_table_present = reader.read_flag()?;
-    let overlap_mode = read_overlap_mode(reader)?;
+    let overlap = read_u8(reader, 2)?;
+    overlap_mode(overlap)?;
     let short_header = reader.read_flag()?;
     let long_word = reader.read_flag()?;
     let windowing = reader.read_flag()?;
@@ -55,25 +60,13 @@ pub(super) fn parse_image_header(
         height,
         flags,
         orientation,
-        overlap_mode,
+        overlap_mode: overlap,
         output_color_format,
         output_bit_depth,
         tile_widths_mb,
         tile_heights_mb,
         margins,
     })
-}
-
-fn read_overlap_mode(reader: &mut BitReader<'_>) -> Result<u8, NativeError> {
-    let value = read_u8(reader, 2)?;
-    if value == 3 {
-        Err(NativeError::ReservedValue {
-            field: "OVERLAP_MODE",
-            value: 3,
-        })
-    } else {
-        Ok(value)
-    }
 }
 
 fn parse_margins(
@@ -94,7 +87,10 @@ fn parse_margins(
     }
 }
 
-fn inferred_margin(dimension: u32) -> u8 {
+/// The margin of padding a header leaves to be inferred beyond an image
+/// edge `dimension` samples from the origin: up to the next whole
+/// macroblock.
+pub(crate) fn inferred_margin(dimension: u32) -> u8 {
     let remainder = dimension % 16;
     if remainder == 0 {
         0
@@ -132,13 +128,8 @@ fn read_tile_sizes(
 }
 
 fn validate_output_codes(color: u8, depth: u8) -> Result<(), NativeError> {
-    if color > 8 {
-        return Err(NativeError::ReservedValue {
-            field: "OUTPUT_CLR_FMT",
-            value: u64::from(color),
-        });
-    }
-    if matches!(depth, 5 | 11..=14) {
+    output_color(color, 0)?;
+    if reserved_bit_depth(depth) {
         return Err(NativeError::ReservedValue {
             field: "OUTPUT_BITDEPTH",
             value: u64::from(depth),

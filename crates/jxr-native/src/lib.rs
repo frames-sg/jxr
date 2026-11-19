@@ -4,14 +4,18 @@
 #![deny(missing_docs)]
 
 mod accelerator;
+mod analyze;
 mod annex_a;
 mod bit_reader;
+mod bit_writer;
 mod codestream;
 mod coefficient;
 mod cpu;
 mod decode;
+mod encode;
 pub mod entropy;
 mod error;
+mod executor;
 mod header;
 mod metadata;
 pub mod output_format;
@@ -20,6 +24,7 @@ mod prepare;
 pub mod reconstruct;
 mod tail;
 pub mod tile_decode;
+mod tile_encode;
 
 pub use accelerator::{
     AcceleratorCoefficients, PreparedAlphaCoefficients, prepare_accelerator_coefficients,
@@ -32,12 +37,13 @@ pub use decode::{
     CpuDecodeIntoOutput, CpuDecodeWorkspace, decode_cpu, decode_cpu_into_with_workspace,
     decode_cpu_u8_into_with_workspace, decode_cpu_with_workspace, prepare_output_format,
 };
+pub use encode::{encode_annex_a, encode_codestream, encode_codestreams};
 pub use error::NativeError;
 pub use header::{
     CodestreamHeader, HeaderFlags, ImagePlaneHeader, ParsedHeaders, QuantizerSet,
     parse_codestream_headers,
 };
 pub use metadata::image_info;
-pub use pixel_format::classify_annex_a_pixel_format;
+pub use pixel_format::{classify_annex_a_pixel_format, native_pixel_format};
 pub use prepare::prepare_plan;
 pub use tail::{CodestreamDirectory, ProfileLevel};

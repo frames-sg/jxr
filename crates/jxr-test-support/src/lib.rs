@@ -11,11 +11,16 @@ mod conformance;
 mod error;
 mod format;
 mod process;
+mod quality;
 
 pub use benchmark::{
-    TimingSummary, checksum_bytes, checksum_cpu_batch_image, checksum_samples, summarize_timings,
+    BenchmarkFile, TimingSummary, check_checksum, checksum_bytes, checksum_cpu_batch_image,
+    checksum_samples, milliseconds, summarize_timings, synthetic_samples,
 };
-pub use compare::{DifferentialResult, RustRawOutput, compare_file, decode_rust_file};
+pub use compare::{
+    DifferentialResult, RustRawOutput, compare_file, decode_rust_file, planar_bytes,
+    reference_alpha_bytes, reference_bytes, sample_bytes,
+};
 #[cfg(feature = "cuda")]
 pub use compare::{compare_file_cuda, decode_cuda_file};
 #[cfg(feature = "metal")]
@@ -26,8 +31,9 @@ pub use conformance::run_t834_cuda_case;
 pub use conformance::run_t834_metal_case;
 pub use conformance::{
     T834Case, T834CaseExpectation, T834CaseOutcome, T834CaseResult, T834Summary,
-    discover_t834_cases, run_t834_cpu_case,
+    discover_t834_cases, run_t834_cpu_case, t834_suite, workspace_root,
 };
-pub use error::OracleError;
-pub use format::{OracleFormat, oracle_format};
-pub use process::{OracleRawOutput, T835Oracle, T835ProfileLimit};
+pub use error::{OracleError, exit_on_error, exit_with_failures};
+pub use format::{OracleFormat, decimates_chroma, oracle_format, subsamples_chroma};
+pub use process::{OracleRawOutput, T835Oracle, T835ProfileLimit, TempFile};
+pub use quality::{QualityClass, QualityMeasurement, QualityPicture, QualitySource, split_mix64};

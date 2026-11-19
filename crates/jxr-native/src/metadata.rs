@@ -1,8 +1,9 @@
 //! Conversion from parsed T.832 syntax to public image metadata.
 
 use jxr_core::{
-    AlphaMode, BandPresence, BitstreamMode, ByteRange, ChromaSampling, ColorFormat, ImageInfo,
-    ImageMetadata, Level, Orientation, OverlapMode, PlaneInfo, Profile, SampleFormat, TileGrid,
+    AlphaMode, BandPresence, BitstreamMode, ByteRange, ChromaSampling, ColorFormat, DecodeScale,
+    ImageInfo, ImageMetadata, Level, Orientation, OutputBitDepth, OverlapMode, PlaneInfo, Profile,
+    SampleFormat, TileGrid,
 };
 
 use crate::classify_annex_a_pixel_format;
@@ -181,14 +182,10 @@ fn profile_and_level(parsed: &ParsedCodestream) -> (Option<Profile>, Option<Leve
     let Some(declaration) = parsed.directory.profiles.first() else {
         return (Some(Profile::Advanced), Some(Level(255)));
     };
-    let profile = match declaration.profile_idc {
-        44 => Profile::SubBaseline,
-        55 => Profile::Baseline,
-        66 => Profile::Main,
-        111 => Profile::Advanced,
-        value => Profile::Unknown(value),
-    };
-    (Some(profile), Some(Level(declaration.level_idc)))
+    (
+        Some(Profile::from_idc(declaration.profile_idc)),
+        Some(Level(declaration.level_idc)),
+    )
 }
 
 const fn orientation(value: u8) -> Orientation {
@@ -204,7 +201,7 @@ const fn orientation(value: u8) -> Orientation {
     }
 }
 
-fn internal_color(code: u8, components: u16) -> Result<ColorFormat, NativeError> {
+pub(crate) fn internal_color(code: u8, components: u16) -> Result<ColorFormat, NativeError> {
     match code {
         0 => Ok(ColorFormat::Luma),
         1 => Ok(ColorFormat::Yuv(ChromaSampling::Cs420)),
@@ -219,26 +216,84 @@ fn internal_color(code: u8, components: u16) -> Result<ColorFormat, NativeError>
     }
 }
 
-fn sample_format(code: u8) -> Result<SampleFormat, NativeError> {
+/// The colour format `OUTPUT_CLR_FMT` code `code` names, an N-component one
+/// of `components` components.
+pub(crate) fn output_color(code: u8, components: u16) -> Result<ColorFormat, NativeError> {
     match code {
-        0 | 15 => Ok(SampleFormat::Bit1),
-        1 => Ok(SampleFormat::Unsigned { bits: 8 }),
-        2 => Ok(SampleFormat::Unsigned { bits: 16 }),
-        3 => Ok(SampleFormat::Signed { bits: 16 }),
-        4 => Ok(SampleFormat::Float16),
-        6 => Ok(SampleFormat::Signed { bits: 32 }),
-        7 => Ok(SampleFormat::Float32),
-        8 => Ok(SampleFormat::Unsigned { bits: 5 }),
-        9 => Ok(SampleFormat::Unsigned { bits: 10 }),
-        10 => Ok(SampleFormat::Unsigned { bits: 6 }),
+        0 => Ok(ColorFormat::Luma),
+        1 => Ok(ColorFormat::Yuv(ChromaSampling::Cs420)),
+        2 => Ok(ColorFormat::Yuv(ChromaSampling::Cs422)),
+        3 => Ok(ColorFormat::Yuv(ChromaSampling::Cs444)),
+        4 => Ok(ColorFormat::Cmyk),
+        5 => Ok(ColorFormat::CmykDirect),
+        6 => Ok(ColorFormat::NComponent(components)),
+        7 => Ok(ColorFormat::Rgb),
+        8 => Ok(ColorFormat::Rgbe),
         value => Err(NativeError::ReservedValue {
-            field: "OUTPUT_BITDEPTH",
+            field: "OUTPUT_CLR_FMT",
             value: u64::from(value),
         }),
     }
 }
 
-fn band_presence(code: u8) -> Result<BandPresence, NativeError> {
+/// `INTERNAL_CLR_FMT` code of an internal colour format: the inverse of
+/// [`internal_color`]. `None` for colour formats no plane is coded in.
+pub(crate) const fn internal_color_code(color: ColorFormat) -> Option<u8> {
+    match color {
+        ColorFormat::Luma => Some(0),
+        ColorFormat::Yuv(ChromaSampling::Cs420) => Some(1),
+        ColorFormat::Yuv(ChromaSampling::Cs422) => Some(2),
+        ColorFormat::Yuv(ChromaSampling::Cs444) => Some(3),
+        ColorFormat::YuvK => Some(4),
+        ColorFormat::NComponent(_) => Some(6),
+        ColorFormat::Rgb | ColorFormat::Rgbe | ColorFormat::Cmyk | ColorFormat::CmykDirect => None,
+    }
+}
+
+/// Whether a decode at `scale` of a primary plane coded in the
+/// `INTERNAL_CLR_FMT` `internal` and output as the `OUTPUT_CLR_FMT` `output`
+/// interpolates subsampled chroma to full resolution: whenever its chroma is
+/// subsampled and not stored as native planes, but at a sixteenth of the
+/// size, where chroma has a sample for each macroblock as luma does. The
+/// interpolation of 4:2:0 chroma reaches across rows.
+pub(crate) fn interpolates_chroma(internal: u8, output: u8, scale: DecodeScale) -> bool {
+    internal_subsampling(internal).is_some()
+        && output_subsampling(output).is_none()
+        && !matches!(scale, DecodeScale::Sixteenth)
+}
+
+/// The chroma subsampling of the `INTERNAL_CLR_FMT` code `code` when it
+/// names YUV 4:2:0 or 4:2:2, whose chroma planes are smaller than luma.
+pub(crate) fn internal_subsampling(code: u8) -> Option<ChromaSampling> {
+    internal_color(code, 0).ok().and_then(subsampling)
+}
+
+/// The chroma subsampling of the `OUTPUT_CLR_FMT` code `code` when it
+/// names YUV 4:2:0 or 4:2:2, which a decode stores as planes.
+pub(crate) fn output_subsampling(code: u8) -> Option<ChromaSampling> {
+    output_color(code, 0).ok().and_then(subsampling)
+}
+
+const fn subsampling(color: ColorFormat) -> Option<ChromaSampling> {
+    match color {
+        ColorFormat::Yuv(sampling @ (ChromaSampling::Cs420 | ChromaSampling::Cs422)) => {
+            Some(sampling)
+        }
+        _ => None,
+    }
+}
+
+/// The sample format of `OUTPUT_BITDEPTH` code `code`.
+fn sample_format(code: u8) -> Result<SampleFormat, NativeError> {
+    crate::header::output_bit_depth(code)
+        .map(OutputBitDepth::sample_format)
+        .ok_or(NativeError::ReservedValue {
+            field: "OUTPUT_BITDEPTH",
+            value: u64::from(code),
+        })
+}
+
+pub(crate) fn band_presence(code: u8) -> Result<BandPresence, NativeError> {
     match code {
         0 => Ok(BandPresence::All),
         1 => Ok(BandPresence::NoFlexbits),
@@ -251,7 +306,18 @@ fn band_presence(code: u8) -> Result<BandPresence, NativeError> {
     }
 }
 
-fn overlap_mode(code: u8) -> Result<OverlapMode, NativeError> {
+/// `BANDS_PRESENT` code of a band presence: the inverse of
+/// [`band_presence`].
+pub(crate) const fn band_presence_code(bands: BandPresence) -> u8 {
+    match bands {
+        BandPresence::All => 0,
+        BandPresence::NoFlexbits => 1,
+        BandPresence::NoHighPass => 2,
+        BandPresence::DcOnly => 3,
+    }
+}
+
+pub(crate) fn overlap_mode(code: u8) -> Result<OverlapMode, NativeError> {
     match code {
         0 => Ok(OverlapMode::None),
         1 => Ok(OverlapMode::One),
@@ -260,5 +326,50 @@ fn overlap_mode(code: u8) -> Result<OverlapMode, NativeError> {
             field: "OVERLAP_MODE",
             value: u64::from(value),
         }),
+    }
+}
+
+/// `OVERLAP_MODE` code of an overlap mode: the inverse of [`overlap_mode`].
+pub(crate) const fn overlap_code(overlap: OverlapMode) -> u8 {
+    match overlap {
+        OverlapMode::None => 0,
+        OverlapMode::One => 1,
+        OverlapMode::Two => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_colour_codes_invert_their_parsing() {
+        for (code, components) in [(0_u8, 1_u16), (1, 3), (2, 3), (3, 3), (4, 4), (6, 5)] {
+            let color = internal_color(code, components).unwrap();
+            assert_eq!(internal_color_code(color), Some(code));
+            assert_eq!(color.component_count(), Some(components));
+        }
+        // Output-only colour formats are never a plane's coded format.
+        for color in [
+            ColorFormat::Rgb,
+            ColorFormat::Rgbe,
+            ColorFormat::Cmyk,
+            ColorFormat::CmykDirect,
+        ] {
+            assert_eq!(internal_color_code(color), None);
+        }
+        assert!(internal_color(5, 3).is_err());
+    }
+
+    #[test]
+    fn band_presence_and_overlap_codes_invert_their_parsing() {
+        for code in 0..=3 {
+            assert_eq!(band_presence_code(band_presence(code).unwrap()), code);
+            if code < 3 {
+                assert_eq!(overlap_code(overlap_mode(code).unwrap()), code);
+            }
+        }
+        assert!(band_presence(4).is_err());
+        assert!(overlap_mode(3).is_err());
     }
 }

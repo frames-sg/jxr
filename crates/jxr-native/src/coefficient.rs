@@ -4,7 +4,7 @@ use jxr_core::{
     CoefficientArena, CoefficientArenaDescriptor, JxrError, JxrErrorKind, PreparedPlan,
 };
 
-use crate::{ParsedCodestream, tile_decode::decode_tiles};
+use crate::{ParsedCodestream, executor::Executor, tile_decode::decode_tiles};
 
 /// Decode entropy, scans, remapping, and prediction into the shared coefficient arena.
 pub fn decode_coefficients(
@@ -20,8 +20,9 @@ pub(crate) fn decode_coefficients_reusing(
     parsed: &ParsedCodestream,
     plan: &PreparedPlan,
     arena: &mut CoefficientArena,
+    executor: Executor,
 ) -> Result<bool, JxrError> {
-    crate::tile_decode::decode_tiles_reusing(source, parsed, plan, arena)
+    crate::tile_decode::decode_tiles_reusing_on(source, parsed, plan, arena, executor)
         .map_err(|error| map_tile_error(&error))
 }
 
@@ -44,7 +45,7 @@ pub fn decode_coefficients_into(
         .map_err(|error| map_tile_error(&error))
 }
 
-fn map_tile_error(error: &crate::tile_decode::TileDecodeError) -> JxrError {
+pub(crate) fn map_tile_error(error: &crate::tile_decode::TileDecodeError) -> JxrError {
     use crate::tile_decode::TileDecodeError;
 
     let operation = error.operation();

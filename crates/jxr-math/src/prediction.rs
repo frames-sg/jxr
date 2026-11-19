@@ -2,6 +2,19 @@
 
 use crate::arithmetic::{MathError, checked_add};
 
+/// Coefficients of a 4-by-4 block that prediction from the block to its
+/// left changes: the vertical frequencies of its first column.
+///
+/// The low-pass band of a macroblock is a 4-by-4 block of its own, and its
+/// prediction from the macroblock to the left changes the same positions.
+pub const PREDICTED_FROM_LEFT: [usize; 3] = [4, 8, 12];
+
+/// Coefficients of a 4-by-4 block that prediction from the block above it
+/// changes: the horizontal frequencies of its first row. As for
+/// [`PREDICTED_FROM_LEFT`], low-pass prediction from the macroblock above
+/// changes the same positions.
+pub const PREDICTED_FROM_TOP: [usize; 3] = [1, 2, 3];
+
 /// Direction selected from reconstructed low-pass coefficients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HighpassPrediction {
@@ -47,14 +60,19 @@ fn predict_geometry(
         HighpassPrediction::FromLeft => {
             for row in 0..rows {
                 for column in 1..columns {
-                    predict_block(coefficients, row * columns + column, 1, [4, 8, 12])?;
+                    predict_block(coefficients, row * columns + column, 1, PREDICTED_FROM_LEFT)?;
                 }
             }
         }
         HighpassPrediction::FromTop => {
             for row in 1..rows {
                 for column in 0..columns {
-                    predict_block(coefficients, row * columns + column, columns, [1, 2, 3])?;
+                    predict_block(
+                        coefficients,
+                        row * columns + column,
+                        columns,
+                        PREDICTED_FROM_TOP,
+                    )?;
                 }
             }
         }
@@ -63,6 +81,7 @@ fn predict_geometry(
     Ok(())
 }
 
+#[inline]
 fn predict_block(
     coefficients: &mut [i32; 256],
     block: usize,

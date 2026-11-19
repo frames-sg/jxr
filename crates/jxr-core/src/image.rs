@@ -74,6 +74,16 @@ pub struct PlaneInfo {
     pub height: u32,
 }
 
+/// Whether component `component` of a plane whose `SCALED_FLAG` is `scaled`
+/// passes through the DC and low-pass transform at half weight, which
+/// reconstruction doubles after that transform: every component after the
+/// first, in any colour format. An alpha plane is a plane of its own, whose
+/// one component is the first.
+#[must_use]
+pub const fn scaled_after_first_transform(scaled: bool, component: usize) -> bool {
+    scaled && component != 0
+}
+
 /// Metadata reported without applying presentation policy.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ImageMetadata {

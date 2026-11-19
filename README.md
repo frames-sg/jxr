@@ -9,21 +9,23 @@
 [Project website](https://frames-sg.com/rust-jpeg-xr-codec/) ·
 [API documentation](https://docs.rs/jxr)
 
-JXR decodes JPEG XR images in Rust, with optional Apple GPU (Metal) and
-NVIDIA GPU (CUDA) reconstruction. The default build runs on the CPU and needs
-no GPU runtime or reference codec.
+JXR decodes and encodes JPEG XR images in Rust, with optional Apple GPU
+(Metal) and NVIDIA GPU (CUDA) reconstruction when decoding. The default build
+runs on the CPU and needs no GPU runtime or reference codec.
 
 It reads raw JPEG XR codestreams and Annex-A still-image files, decodes full
 images or regions, and preserves high-bit-depth samples, alpha, and embedded
-ICC profiles. It can also wrap an existing codestream in an Annex-A file;
-pixel-to-codestream encoding is not implemented.
+ICC profiles. It encodes grayscale, RGB and YUV images at every sample depth
+it decodes, from 1-bit to 32-bit float, and CMYK and N-component images, with
+or without alpha, losslessly or with chosen quantization, and can wrap an
+existing codestream in an Annex-A file.
 
 ```sh
 cargo add jxr
 ```
 
-Requires **Rust 1.99.0 or newer**. The current release is **0.5.1**; see the
-[release notes](docs/releasing.md#051-patch-release) for migration details.
+Requires **Rust 1.99.0 or newer**. The current release is **0.5.2**; see the
+[release notes](docs/releasing.md#052-release) for migration details.
 
 ## What it does
 
@@ -42,12 +44,34 @@ Requires **Rust 1.99.0 or newer**. The current release is **0.5.1**; see the
   layouts; GPU output can remain in device memory.
 - **Connect to other libraries.** `jxr-image` transfers supported buffers into
   `image::DynamicImage`; `jxr-mpsgraph` hands Metal batches to Apple's MPSGraph.
+- **Encode grayscale, RGB, CMYK, and N-component.** `encode` writes a `.jxr`
+  file from grayscale, RGB, or BGR samples: 1-bit, 8-bit, 16-bit, fixed-point,
+  half and 32-bit float, packed RGB, and RGBE; and from 8-bit or 16-bit CMYK
+  and three- to eight-channel samples. Coding is lossless, at a quality from
+  0 to 100, or with per-band quantizers, with a choice of overlap filtering,
+  tiling, frequency bands, flexbits trimming, and packet layout. Anything the
+  decoder returns in these formats can be re-encoded.
+- **Encode for thumbnails.** `EncodeRequest::with_bitstream_mode` writes
+  frequency-mode files, in any format the encoder supports, which decode at a
+  quarter or a sixteenth of their size without reading the other bands.
+- **Encode YUV and subsample chroma.** YUV 4:4:4, 4:2:2, and 4:2:0 samples
+  at 8, 10, and 16 bits are coded as they are, the subsampled ones from
+  planes as the decoder returns them. `EncodeRequest::with_chroma_sampling`
+  codes the chroma of RGB and YUV 4:4:4 images at 4:2:2 or 4:2:0, which a
+  decoder interpolates back.
+- **Encode alpha.** RGBA at every depth and 8-bit BGRA, straight or
+  premultiplied, CMYK and YUV with alpha, and three- to eight-channel samples
+  with alpha. Alpha is
+  coded as a separate image in the file by default, or integrated into the
+  codestream with `EncodeRequest::with_alpha_mode`, and can be quantized
+  apart from colour, for example lossless alpha under lossy colour.
 - **Write Annex-A containers.** `write_annex_a` packages an existing raw
   codestream with validated metadata and optional separate alpha.
 
-The supported format boundary is **Main-profile syntax**. Advanced-only output
+The supported decode boundary is **Main-profile syntax**. Advanced-only output
 syntax, JPEG 2000 `.jpx` wrappers, Annex-F/HEIF sequences, and transcoding are
-outside the scope. See the [full support guide](docs/support.md).
+outside the scope. Encoding covers a narrower set of formats and syntax than
+decoding. See the [full support guide](docs/support.md).
 
 ## Quick start
 
@@ -79,6 +103,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 layout. ICC bytes are available through `view.icc_profile()`; applying the
 profile is the application's responsibility. Use `decode_oriented` to apply
 the file's presentation orientation for supported full-image host outputs.
+
+### Encode an image
+
+Encode samples to a `.jxr` file. `EncodeRequest::quality` takes a
+JPEG-like quality from 0 to 100: 100 is lossless, 90 stays close to the
+source, 75 is a sound default, and smaller values give smaller files.
+`SourceSamples` has a variant for each sample storage, and converts from
+`DecodedSamples`:
+
+```rust
+use jxr::{ChannelLayout, EncodeRequest, PixelFormat, SourceImage, SourceSamples};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (width, height) = (640, 480);
+    let rgb = vec![0_u8; width as usize * height as usize * 3];
+    let image = SourceImage::new(
+        width,
+        height,
+        PixelFormat::U8(ChannelLayout::Rgb),
+        SourceSamples::U8(&rgb),
+    )?;
+
+    std::fs::write("photo.jxr", jxr::encode(&image, &EncodeRequest::quality(75))?)?;
+    std::fs::write("exact.jxr", jxr::encode(&image, &EncodeRequest::lossless())?)?;
+    Ok(())
+}
+```
+
+`EncodeRequest::lossless()` is the same request as quality 100. To choose the
+T.832 quantization parameters yourself, use `EncodeRequest::lossy` with
+`EncodeQuantizers`, where larger values give smaller files. The quality scale
+is calibrated on 8-bit images and resolved against each source, so that a
+quality loses about the same share of the sample range at any sample depth
+and in any colour format; the [support matrix](docs/support.md#quality-scale)
+gives the rule and the sizes and errors measured at each quality. It codes
+chroma at full resolution; add `.with_chroma_sampling(ChromaSampling::Cs420)`
+to the request for the 4:2:0 chroma of a typical JPEG.
+
+A file is coded in spatial mode unless the request says otherwise. Add
+`.with_bitstream_mode(BitstreamMode::Frequency)` to code each tile as one
+packet per frequency band, which lets a decoder reconstruct a quarter-size or
+sixteenth-size picture from the leading packets alone, as
+[below](#regions-and-thumbnails). The samples a full decode returns
+are the same in both modes.
+
+Source formats the encoder does not implement return an `Unsupported` error.
+`encode_codestream` returns the raw codestream without the container, and
+`encode_codestreams` the two codestreams of an image with separate alpha.
 
 ### Choose an output format
 
@@ -175,6 +247,8 @@ let thumbnail = view.decoder().decode(&thumbnail_request)?;
 `DecodeScale::Quarter` is also available. Region coordinates remain in
 full-resolution pixels. Native reduced decode currently requires frequency-mode
 input and the CPU backend; spatial-mode and GPU reduction are not implemented.
+The encoder writes frequency-mode files with
+`EncodeRequest::with_bitstream_mode(BitstreamMode::Frequency)`.
 
 ### Inspect a file
 
@@ -220,7 +294,7 @@ Most applications only need `jxr`.
 
 | You want to | Use |
 | --- | --- |
-| Inspect or decode JPEG XR; wrap existing codestreams | [`jxr`](https://docs.rs/jxr) |
+| Inspect, decode, or encode JPEG XR; wrap existing codestreams | [`jxr`](https://docs.rs/jxr) |
 | Decode with an Apple or NVIDIA GPU | `jxr` with `metal` or `cuda` |
 | Transfer decoded pixels to `image::DynamicImage` | [`jxr-image`](crates/jxr-image/README.md) |
 | Feed Metal-resident batches to MPSGraph | [`jxr-mpsgraph`](crates/jxr-mpsgraph/README.md) |
@@ -240,10 +314,18 @@ excluded for Advanced-only output syntax or `.jpx` wrappers. This is scoped
 differential evidence, not a claim of complete JPEG XR conformance. The
 [release notes](docs/releasing.md#030-release-line) link to the validation runs.
 
+**Encoder checks.** `jxr-encode-check` encodes each source image under a
+matrix of settings in both packet layouts, at each chroma sampling its format
+can be coded with, and requires every result to decode identically in JXR and
+in T.835, with no profile or level warning from T.835, and every lossless
+result to reproduce its source exactly. Agreement with the reference decoder
+shows the codestreams are valid; it says nothing about compression efficiency.
+
 **Input handling.** The public facade forbids unsafe Rust. Decode requests
 include configurable `DecodeLimits` for dimensions, compressed input,
-coefficients, and host allocations. Parser, decode, and output/batch fuzz targets
-live in the repository; ordinary CI checks that the fuzz package builds.
+coefficients, and host allocations. Parser, decode, output/batch, and encode
+round-trip fuzz targets live in the repository; ordinary CI checks that the
+fuzz package builds and runs the encode harness on its fixed cases.
 
 **Color and metadata.** JXR exposes ICC profiles without applying color
 transforms. It preserves explicit alpha and output-format semantics, and rejects
