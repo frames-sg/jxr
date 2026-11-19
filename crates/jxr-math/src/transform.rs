@@ -154,7 +154,13 @@ pub(crate) fn transform_group<const N: usize>(
     indices: [usize; N],
     operation: impl FnOnce(&mut [i32; N]) -> Result<(), MathError>,
 ) -> Result<(), MathError> {
-    let mut values = indices.map(|index| coefficients[index]);
+    // CUDA kernels reach this function, and CUDA Oxide's pinned compiler
+    // fails on a closure here (`indices.map(|index| ...)`), so the gather
+    // is a loop like the write-back below.
+    let mut values = [0; N];
+    for i in 0..N {
+        values[i] = coefficients[indices[i]];
+    }
     math_try!(operation(&mut values));
     for i in 0..N {
         coefficients[indices[i]] = values[i];
