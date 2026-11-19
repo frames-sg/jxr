@@ -10,7 +10,7 @@ homepage.workspace = true
 publish = false
 
 [dependencies]
-jxr = { path = "../jxr", version = "=0.5.1" }
+jxr = { path = "../jxr", version = "=0.5.2" }
 
 [lints]
 workspace = true

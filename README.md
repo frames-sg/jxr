@@ -24,8 +24,8 @@ existing codestream in an Annex-A file.
 cargo add jxr
 ```
 
-Requires **Rust 1.99.0 or newer**. The current release is **0.5.1**; see the
-[release notes](docs/releasing.md#051-patch-release) for migration details.
+Requires **Rust 1.99.0 or newer**. The current release is **0.5.2**; see the
+[release notes](docs/releasing.md#052-release) for migration details.
 
 ## What it does
 

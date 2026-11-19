@@ -265,3 +265,49 @@ Publish the changed packages and their exact-version dependents in this order:
 `jxr-math` 0.2.0, `jxr-core` 0.5.0, and `jxr-cuda` 0.5.0 are unchanged and stay
 at their published versions. `jxr-image` and `jxr-mpsgraph` change only their
 exact pins.
+
+## 0.5.2 release
+
+This release adds a CPU encoder. The additions are compatible with 0.5:
+`cargo semver-checks` reports no semver update required for any published
+package, so 0.5 applications take the encoder with `cargo update`.
+
+- `jxr::encode` writes an Annex-A `.jxr` file from a `SourceImage`;
+  `encode_codestream` and `encode_codestreams` return the raw codestreams.
+  `EncodeRequest::lossless`, `EncodeRequest::quality` (0 to 100), or
+  per-band quantizers choose the coding, with overlap filtering, tiling,
+  frequency bands, flexbits trimming, and packet layout as options.
+- The encoder takes grayscale, RGB, and BGR samples at every depth the
+  decoder returns, from 1-bit to 32-bit float, packed RGB, and RGBE; 8-bit
+  and 16-bit CMYK; three- to eight-channel samples; and YUV 4:4:4, 4:2:2, and
+  4:2:0 at 8, 10, and 16 bits. `SourceSamples` converts from
+  `DecodedSamples`, so decoder output can be re-encoded.
+- `EncodeRequest::with_bitstream_mode` writes frequency-mode files whose
+  thumbnails decode at a quarter or a sixteenth of full size.
+  `EncodeRequest::with_chroma_sampling` codes RGB and YUV 4:4:4 chroma at
+  4:2:2 or 4:2:0. `EncodeRequest::with_alpha_mode` stores alpha as a separate
+  image (the default) or integrated in the codestream, and alpha can be
+  quantized apart from colour.
+- Full-resolution CPU decodes run as a stream of row strips, shared with the
+  encoder's analysis stages; see [architecture](architecture.md).
+- With `SCALED_FLAG` set, every component after the first is reconstructed at
+  double weight in any colour format, where 0.5.1 did this only for YUV. The
+  CPU, Metal, and CUDA backends share the rule through
+  `jxr_core::scaled_after_first_transform`. Decoded output changes only for
+  scaled CMYK and N-component images.
+
+Every published package changes. `jxr-math`, `jxr-core`, `jxr-native`,
+`jxr-metal`, `jxr-cuda`, and `jxr` have source changes; `jxr-image` and
+`jxr-mpsgraph` change only their exact pins. Publish in this order:
+
+1. `jxr-math` 0.2.1
+2. `jxr-core` 0.5.1
+3. `jxr-native` 0.5.2
+4. `jxr-metal` 0.5.2
+5. `jxr-cuda` 0.5.1
+6. `jxr` 0.5.2
+7. `jxr-image` 0.5.2
+8. `jxr-mpsgraph` 0.6.2
+
+`jxr-math` takes a package-level version; the workspace version stays the
+baseline for the unpublished crates.
