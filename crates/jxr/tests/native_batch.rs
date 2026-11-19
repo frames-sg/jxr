@@ -1,34 +1,13 @@
+mod common;
+
 use std::{num::NonZeroUsize, sync::Arc};
 
 use jxr::{
     AlphaHandling, BackendRequest, BatchDecodeOptions, BatchErrorStage, BatchInfrastructureError,
     BatchLayout, ChannelLayout, CpuBatchDecoder, CpuBatchDestination, CpuBatchSamples,
-    DecodeRequest, EncodedImage, PixelFormat, PreparedJxr, Rect,
+    DecodeRequest, EncodeRequest, EncodedImage, PixelFormat, PreparedJxr, Rect, SourceImage,
+    SourceSamples, encode,
 };
-
-fn minimal_raw_codestream() -> Vec<u8> {
-    let mut bytes = b"WMPHOTO\0".to_vec();
-    bytes.extend_from_slice(&[0x11, 0x00, 0x80, 0x01]);
-    bytes.extend_from_slice(&15_u16.to_be_bytes());
-    bytes.extend_from_slice(&15_u16.to_be_bytes());
-    let mut bit_position = bytes.len() * 8;
-    for (value, count) in [(0, 3), (0, 1), (3, 4), (1, 1), (1, 8)] {
-        push_bits(&mut bytes, &mut bit_position, value, count);
-    }
-    bytes.extend_from_slice(&[0xFD, 0, 0, 1, 0x5a, 0, 0, 0]);
-    bytes
-}
-
-fn push_bits(bytes: &mut Vec<u8>, bit_position: &mut usize, value: u64, count: u8) {
-    for shift in (0..count).rev() {
-        if *bit_position / 8 == bytes.len() {
-            bytes.push(0);
-        }
-        let bit = u8::from(((value >> shift) & 1) != 0);
-        bytes[*bit_position / 8] |= bit << (7 - (*bit_position % 8));
-        *bit_position += 1;
-    }
-}
 
 fn request(format: PixelFormat) -> DecodeRequest {
     DecodeRequest::new(format).with_backend(BackendRequest::Cpu)
@@ -36,7 +15,7 @@ fn request(format: PixelFormat) -> DecodeRequest {
 
 #[test]
 fn preparation_groups_native_contracts_and_isolates_bad_inputs() {
-    let encoded: Arc<[u8]> = minimal_raw_codestream().into();
+    let encoded: Arc<[u8]> = common::dc_only_luma_codestream(false, [0; 3]).into();
     let inputs = vec![
         EncodedImage::new(
             Arc::clone(&encoded),
@@ -84,7 +63,7 @@ fn preparation_groups_native_contracts_and_isolates_bad_inputs() {
 
 #[test]
 fn prepared_cpu_batch_is_reusable_and_matches_individual_decode() {
-    let encoded: Arc<[u8]> = minimal_raw_codestream().into();
+    let encoded: Arc<[u8]> = common::dc_only_luma_codestream(false, [0; 3]).into();
     let decode_request = request(PixelFormat::U8(ChannelLayout::Luma));
     let prepared_image = PreparedJxr::from_arc(Arc::clone(&encoded)).unwrap();
     let expected = prepared_image.decoder().decode(&decode_request).unwrap();
@@ -123,7 +102,7 @@ fn prepared_cpu_batch_is_reusable_and_matches_individual_decode() {
 
 #[test]
 fn cpu_batch_keeps_successful_siblings_when_one_route_is_invalid() {
-    let encoded: Arc<[u8]> = minimal_raw_codestream().into();
+    let encoded: Arc<[u8]> = common::dc_only_luma_codestream(false, [0; 3]).into();
     let cpu = request(PixelFormat::U8(ChannelLayout::Luma));
     let metal = DecodeRequest::new(PixelFormat::U8(ChannelLayout::Luma))
         .with_backend(BackendRequest::Metal);
@@ -144,7 +123,7 @@ fn cpu_batch_keeps_successful_siblings_when_one_route_is_invalid() {
 
 #[test]
 fn batch_limits_fail_before_dense_output_allocation() {
-    let encoded: Arc<[u8]> = minimal_raw_codestream().into();
+    let encoded: Arc<[u8]> = common::dc_only_luma_codestream(false, [0; 3]).into();
     let input = EncodedImage::new(encoded, request(PixelFormat::U8(ChannelLayout::Luma)));
     let options = BatchDecodeOptions {
         max_inputs: 1,
@@ -172,11 +151,11 @@ fn batch_limits_fail_before_dense_output_allocation() {
     let prepared = permissive
         .prepare(vec![
             EncodedImage::new(
-                Arc::from(minimal_raw_codestream()),
+                Arc::from(common::dc_only_luma_codestream(false, [0; 3])),
                 request(PixelFormat::U8(ChannelLayout::Luma)),
             ),
             EncodedImage::new(
-                Arc::from(minimal_raw_codestream()),
+                Arc::from(common::dc_only_luma_codestream(false, [0; 3])),
                 request(PixelFormat::U8(ChannelLayout::Luma)),
             ),
         ])
@@ -192,7 +171,7 @@ fn batch_limits_fail_before_dense_output_allocation() {
 
 #[test]
 fn repeated_identity_requests_hit_the_preparation_cache() {
-    let encoded: Arc<[u8]> = minimal_raw_codestream().into();
+    let encoded: Arc<[u8]> = common::dc_only_luma_codestream(false, [0; 3]).into();
     let input = EncodedImage::new(
         Arc::clone(&encoded),
         request(PixelFormat::U8(ChannelLayout::Luma)),
@@ -223,7 +202,7 @@ fn repeated_identity_requests_hit_the_preparation_cache() {
 
 #[test]
 fn cpu_batch_reuses_native_workspace_across_calls() {
-    let encoded: Arc<[u8]> = minimal_raw_codestream().into();
+    let encoded: Arc<[u8]> = common::dc_only_luma_codestream(false, [0; 3]).into();
     let input = EncodedImage::new(encoded, request(PixelFormat::U8(ChannelLayout::Luma)));
     let decoder = CpuBatchDecoder::new(BatchDecodeOptions {
         workers: NonZeroUsize::new(1),
@@ -246,8 +225,53 @@ fn cpu_batch_reuses_native_workspace_across_calls() {
 }
 
 #[test]
+fn cpu_batch_counts_only_coefficient_storage_large_enough_for_the_next_decode() {
+    let encoded = |width, height| {
+        let samples = vec![0_u8; (width * height) as usize];
+        let image = SourceImage::new(
+            width,
+            height,
+            PixelFormat::U8(ChannelLayout::Luma),
+            SourceSamples::U8(&samples),
+        )
+        .unwrap();
+        Arc::<[u8]>::from(encode(&image, &EncodeRequest::lossless()).unwrap())
+    };
+    let decoder = CpuBatchDecoder::new(BatchDecodeOptions {
+        workers: NonZeroUsize::new(1),
+        ..BatchDecodeOptions::default()
+    })
+    .unwrap();
+    let prepared = |source| {
+        decoder
+            .prepare(vec![EncodedImage::new(
+                source,
+                request(PixelFormat::U8(ChannelLayout::Luma)),
+            )])
+            .unwrap()
+    };
+    let small = prepared(encoded(16, 16));
+    let large = prepared(encoded(256, 256));
+
+    decoder.decode_prepared(&small).unwrap();
+    let first = decoder.diagnostics().coefficient_workspace_reuses;
+    decoder.decode_prepared(&small).unwrap();
+    let reused_small = decoder.diagnostics().coefficient_workspace_reuses;
+    assert_eq!(reused_small, first + 1);
+
+    decoder.decode_prepared(&large).unwrap();
+    let grew_for_large = decoder.diagnostics().coefficient_workspace_reuses;
+    assert_eq!(grew_for_large, reused_small);
+    decoder.decode_prepared(&large).unwrap();
+    assert_eq!(
+        decoder.diagnostics().coefficient_workspace_reuses,
+        grew_for_large + 1
+    );
+}
+
+#[test]
 fn caller_owned_cpu_destination_receives_dense_images() {
-    let encoded: Arc<[u8]> = minimal_raw_codestream().into();
+    let encoded: Arc<[u8]> = common::dc_only_luma_codestream(false, [0; 3]).into();
     let inputs = (0..2)
         .map(|_| {
             EncodedImage::new(
@@ -329,7 +353,7 @@ fn separate_alpha_batch_writes_directly_into_the_dense_destination() {
 
 #[test]
 fn nchw_policy_is_retained_in_the_dense_contract() {
-    let encoded: Arc<[u8]> = minimal_raw_codestream().into();
+    let encoded: Arc<[u8]> = common::dc_only_luma_codestream(false, [0; 3]).into();
     let options = BatchDecodeOptions {
         layout: BatchLayout::Nchw,
         ..BatchDecodeOptions::default()
@@ -418,7 +442,7 @@ fn assert_unavailable_metal_contract(
 fn metal_batch_consumes_shared_preparation_and_keeps_resident_outputs() {
     use jxr::MetalBatchDecoder;
 
-    let encoded: Arc<[u8]> = minimal_raw_codestream().into();
+    let encoded: Arc<[u8]> = common::dc_only_luma_codestream(false, [0; 3]).into();
     let strict_metal = DecodeRequest::new(PixelFormat::U8(ChannelLayout::Luma))
         .with_backend(BackendRequest::Metal);
     let inputs = (0..2)
@@ -448,7 +472,7 @@ fn metal_batch_consumes_shared_preparation_and_keeps_resident_outputs() {
 fn metal_batch_pipelines_chunks_in_source_order() {
     use jxr::MetalBatchDecoder;
 
-    let encoded: Arc<[u8]> = minimal_raw_codestream().into();
+    let encoded: Arc<[u8]> = common::dc_only_luma_codestream(false, [0; 3]).into();
     let strict_metal = DecodeRequest::new(PixelFormat::U8(ChannelLayout::Luma))
         .with_backend(BackendRequest::Metal);
     // Spans more than two pipeline chunks with one unparsable input mid-batch.
@@ -486,7 +510,7 @@ fn metal_batch_pipelines_chunks_in_source_order() {
 fn metal_batch_exposes_nonblocking_and_single_allocation_groups() {
     use jxr::MetalBatchDecoder;
 
-    let encoded: Arc<[u8]> = minimal_raw_codestream().into();
+    let encoded: Arc<[u8]> = common::dc_only_luma_codestream(false, [0; 3]).into();
     let strict_metal = DecodeRequest::new(PixelFormat::U8(ChannelLayout::Luma))
         .with_backend(BackendRequest::Metal);
     let inputs = (0..2)
@@ -530,7 +554,7 @@ fn metal_batch_exposes_nonblocking_and_single_allocation_groups() {
 fn high_level_metal_batch_writes_an_ordered_caller_owned_destination() {
     use jxr::{MetalBatchDecoder, metal::DenseMetalBatchLayout};
 
-    let encoded: Arc<[u8]> = minimal_raw_codestream().into();
+    let encoded: Arc<[u8]> = common::dc_only_luma_codestream(false, [0; 3]).into();
     let strict_metal = DecodeRequest::new(PixelFormat::U8(ChannelLayout::Luma))
         .with_backend(BackendRequest::Metal);
     let inputs = (0..2)
@@ -565,7 +589,7 @@ fn high_level_metal_batch_writes_an_ordered_caller_owned_destination() {
 fn metal_batch_isolates_an_explicit_cpu_request() {
     use jxr::MetalBatchDecoder;
 
-    let encoded: Arc<[u8]> = minimal_raw_codestream().into();
+    let encoded: Arc<[u8]> = common::dc_only_luma_codestream(false, [0; 3]).into();
     let metal = DecodeRequest::new(PixelFormat::U8(ChannelLayout::Luma))
         .with_backend(BackendRequest::Metal);
     let cpu = request(PixelFormat::U8(ChannelLayout::Luma));

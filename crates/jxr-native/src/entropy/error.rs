@@ -1,8 +1,8 @@
-//! Errors produced while decoding a tile packet.
+//! Errors produced while decoding or encoding a tile packet.
 
 use core::fmt;
 
-/// Error returned by an entropy decoding primitive.
+/// Error returned by an entropy coding primitive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EntropyError {
@@ -68,7 +68,7 @@ impl fmt::Display for EntropyError {
             Self::InvalidParameter { parameter, value } => {
                 write!(formatter, "invalid {parameter} value {value}")
             }
-            Self::CoefficientOverflow => formatter.write_str("decoded coefficient overflow"),
+            Self::CoefficientOverflow => formatter.write_str("coefficient overflow"),
         }
     }
 }

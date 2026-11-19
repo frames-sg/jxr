@@ -5,7 +5,11 @@ use jxr_core::{
     JxrError, JxrErrorKind, PixelFormat, PlanePlan, PreparedPlan, Rect, TilePlan,
 };
 
-use crate::{CodestreamDirectory, NativeError, ParsedCodestream, image_info};
+use crate::{
+    CodestreamDirectory, NativeError, ParsedCodestream, image_info,
+    metadata::{interpolates_chroma, output_subsampling},
+    tile_decode::{self, component_geometry},
+};
 
 /// Validate a request and construct immutable tile/reconstruction geometry.
 pub fn prepare_plan(
@@ -41,7 +45,7 @@ pub fn prepare_plan(
                 .map(|_| plane_plan(&info, alpha_coefficient_plane(&info)))
         })
         .flatten();
-    let tiles = tile_plans(parsed, &info, output_region)?;
+    let tiles = tile_plans(parsed, &info, output_region, request.scale)?;
     let selected_macroblocks = tiles
         .iter()
         .filter(|tile| tile.required_for_reconstruction)
@@ -89,17 +93,17 @@ fn host_output_bytes(
     region: Rect,
 ) -> Result<usize, JxrError> {
     let rows = usize::try_from(region.h).map_err(|_| JxrError::arithmetic("output row count"))?;
-    if !matches!(output_color_format, 1 | 2) {
+    let Some(sampling) = output_subsampling(output_color_format) else {
         return format
             .row_bytes(region.w)?
             .checked_mul(rows)
             .ok_or_else(|| JxrError::arithmetic("host output allocation"));
-    }
+    };
     let luma = format
         .row_bytes_for_channels(region.w, 1)?
         .checked_mul(rows)
         .ok_or_else(|| JxrError::arithmetic("planar luma allocation"))?;
-    let chroma_height = if output_color_format == 1 {
+    let chroma_height = if sampling == ChromaSampling::Cs420 {
         region.h / 2
     } else {
         region.h
@@ -179,7 +183,7 @@ fn validate_native_scale(
         ));
     }
     if request.scale == DecodeScale::Sixteenth
-        && matches!(parsed.headers.image.output_color_format, 1 | 2)
+        && output_subsampling(parsed.headers.image.output_color_format).is_some()
     {
         return Err(JxrError::new(
             JxrErrorKind::Unsupported,
@@ -262,9 +266,10 @@ fn tile_plans(
     parsed: &ParsedCodestream,
     info: &jxr_core::ImageInfo,
     output_region: Rect,
+    scale: DecodeScale,
 ) -> Result<Vec<TilePlan>, JxrError> {
     let ranges = tile_packet_ranges(parsed, &parsed.directory)?;
-    let bounds = coded_reconstruction_bounds(parsed, info, output_region)?;
+    let bounds = coded_reconstruction_bounds(parsed, info, output_region, scale)?;
     let mut plans = Vec::with_capacity(ranges.len());
     let mut macroblock_start = 0_u32;
     let mut y_mb = 0_u32;
@@ -301,6 +306,7 @@ fn coded_reconstruction_bounds(
     parsed: &ParsedCodestream,
     info: &jxr_core::ImageInfo,
     output_region: Rect,
+    scale: DecodeScale,
 ) -> Result<[u32; 4], JxrError> {
     reconstruction_bounds(
         [
@@ -312,18 +318,23 @@ fn coded_reconstruction_bounds(
             info.tiles.row_heights.iter().sum::<u32>(),
         ],
         info.primary.overlap,
-        parsed.headers.primary.internal_color_format,
-        parsed.headers.image.output_color_format,
+        interpolates_chroma(
+            parsed.headers.primary.internal_color_format,
+            parsed.headers.image.output_color_format,
+            scale,
+        ),
         output_region,
     )
 }
 
+/// The macroblocks a decode of `output_region` reconstructs: those it
+/// covers, and a macroblock more on each side where the overlap filter or
+/// the interpolation of chroma, `chroma_upsampling`, reaches into them.
 fn reconstruction_bounds(
     margins: [u32; 2],
     macroblocks: [u32; 2],
     overlap: jxr_core::OverlapMode,
-    internal_color_format: u8,
-    output_color_format: u8,
+    chroma_upsampling: bool,
     output_region: Rect,
 ) -> Result<[u32; 4], JxrError> {
     let start_x = margins[0]
@@ -338,8 +349,6 @@ fn reconstruction_bounds(
     let end_y = start_y
         .checked_add(output_region.h)
         .ok_or_else(|| JxrError::arithmetic("region coded height"))?;
-    let chroma_upsampling =
-        matches!(internal_color_format, 1 | 2) && !matches!(output_color_format, 1 | 2);
     let halo = u32::from(overlap != jxr_core::OverlapMode::None || chroma_upsampling);
     Ok([
         (start_x / 16).saturating_sub(halo),
@@ -463,18 +472,14 @@ fn coefficient_bytes(
     let primary_per_mb = coefficients_per_macroblock(
         info.primary.color_format,
         scale.retained_bands(info.primary.bands),
-    )?;
-    let alpha_per_mb = if include_alpha {
-        info.alpha
-            .as_ref()
-            .map(|alpha| {
-                coefficients_per_macroblock(alpha.color_format, scale.retained_bands(alpha.bands))
-            })
-            .transpose()?
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    );
+    let alpha_per_mb = info
+        .alpha
+        .as_ref()
+        .filter(|_| include_alpha)
+        .map_or(0, |alpha| {
+            coefficients_per_macroblock(alpha.color_format, scale.retained_bands(alpha.bands))
+        });
     usize::try_from(macroblocks)
         .ok()
         .and_then(|count| count.checked_mul(primary_per_mb + alpha_per_mb))
@@ -482,38 +487,18 @@ fn coefficient_bytes(
         .ok_or_else(|| JxrError::arithmetic("coefficient allocation size"))
 }
 
-fn coefficients_per_macroblock(color: ColorFormat, bands: BandPresence) -> Result<usize, JxrError> {
-    let full = band_coefficient_count(bands, 1, 16, 256);
-    let count = match color {
-        ColorFormat::Luma => full,
-        ColorFormat::Yuv(ChromaSampling::Cs420) => {
-            full + 2 * band_coefficient_count(bands, 1, 4, 64)
-        }
-        ColorFormat::Yuv(ChromaSampling::Cs422) => {
-            full + 2 * band_coefficient_count(bands, 1, 8, 128)
-        }
-        ColorFormat::Yuv(ChromaSampling::Cs444) | ColorFormat::Rgb => 3 * full,
-        ColorFormat::Cmyk | ColorFormat::CmykDirect | ColorFormat::YuvK | ColorFormat::Rgbe => {
-            4 * full
-        }
-        ColorFormat::NComponent(components) => usize::from(components)
-            .checked_mul(full)
-            .ok_or_else(|| JxrError::arithmetic("N-component coefficient count"))?,
-    };
-    Ok(count)
-}
-
-const fn band_coefficient_count(
-    bands: BandPresence,
-    dc: usize,
-    low_pass: usize,
-    all: usize,
-) -> usize {
-    match bands {
-        BandPresence::DcOnly => dc,
-        BandPresence::NoHighPass => low_pass,
-        BandPresence::NoFlexbits | BandPresence::All => all,
-    }
+/// Coefficients a macroblock of a plane coded in `color` stores with the
+/// bands `bands`, over all its components.
+fn coefficients_per_macroblock(color: ColorFormat, bands: BandPresence) -> usize {
+    let components = color.component_count().map_or(0, usize::from);
+    (0..components)
+        .map(|component| {
+            tile_decode::coefficients_per_macroblock(
+                bands,
+                component_geometry(color, component).block_count(),
+            )
+        })
+        .sum()
 }
 
 fn native_plan_error(error: &NativeError) -> JxrError {

@@ -93,12 +93,116 @@ pub fn write_annex_a(
     options: &AnnexAWriteOptions<'_>,
 ) -> Result<Vec<u8>, NativeError> {
     validate_options(primary, options)?;
-    let layout = ContainerLayout::new(primary, options)?;
+    let payloads = Payloads {
+        primary: primary.len(),
+        icc_profile: options.icc_profile.map(<[u8]>::len),
+        alpha: options.separate_alpha.map(<[u8]>::len),
+    };
+    let layout = ContainerLayout::new(payloads)?;
     let mut output = vec![0_u8; layout.output_len];
-    write_directory(&mut output, primary, options, &layout)?;
     write_payloads(&mut output, primary, options, &layout);
-    parse_codestream(&output)?;
+    complete(&mut output, payloads, options, &layout)?;
     Ok(output)
+}
+
+/// Where the primary codestream of an Annex-A file without an ICC profile
+/// starts, with or without a separate alpha codestream: the size of the
+/// directory and pixel format in front of it, which no payload's length
+/// changes.
+pub(crate) fn annex_a_primary_offset(separate_alpha: bool) -> Result<usize, NativeError> {
+    let payloads = Payloads {
+        primary: 0,
+        icc_profile: None,
+        alpha: separate_alpha.then_some(0),
+    };
+    Ok(ContainerLayout::new(payloads)?.primary_offset)
+}
+
+/// Where the separate alpha codestream of an Annex-A file without an ICC
+/// profile starts, after a primary codestream of `primary` bytes at
+/// [`annex_a_primary_offset`]: the next four-byte boundary.
+pub(crate) fn annex_a_alpha_offset(primary: usize) -> Result<usize, NativeError> {
+    let payloads = Payloads {
+        primary,
+        icc_profile: None,
+        alpha: Some(0),
+    };
+    ContainerLayout::new(payloads)?
+        .alpha_offset
+        .ok_or_else(|| overflow("locating Annex-A alpha codestream"))
+}
+
+/// Complete an Annex-A file whose codestreams `file` already holds where
+/// [`write_annex_a`] places them: the primary codestream of `primary` bytes
+/// at [`annex_a_primary_offset`], and the separate alpha codestream of
+/// `alpha` bytes, if any, at [`annex_a_alpha_offset`]. The
+/// bytes before and between them are overwritten.
+///
+/// This is [`write_annex_a`] for codestreams written into the file in the
+/// first place, so that no codestream is copied into a file beside it. It
+/// checks the codestreams and the finished file as that does. `options`
+/// gives the image and its metadata; its ICC profile and separate alpha
+/// are not used.
+pub(crate) fn complete_annex_a(
+    file: &mut [u8],
+    primary: usize,
+    alpha: Option<usize>,
+    options: &AnnexAWriteOptions<'_>,
+) -> Result<(), NativeError> {
+    let payloads = Payloads {
+        primary,
+        icc_profile: None,
+        alpha,
+    };
+    let layout = ContainerLayout::new(payloads)?;
+    if file.len() != layout.output_len {
+        return Err(NativeError::InvalidSyntax {
+            field: "Annex-A payload placement",
+        });
+    }
+    let options = AnnexAWriteOptions {
+        icc_profile: None,
+        separate_alpha: None,
+        ..*options
+    };
+    let primary = &file[layout.primary_offset..layout.primary_offset + primary];
+    validate_options(primary, &options)?;
+    if let (Some(offset), Some(length)) = (layout.alpha_offset, alpha) {
+        validate_raw_codestream(
+            &file[offset..offset + length],
+            options.width,
+            options.height,
+            true,
+        )?;
+    }
+    file[..layout.primary_offset].fill(0);
+    if let Some(offset) = layout.alpha_offset {
+        file[layout.primary_offset + payloads.primary..offset].fill(0);
+    }
+    complete(file, payloads, &options, &layout)
+}
+
+/// Write the header, directory and pixel format of a file whose payloads
+/// are in place, and parse the finished file.
+fn complete(
+    output: &mut [u8],
+    payloads: Payloads,
+    options: &AnnexAWriteOptions<'_>,
+    layout: &ContainerLayout,
+) -> Result<(), NativeError> {
+    write_directory(output, payloads, options, layout)?;
+    output[layout.pixel_format_offset..layout.pixel_format_offset + 16]
+        .copy_from_slice(&options.pixel_format_guid);
+    parse_codestream(output)?;
+    Ok(())
+}
+
+/// The lengths of the payloads of one file.
+#[derive(Clone, Copy, Debug)]
+struct Payloads {
+    primary: usize,
+    icc_profile: Option<usize>,
+    alpha: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -112,10 +216,10 @@ struct ContainerLayout {
 }
 
 impl ContainerLayout {
-    fn new(primary: &[u8], options: &AnnexAWriteOptions<'_>) -> Result<Self, NativeError> {
+    fn new(payloads: Payloads) -> Result<Self, NativeError> {
         let entry_count = 8_usize
-            + usize::from(options.icc_profile.is_some())
-            + 2 * usize::from(options.separate_alpha.is_some());
+            + usize::from(payloads.icc_profile.is_some())
+            + 2 * usize::from(payloads.alpha.is_some());
         let directory_size = 2_usize
             .checked_add(
                 entry_count
@@ -129,31 +233,31 @@ impl ContainerLayout {
                 .checked_add(directory_size)
                 .ok_or_else(|| overflow("locating Annex-A payloads"))?,
         )?;
-        let mut cursor = checked_advance(pixel_format_offset, options.pixel_format_guid.len())?;
-        let icc_offset = if let Some(profile) = options.icc_profile {
+        let mut cursor = checked_advance(pixel_format_offset, 16)?;
+        let icc_offset = if let Some(profile) = payloads.icc_profile {
             cursor = align_four(cursor)?;
             let offset = cursor;
-            cursor = checked_advance(cursor, profile.len())?;
+            cursor = checked_advance(cursor, profile)?;
             Some(offset)
         } else {
             None
         };
         let primary_offset = align_four(cursor)?;
-        cursor = checked_advance(primary_offset, primary.len())?;
-        let alpha_offset = if let Some(alpha) = options.separate_alpha {
+        cursor = checked_advance(primary_offset, payloads.primary)?;
+        let alpha_offset = if let Some(alpha) = payloads.alpha {
             cursor = align_four(cursor)?;
             let offset = cursor;
-            cursor = checked_advance(cursor, alpha.len())?;
+            cursor = checked_advance(cursor, alpha)?;
             Some(offset)
         } else {
             None
         };
-        checked_u32(primary.len(), "representing primary codestream length")?;
-        if let Some(profile) = options.icc_profile {
-            checked_u32(profile.len(), "representing ICC profile length")?;
+        checked_u32(payloads.primary, "representing primary codestream length")?;
+        if let Some(profile) = payloads.icc_profile {
+            checked_u32(profile, "representing ICC profile length")?;
         }
-        if let Some(alpha) = options.separate_alpha {
-            checked_u32(alpha.len(), "representing alpha codestream length")?;
+        if let Some(alpha) = payloads.alpha {
+            checked_u32(alpha, "representing alpha codestream length")?;
         }
         checked_u32(cursor, "representing Annex-A file length")?;
         Ok(Self {
@@ -169,7 +273,7 @@ impl ContainerLayout {
 
 fn write_directory(
     output: &mut [u8],
-    primary: &[u8],
+    payloads: Payloads,
     options: &AnnexAWriteOptions<'_>,
     layout: &ContainerLayout,
 ) -> Result<(), NativeError> {
@@ -182,11 +286,11 @@ fn write_directory(
     );
 
     let mut entries = DirectoryEntries::new(output);
-    if let (Some(profile), Some(offset)) = (options.icc_profile, layout.icc_offset) {
+    if let (Some(profile), Some(offset)) = (payloads.icc_profile, layout.icc_offset) {
         entries.push(
             TAG_ICC_PROFILE,
             TYPE_UNDEFINED,
-            checked_u32(profile.len(), "representing ICC profile length")?,
+            checked_u32(profile, "representing ICC profile length")?,
             checked_u32(offset, "representing ICC profile offset")?,
         );
     }
@@ -232,9 +336,9 @@ fn write_directory(
         TAG_IMAGE_BYTE_COUNT,
         TYPE_LONG,
         1,
-        checked_u32(primary.len(), "representing primary codestream length")?,
+        checked_u32(payloads.primary, "representing primary codestream length")?,
     );
-    if let (Some(alpha), Some(offset)) = (options.separate_alpha, layout.alpha_offset) {
+    if let (Some(alpha), Some(offset)) = (payloads.alpha, layout.alpha_offset) {
         entries.push(
             TAG_ALPHA_OFFSET,
             TYPE_LONG,
@@ -245,7 +349,7 @@ fn write_directory(
             TAG_ALPHA_BYTE_COUNT,
             TYPE_LONG,
             1,
-            checked_u32(alpha.len(), "representing alpha codestream length")?,
+            checked_u32(alpha, "representing alpha codestream length")?,
         );
     }
     Ok(())
@@ -276,8 +380,6 @@ fn write_payloads(
     options: &AnnexAWriteOptions<'_>,
     layout: &ContainerLayout,
 ) {
-    output[layout.pixel_format_offset..layout.pixel_format_offset + 16]
-        .copy_from_slice(&options.pixel_format_guid);
     if let (Some(profile), Some(offset)) = (options.icc_profile, layout.icc_offset) {
         output[offset..offset + profile.len()].copy_from_slice(profile);
     }

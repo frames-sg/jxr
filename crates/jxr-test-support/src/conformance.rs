@@ -94,6 +94,21 @@ impl T834Summary {
     }
 }
 
+/// The workspace this crate is built in, under whose `target` directory the
+/// T.835 oracle and the T.834 suite are downloaded.
+pub fn workspace_root() -> Result<&'static Path, &'static str> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("test-support crate is outside its workspace")
+}
+
+/// The downloaded T.834 conformance suite of the workspace `workspace`.
+#[must_use]
+pub fn t834_suite(workspace: &Path) -> PathBuf {
+    workspace.join("target/t834-conformance/suite-2014")
+}
+
 /// Discover every `.jxr` and `.jpx` file below an extracted T.834 suite root.
 pub fn discover_t834_cases(root: &Path) -> Result<Vec<T834Case>, OracleError> {
     let mut pending = vec![root.to_owned()];

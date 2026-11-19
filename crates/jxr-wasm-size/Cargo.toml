@@ -1,0 +1,16 @@
+[package]
+name = "jxr-wasm-size"
+description = "Dev-only probe: the decode-only WebAssembly module a Flash player links, measured for size"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+jxr = { path = "../jxr", version = "=0.5.1" }
+
+[lints]
+workspace = true

@@ -5,7 +5,8 @@ use jxr_core::{
 
 use super::{
     coefficients_per_macroblock, host_output_bytes, indexed_tile_packet_ranges,
-    native_output_region, reconstruction_bounds, reconstruction_region, should_prepare_alpha,
+    interpolates_chroma, native_output_region, reconstruction_bounds, reconstruction_region,
+    should_prepare_alpha,
 };
 
 #[test]
@@ -16,17 +17,35 @@ fn coded_region_bounds_include_overlap_and_chroma_halos() {
         w: 8,
         h: 16,
     };
+    let bounds = |overlap, internal, output, scale| {
+        let interpolated = interpolates_chroma(internal, output, scale);
+        reconstruction_bounds([8, 0], [8, 8], overlap, interpolated, region).unwrap()
+    };
     assert_eq!(
-        reconstruction_bounds([8, 0], [8, 8], OverlapMode::One, 0, 0, region).unwrap(),
+        bounds(OverlapMode::One, 0, 0, DecodeScale::Full),
+        [2, 0, 5, 3]
+    );
+    // YUV 4:2:0 output as RGB interpolates chroma from the macroblocks
+    // around, but not at a sixteenth of the size, nor stored as its planes.
+    assert_eq!(
+        bounds(OverlapMode::None, 1, 7, DecodeScale::Full),
         [2, 0, 5, 3]
     );
     assert_eq!(
-        reconstruction_bounds([8, 0], [8, 8], OverlapMode::None, 1, 7, region).unwrap(),
+        bounds(OverlapMode::None, 1, 7, DecodeScale::Quarter),
         [2, 0, 5, 3]
     );
     assert_eq!(
-        reconstruction_bounds([8, 0], [8, 8], OverlapMode::None, 1, 1, region).unwrap(),
+        bounds(OverlapMode::None, 1, 7, DecodeScale::Sixteenth),
         [3, 1, 4, 2]
+    );
+    assert_eq!(
+        bounds(OverlapMode::None, 1, 1, DecodeScale::Full),
+        [3, 1, 4, 2]
+    );
+    assert_eq!(
+        bounds(OverlapMode::One, 1, 7, DecodeScale::Sixteenth),
+        [2, 0, 5, 3]
     );
 }
 
@@ -59,21 +78,23 @@ fn planar_output_allocation_matches_normative_plane_extents() {
 #[test]
 fn coefficient_accounting_matches_normative_macroblock_shapes() {
     assert_eq!(
-        coefficients_per_macroblock(ColorFormat::Yuv(ChromaSampling::Cs420), BandPresence::All,)
-            .unwrap(),
+        coefficients_per_macroblock(ColorFormat::Yuv(ChromaSampling::Cs420), BandPresence::All),
         384
     );
     assert_eq!(
         coefficients_per_macroblock(
             ColorFormat::Yuv(ChromaSampling::Cs422),
             BandPresence::NoHighPass,
-        )
-        .unwrap(),
+        ),
         32
     );
     assert_eq!(
-        coefficients_per_macroblock(ColorFormat::Luma, BandPresence::DcOnly).unwrap(),
+        coefficients_per_macroblock(ColorFormat::Luma, BandPresence::DcOnly),
         1
+    );
+    assert_eq!(
+        coefficients_per_macroblock(ColorFormat::NComponent(5), BandPresence::NoFlexbits),
+        5 * 256
     );
 }
 

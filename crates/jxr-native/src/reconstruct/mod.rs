@@ -13,20 +13,29 @@ mod packing;
 mod pipeline;
 #[cfg(test)]
 mod pipeline_tests;
+mod sample_scale;
 mod simd_dequant;
+mod strip;
 mod subsampled_overlap;
 mod transform;
 
+#[cfg(test)]
+pub(crate) use chroma::subsample_chroma;
+pub(crate) use chroma::{ChromaDecimation, ChromaStrip};
 pub use chroma::{ChromaReconstructionConfig, reconstruct_chroma_444};
 pub use contract::{
     CropWindow, PlanarSamples, QuantizedMacroblock, ReconstructionConfig, ReconstructionError,
     TilePartition,
 };
+pub(crate) use lanes::{
+    ForwardTransform, Lane, PARALLEL_MACROBLOCKS, PARALLEL_SAMPLES, Prefilter, transform_rows,
+};
 pub use packing::{pack_luma_u8, pack_luma_u16};
 pub use pipeline::reconstruct_luma;
 #[cfg(test)]
 pub(crate) use pipeline::reconstruct_luma_scaled;
-pub(crate) use pipeline::{
-    MacroblockSource, ReconstructionPipelineWorkspace, reconstruct_luma_from_source,
-    reconstruct_luma_scaled_with_cpu,
+pub(crate) use pipeline::{ReconstructionPipelineWorkspace, reconstruct_luma_scaled_with_cpu};
+pub(crate) use simd_dequant::quantize_coefficients;
+pub(crate) use strip::{
+    ComponentStrip, MacroblockSource, NOT_BEGUN, ReconstructionSimd, RowWindow, StripPlan,
 };

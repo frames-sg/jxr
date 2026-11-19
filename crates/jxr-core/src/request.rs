@@ -56,7 +56,23 @@ pub struct DecodeLimits {
     pub max_components: u16,
     pub max_tiles: u32,
     pub max_compressed_bytes: u64,
+    /// Most bytes of quantized coefficients a decode may hold.
+    ///
+    /// Planning checks it against the coefficients of every tile a request
+    /// selects, on every route, so that a request does not pass on one
+    /// route and fail on another. That is what an accelerator route, a
+    /// prepared reconstruction and a reduced-resolution CPU decode hold. A
+    /// full-resolution CPU decode holds the coefficients of a few
+    /// macroblock rows at a time, and is checked against the same figure
+    /// although it needs far less; the working storage of the strips it
+    /// runs through a thread pool is bounded by this limit as well as by
+    /// the decoder's own.
     pub max_coefficient_bytes: u64,
+    /// Most bytes of decoded output a decode may allocate or fill.
+    ///
+    /// Checked against the output alone. What a decode holds beside its
+    /// output and its coefficients is not counted: on the CPU it is a few
+    /// rows of samples of each component for each strip.
     pub max_host_allocation_bytes: u64,
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "jxr-core"
-description = "Shared JPEG XR decoder contracts"
+description = "Shared JPEG XR decoder and encoder contracts"
 version = "0.5.0"
 edition.workspace = true
 rust-version.workspace = true

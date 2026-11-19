@@ -2,7 +2,86 @@
 
 use alloc::vec::Vec;
 
-use crate::{DecodeReport, ImageInfo, JxrError, JxrErrorKind, PixelFormat, Rect, StorageKind};
+use crate::{DecodeReport, ImageInfo, JxrError, JxrErrorKind, PixelFormat, Rect};
+
+/// Implements `storage_kind`, `matches_format`, `len`, `is_empty` and
+/// `byte_len` for typed sample storage, an enum whose variants are those of
+/// [`DecodedSamples`],
+/// each holding a slice or vector of its storage elements, so that the
+/// borrowed, owned, source and batch forms of the storage share one
+/// definition of its kind and size.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! impl_sample_storage {
+    ($samples:ty) => {
+        impl $samples {
+            /// Native storage kind of these samples.
+            #[must_use]
+            pub const fn storage_kind(&self) -> $crate::StorageKind {
+                match self {
+                    Self::BitPacked(_) => $crate::StorageKind::BitPacked,
+                    Self::U8(_) => $crate::StorageKind::U8,
+                    Self::U16(_) => $crate::StorageKind::U16,
+                    Self::I16(_) => $crate::StorageKind::I16,
+                    Self::I32(_) => $crate::StorageKind::I32,
+                    Self::F16(_) => $crate::StorageKind::F16Bits,
+                    Self::F32(_) => $crate::StorageKind::F32,
+                    Self::Rgb555(_) | Self::Rgb565(_) => $crate::StorageKind::PackedU16,
+                    Self::Rgb101010(_) | Self::Rgbe(_) => $crate::StorageKind::PackedU32,
+                }
+            }
+
+            /// Whether this storage variant exactly represents `format`.
+            #[must_use]
+            pub const fn matches_format(&self, format: $crate::PixelFormat) -> bool {
+                matches!(
+                    (self, format),
+                    (Self::BitPacked(_), $crate::PixelFormat::BitPacked(_))
+                        | (Self::U8(_), $crate::PixelFormat::U8(_))
+                        | (Self::U16(_), $crate::PixelFormat::U16(_))
+                        | (Self::I16(_), $crate::PixelFormat::I16(_))
+                        | (Self::I32(_), $crate::PixelFormat::I32(_))
+                        | (Self::F16(_), $crate::PixelFormat::F16(_))
+                        | (Self::F32(_), $crate::PixelFormat::F32(_))
+                        | (Self::Rgb555(_), $crate::PixelFormat::Rgb555)
+                        | (Self::Rgb565(_), $crate::PixelFormat::Rgb565)
+                        | (Self::Rgb101010(_), $crate::PixelFormat::Rgb101010)
+                        | (Self::Rgbe(_), $crate::PixelFormat::Rgbe)
+                )
+            }
+
+            /// Number of native storage elements: bytes of one-bit
+            /// samples, samples, or packed pixels.
+            #[must_use]
+            pub const fn len(&self) -> usize {
+                match self {
+                    Self::BitPacked(values) | Self::U8(values) => values.len(),
+                    Self::U16(values)
+                    | Self::F16(values)
+                    | Self::Rgb555(values)
+                    | Self::Rgb565(values) => values.len(),
+                    Self::I16(values) => values.len(),
+                    Self::I32(values) => values.len(),
+                    Self::F32(values) => values.len(),
+                    Self::Rgb101010(values) | Self::Rgbe(values) => values.len(),
+                }
+            }
+
+            /// Whether there are no storage elements.
+            #[must_use]
+            pub const fn is_empty(&self) -> bool {
+                self.len() == 0
+            }
+
+            /// Bytes the storage elements take.
+            #[must_use]
+            pub const fn byte_len(&self) -> usize {
+                self.len()
+                    .saturating_mul(self.storage_kind().element_bytes())
+            }
+        }
+    };
+}
 
 /// Mutable caller-owned storage for every supported output representation.
 pub enum DecodedSamplesMut<'a> {
@@ -61,74 +140,6 @@ impl DecodedSamplesMut<'_> {
             Self::Rgbe(values) => DecodedSamplesMut::Rgbe(values),
         }
     }
-
-    /// Native storage kind of this destination.
-    #[must_use]
-    pub const fn storage_kind(&self) -> StorageKind {
-        match self {
-            Self::BitPacked(_) => StorageKind::BitPacked,
-            Self::U8(_) => StorageKind::U8,
-            Self::U16(_) => StorageKind::U16,
-            Self::I16(_) => StorageKind::I16,
-            Self::I32(_) => StorageKind::I32,
-            Self::F16(_) => StorageKind::F16Bits,
-            Self::F32(_) => StorageKind::F32,
-            Self::Rgb555(_) | Self::Rgb565(_) => StorageKind::PackedU16,
-            Self::Rgb101010(_) | Self::Rgbe(_) => StorageKind::PackedU32,
-        }
-    }
-
-    /// Number of native storage elements available.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        match self {
-            Self::BitPacked(values) | Self::U8(values) => values.len(),
-            Self::U16(values) | Self::F16(values) | Self::Rgb555(values) | Self::Rgb565(values) => {
-                values.len()
-            }
-            Self::I16(values) => values.len(),
-            Self::I32(values) => values.len(),
-            Self::F32(values) => values.len(),
-            Self::Rgb101010(values) | Self::Rgbe(values) => values.len(),
-        }
-    }
-
-    /// Whether this destination contains no storage elements.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Total destination capacity in bytes.
-    #[must_use]
-    pub fn byte_len(&self) -> usize {
-        self.len().saturating_mul(match self.storage_kind() {
-            StorageKind::BitPacked | StorageKind::U8 => 1,
-            StorageKind::U16 | StorageKind::I16 | StorageKind::F16Bits | StorageKind::PackedU16 => {
-                2
-            }
-            StorageKind::I32 | StorageKind::F32 | StorageKind::PackedU32 => 4,
-        })
-    }
-
-    /// Whether the destination variant exactly represents `format`.
-    #[must_use]
-    pub const fn matches_format(&self, format: PixelFormat) -> bool {
-        matches!(
-            (self, format),
-            (Self::BitPacked(_), PixelFormat::BitPacked(_))
-                | (Self::U8(_), PixelFormat::U8(_))
-                | (Self::U16(_), PixelFormat::U16(_))
-                | (Self::I16(_), PixelFormat::I16(_))
-                | (Self::I32(_), PixelFormat::I32(_))
-                | (Self::F16(_), PixelFormat::F16(_))
-                | (Self::F32(_), PixelFormat::F32(_))
-                | (Self::Rgb555(_), PixelFormat::Rgb555)
-                | (Self::Rgb565(_), PixelFormat::Rgb565)
-                | (Self::Rgb101010(_), PixelFormat::Rgb101010)
-                | (Self::Rgbe(_), PixelFormat::Rgbe)
-        )
-    }
 }
 
 /// Typed storage for every supported output representation.
@@ -147,49 +158,19 @@ pub enum DecodedSamples {
     Rgbe(Vec<u32>),
 }
 
-impl DecodedSamples {
-    #[must_use]
-    pub fn storage_kind(&self) -> StorageKind {
-        match self {
-            Self::BitPacked(_) => StorageKind::BitPacked,
-            Self::U8(_) => StorageKind::U8,
-            Self::U16(_) => StorageKind::U16,
-            Self::I16(_) => StorageKind::I16,
-            Self::I32(_) => StorageKind::I32,
-            Self::F16(_) => StorageKind::F16Bits,
-            Self::F32(_) => StorageKind::F32,
-            Self::Rgb555(_) | Self::Rgb565(_) => StorageKind::PackedU16,
-            Self::Rgb101010(_) | Self::Rgbe(_) => StorageKind::PackedU32,
-        }
-    }
+impl_sample_storage!(DecodedSamples);
+impl_sample_storage!(DecodedSamplesMut<'_>);
 
+impl DecodedSamples {
+    /// Samples held: eight to each byte of one-bit samples.
     #[must_use]
     pub fn sample_count(&self) -> usize {
-        match self {
-            Self::BitPacked(values) => values.len().saturating_mul(8),
-            Self::U8(values) => values.len(),
-            Self::U16(values) | Self::F16(values) | Self::Rgb555(values) | Self::Rgb565(values) => {
-                values.len()
-            }
-            Self::I16(values) => values.len(),
-            Self::I32(values) => values.len(),
-            Self::F32(values) => values.len(),
-            Self::Rgb101010(values) | Self::Rgbe(values) => values.len(),
-        }
-    }
-
-    #[must_use]
-    pub fn byte_len(&self) -> usize {
-        match self {
-            Self::BitPacked(values) | Self::U8(values) => values.len(),
-            Self::U16(values) | Self::F16(values) | Self::Rgb555(values) | Self::Rgb565(values) => {
-                values.len().saturating_mul(2)
-            }
-            Self::I16(values) => values.len().saturating_mul(2),
-            Self::I32(values) => values.len().saturating_mul(4),
-            Self::F32(values) => values.len().saturating_mul(4),
-            Self::Rgb101010(values) | Self::Rgbe(values) => values.len().saturating_mul(4),
-        }
+        let per_element = if matches!(self, Self::BitPacked(_)) {
+            8
+        } else {
+            1
+        };
+        self.len().saturating_mul(per_element)
     }
 }
 

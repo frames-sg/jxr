@@ -1,26 +1,26 @@
 //! Bounds-checked tile packets decoded into macroblock-major coefficient storage.
 
-mod cbphp;
+pub(crate) mod cbphp;
 mod dispatch;
 mod error;
 mod frequency;
-mod high_pass;
-mod integrated_alpha;
-mod integrated_alpha_frequency;
-mod multicomponent;
-mod multicomponent_frequency;
+pub(crate) mod high_pass;
 mod output;
-mod quantizer;
-mod spatial;
-mod yuv;
+mod plane;
+pub(crate) mod quantizer;
+pub(crate) mod spatial;
+mod spatial_tile;
+pub(crate) mod syntax;
+pub(crate) mod yuv;
 
 use jxr_core::{
     BandPresence, ChromaSampling, CoefficientArena, CoefficientArenaDescriptor, CoefficientPlane,
     ColorFormat, MacroblockMetadata, PreparedPlan, TileEdgeFlags,
 };
 
-use crate::ParsedCodestream;
+use crate::{ParsedCodestream, executor::Executor, metadata::internal_color};
 
+pub(crate) use dispatch::BandDecoder;
 pub use error::TileDecodeError;
 
 /// Decode tile packets into the device-neutral coefficient arena.
@@ -33,10 +33,8 @@ pub fn decode_tiles(
     parsed: &ParsedCodestream,
     plan: &PreparedPlan,
 ) -> Result<CoefficientArena, TileDecodeError> {
-    validate_decode_scope(parsed)?;
-    validate_tile_count(plan)?;
-    let layouts = plane_layouts(parsed, plan);
-    let (coefficient_count, macroblock_count) = arena_capacity(plan, &layouts)?;
+    let executor = Executor::DEFAULT;
+    let (layouts, coefficient_count, macroblock_count) = planned(parsed, plan)?;
     let mut arena = CoefficientArena {
         coefficients: vec![0; coefficient_count],
         macroblocks: macroblock_metadata(macroblock_count),
@@ -47,9 +45,12 @@ pub fn decode_tiles(
         parsed,
         plan,
         &layouts,
-        &mut arena.coefficients,
-        &mut arena.macroblocks,
-        &mut arena.planes,
+        PlaneStorage {
+            coefficients: &mut arena.coefficients,
+            macroblocks: &mut arena.macroblocks,
+            planes: &mut arena.planes,
+        },
+        executor,
     )?;
     arena
         .validate()
@@ -64,22 +65,31 @@ pub fn decode_tiles_reusing(
     plan: &PreparedPlan,
     arena: &mut CoefficientArena,
 ) -> Result<bool, TileDecodeError> {
-    validate_decode_scope(parsed)?;
-    validate_tile_count(plan)?;
-    let layouts = plane_layouts(parsed, plan);
-    let (coefficient_count, macroblock_count) = arena_capacity(plan, &layouts)?;
-    let reused = arena.coefficients.capacity() >= coefficient_count
-        && arena.planes.capacity() >= layouts.len()
-        && macroblock_capacity(&arena.macroblocks) >= macroblock_count;
-    prepare_reusable_arena(arena, coefficient_count, macroblock_count, layouts.len());
+    decode_tiles_reusing_on(source, parsed, plan, arena, Executor::DEFAULT)
+}
+
+/// [`decode_tiles_reusing`], reading several tiles side by side through
+/// `executor`.
+pub(crate) fn decode_tiles_reusing_on(
+    source: &[u8],
+    parsed: &ParsedCodestream,
+    plan: &PreparedPlan,
+    arena: &mut CoefficientArena,
+    executor: Executor,
+) -> Result<bool, TileDecodeError> {
+    let (layouts, coefficient_count, macroblock_count) = planned(parsed, plan)?;
+    let reused = prepare_reusable_arena(arena, coefficient_count, macroblock_count, layouts.len());
     decode_planes(
         source,
         parsed,
         plan,
         &layouts,
-        &mut arena.coefficients,
-        &mut arena.macroblocks,
-        &mut arena.planes,
+        PlaneStorage {
+            coefficients: &mut arena.coefficients,
+            macroblocks: &mut arena.macroblocks,
+            planes: &mut arena.planes,
+        },
+        executor,
     )?;
     arena
         .validate()
@@ -94,10 +104,7 @@ pub fn decode_tiles_into(
     plan: &PreparedPlan,
     destination: &mut [i32],
 ) -> Result<CoefficientArenaDescriptor, TileDecodeError> {
-    validate_decode_scope(parsed)?;
-    validate_tile_count(plan)?;
-    let layouts = plane_layouts(parsed, plan);
-    let (coefficient_count, macroblock_count) = arena_capacity(plan, &layouts)?;
+    let (layouts, coefficient_count, macroblock_count) = planned(parsed, plan)?;
     if destination.len() != coefficient_count {
         return Err(TileDecodeError::InvalidPlan(
             "external coefficient storage length",
@@ -110,9 +117,12 @@ pub fn decode_tiles_into(
         parsed,
         plan,
         &layouts,
-        destination,
-        &mut macroblocks,
-        &mut planes,
+        PlaneStorage {
+            coefficients: destination,
+            macroblocks: &mut macroblocks,
+            planes: &mut planes,
+        },
+        Executor::DEFAULT,
     )?;
     let descriptor = CoefficientArenaDescriptor {
         coefficient_count,
@@ -133,21 +143,34 @@ pub fn coefficient_count(
     arena_capacity(plan, &plane_layouts(parsed, plan)).map(|(coefficients, _)| coefficients)
 }
 
+/// Where [`decode_planes`] puts what it decodes: the plane-major
+/// coefficients, and the macroblock metadata and planes it appends.
+struct PlaneStorage<'a> {
+    coefficients: &'a mut [i32],
+    macroblocks: &'a mut MacroblockMetadata,
+    planes: &'a mut Vec<CoefficientPlane>,
+}
+
 /// Decode every selected tile directly into its plane-major coefficient
-/// windows, then append the macroblock metadata in arena order.
+/// windows, side by side through `executor`, then append the macroblock
+/// metadata in arena order.
 fn decode_planes(
     source: &[u8],
     parsed: &ParsedCodestream,
     plan: &PreparedPlan,
     layouts: &[output::PlaneLayout],
-    coefficients: &mut [i32],
-    macroblocks: &mut MacroblockMetadata,
-    planes: &mut Vec<CoefficientPlane>,
+    storage: PlaneStorage<'_>,
+    executor: Executor,
 ) -> Result<(), TileDecodeError> {
+    let PlaneStorage {
+        coefficients,
+        macroblocks,
+        planes,
+    } = storage;
     let locations = tile_locations(parsed, plan, plan.tiles.len())?;
     let coefficient_count = coefficients.len();
     let writers = output::split_planes(coefficients, layouts, &plan.tiles)?;
-    let decoded = dispatch::decode_packets(source, parsed, plan, &locations, writers)?;
+    let decoded = dispatch::decode_packets(source, parsed, plan, &locations, writers, executor)?;
     let written = output::append_metadata(macroblocks, planes, &decoded, layouts)?;
     if written != coefficient_count {
         return Err(TileDecodeError::InvalidPlan(
@@ -202,6 +225,20 @@ fn plane_layouts(parsed: &ParsedCodestream, plan: &PreparedPlan) -> Vec<output::
             }
         })
         .collect()
+}
+
+/// The planes a decode of `plan` stores, with the coefficients and the
+/// macroblocks they take, once the codestream is checked to be one the
+/// tile readers read.
+fn planned(
+    parsed: &ParsedCodestream,
+    plan: &PreparedPlan,
+) -> Result<(Vec<output::PlaneLayout>, usize, usize), TileDecodeError> {
+    validate_decode_scope(parsed)?;
+    validate_tile_count(plan)?;
+    let layouts = plane_layouts(parsed, plan);
+    let (coefficients, macroblocks) = arena_capacity(plan, &layouts)?;
+    Ok((layouts, coefficients, macroblocks))
 }
 
 fn arena_capacity(
@@ -277,7 +314,10 @@ fn prepare_reusable_arena(
     coefficient_count: usize,
     macroblock_count: usize,
     component_count: usize,
-) {
+) -> bool {
+    let reused = arena.coefficients.capacity() >= coefficient_count
+        && arena.planes.capacity() >= component_count
+        && macroblock_capacity(&arena.macroblocks) >= macroblock_count;
     // Tile decoders overwrite every element, so retained values are never
     // read and reused storage is resized without clearing it first.
     if arena.coefficients.capacity() < coefficient_count {
@@ -317,6 +357,7 @@ fn prepare_reusable_arena(
     reserve_metadata!(coded_y);
     reserve_metadata!(output_x);
     reserve_metadata!(output_y);
+    reused
 }
 
 fn tile_locations(
@@ -358,11 +399,14 @@ fn validate_decode_scope(parsed: &ParsedCodestream) -> Result<(), TileDecodeErro
             "integrated alpha plane component layout",
         ));
     }
+    // A plane whose colour format has a macroblock syntax, with as many
+    // components as that format has.
     let plane = &parsed.headers.primary;
-    let supported = matches!(
-        (plane.internal_color_format, plane.components),
-        (0, 1) | (1..=3, 3) | (4, 4) | (6, 2..=16)
-    );
+    let supported =
+        internal_color(plane.internal_color_format, plane.components).is_ok_and(|colour| {
+            colour.component_count() == Some(plane.components)
+                && syntax::ComponentSyntax::new(colour).is_ok()
+        });
     if !supported {
         return Err(TileDecodeError::Unsupported(
             "unsupported primary component layout",
@@ -396,20 +440,10 @@ struct TileLocation {
     margin_top: u32,
 }
 
-/// Macroblocks of a frequency-mode traversal, stored once the tile completes.
-pub(in crate::tile_decode) struct DecodedTile {
-    pub(in crate::tile_decode) components: Vec<Vec<spatial::SpatialMacroblock>>,
-}
-
-impl DecodedTile {
-    fn single(macroblocks: Vec<spatial::SpatialMacroblock>) -> Self {
-        Self {
-            components: vec![macroblocks],
-        }
-    }
-}
-
-fn coefficients_per_macroblock(bands: BandPresence, block_count: usize) -> usize {
+/// Coefficients a macroblock of a component of `block_count` blocks stores
+/// with the bands `bands`: its DC, the DC or low-pass coefficient of each
+/// block, or every coefficient of every block.
+pub(crate) const fn coefficients_per_macroblock(bands: BandPresence, block_count: usize) -> usize {
     match bands {
         BandPresence::DcOnly => 1,
         BandPresence::NoHighPass => block_count,
@@ -417,19 +451,23 @@ fn coefficients_per_macroblock(bands: BandPresence, block_count: usize) -> usize
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ComponentGeometry {
-    columns: u8,
-    rows: u8,
+/// Transform blocks across and down one macroblock of a component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ComponentGeometry {
+    pub(crate) columns: u8,
+    pub(crate) rows: u8,
 }
 
 impl ComponentGeometry {
-    const fn block_count(self) -> usize {
+    pub(crate) const fn block_count(self) -> usize {
         self.columns as usize * self.rows as usize
     }
 }
 
-const fn component_geometry(color: ColorFormat, component: usize) -> ComponentGeometry {
+/// Macroblock shape of component `component` of a plane coded in `color`:
+/// four blocks square, except for the chroma components of YUV 4:2:2, two
+/// across and four down, and of YUV 4:2:0, two square.
+pub(crate) const fn component_geometry(color: ColorFormat, component: usize) -> ComponentGeometry {
     match (color, component) {
         (ColorFormat::Yuv(ChromaSampling::Cs420), 1..) => ComponentGeometry {
             columns: 2,

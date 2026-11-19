@@ -1,8 +1,11 @@
 //! LP coefficient refinement and HP flexbits parsing.
 
-use super::{EntropyError, PacketBitReader};
+use super::{
+    EntropyError, PacketBitReader,
+    coefficients::{apply_sign, signed},
+};
 
-const TRANSPOSE: [usize; 16] = [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
+pub(super) const TRANSPOSE: [usize; 16] = [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
 
 /// Decode one HP flexbits value as specified by T.832 Table 85.
 #[inline]
@@ -34,6 +37,35 @@ pub fn decode_flex_block(
     model_bits: u8,
     trim_flexbits: u8,
 ) -> Result<[i32; 16], EntropyError> {
+    let mut output = *vlc_coefficients;
+    refine_flex_block(
+        reader,
+        &mut output,
+        model_bits,
+        trim_flexbits,
+        |coefficient, refinement| *coefficient = refinement,
+    )?;
+    output[0] = 0;
+    Ok(output)
+}
+
+/// Decodes the flexbits of the fifteen HP positions of `block`, whose
+/// VLC-coded parts it holds, in transpose order, and passes each position
+/// with its refinement to `refine`, which replaces the VLC-coded part: once
+/// the position's flexbits are read, as their sign depends on that part.
+/// Every position is passed, with a refinement of zero where no flexbits
+/// are left after `trim_flexbits`.
+///
+/// On error, positions already passed are refined: the caller must discard
+/// the block, as it does along with the failed tile.
+#[inline]
+pub(crate) fn refine_flex_block(
+    reader: &mut PacketBitReader<'_>,
+    block: &mut [i32; 16],
+    model_bits: u8,
+    trim_flexbits: u8,
+    mut refine: impl FnMut(&mut i32, i32),
+) -> Result<(), EntropyError> {
     if model_bits > 15 {
         return Err(EntropyError::InvalidParameter {
             parameter: "HP model bits",
@@ -47,17 +79,34 @@ pub fn decode_flex_block(
         });
     }
     let bits_left = model_bits.saturating_sub(trim_flexbits);
-    let mut output = [0_i32; 16];
     if bits_left == 0 {
-        return Ok(output);
+        for coefficient in &mut block[1..] {
+            refine(coefficient, 0);
+        }
+        return Ok(());
     }
-    for &position in &TRANSPOSE[1..] {
-        let flex = decode_flex_fast(reader, vlc_coefficients[position], bits_left)?;
-        output[position] = flex
+    // Flexbits are read from the reader's cache while it holds a
+    // position's, and bit by bit once it does not, near the end of the
+    // packet, where it then holds too few for every later position too.
+    // The first loop calls nothing that is given the reader, so the
+    // compiler keeps the reader's fields in registers through it.
+    let mut next = 1;
+    while let Some(&position) = TRANSPOSE.get(next) {
+        let coefficient = &mut block[position];
+        let Some(flex) = cached_flex(reader, *coefficient, bits_left) else {
+            break;
+        };
+        refine(coefficient, flex << trim_flexbits);
+        next += 1;
+    }
+    for &position in &TRANSPOSE[next..] {
+        let coefficient = &mut block[position];
+        let refinement = decode_flex(reader, *coefficient, bits_left)?
             .checked_shl(u32::from(trim_flexbits))
             .ok_or(EntropyError::CoefficientOverflow)?;
+        refine(coefficient, refinement);
     }
-    Ok(output)
+    Ok(())
 }
 
 /// [`decode_flex`] for widths of at most 15 bits, served from the reader cache.
@@ -67,19 +116,30 @@ fn decode_flex_fast(
     vlc_coefficient: i32,
     flex_bits: u8,
 ) -> Result<i32, EntropyError> {
-    debug_assert!(flex_bits <= 15);
-    match reader.read_magnitude_and_sign(flex_bits, vlc_coefficient == 0) {
-        Some((magnitude, negative)) => {
-            let magnitude =
-                i32::try_from(magnitude).map_err(|_| EntropyError::CoefficientOverflow)?;
-            Ok(if negative || vlc_coefficient < 0 {
-                -magnitude
-            } else {
-                magnitude
-            })
-        }
+    match cached_flex(reader, vlc_coefficient, flex_bits) {
+        Some(flex) => Ok(flex),
         None => decode_flex(reader, vlc_coefficient, flex_bits),
     }
+}
+
+/// [`decode_flex`] for widths of at most 15 bits where the reader's cache
+/// holds the value and its sign; `None`, having read nothing, where it
+/// does not.
+#[inline]
+fn cached_flex(
+    reader: &mut PacketBitReader<'_>,
+    vlc_coefficient: i32,
+    flex_bits: u8,
+) -> Option<i32> {
+    debug_assert!(flex_bits <= 15);
+    let (magnitude, negative) = reader.read_magnitude_and_sign(flex_bits, vlc_coefficient == 0)?;
+    // At most 15 bits: the magnitude is within `i32`.
+    let magnitude = magnitude.cast_signed();
+    Some(if negative || vlc_coefficient < 0 {
+        -magnitude
+    } else {
+        magnitude
+    })
 }
 
 /// Refine the fifteen LP positions in the normative 4-by-4 transpose order.
@@ -116,23 +176,6 @@ pub fn decode_lp_refinement_at(
             .ok_or(EntropyError::CoefficientOverflow)?;
     }
     Ok(())
-}
-
-fn apply_sign(reader: &mut PacketBitReader<'_>, value: i32) -> Result<i32, EntropyError> {
-    if value == 0 {
-        return Ok(0);
-    }
-    signed(value, reader.read_bit()?)
-}
-
-fn signed(magnitude: i32, negative: bool) -> Result<i32, EntropyError> {
-    if negative {
-        magnitude
-            .checked_neg()
-            .ok_or(EntropyError::CoefficientOverflow)
-    } else {
-        Ok(magnitude)
-    }
 }
 
 #[cfg(test)]

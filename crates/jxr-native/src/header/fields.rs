@@ -1,6 +1,34 @@
 //! Narrow typed reads for T.832 header syntax fields.
 
+use jxr_core::OutputBitDepth;
+
 use crate::{NativeError, bit_reader::BitReader};
+
+/// The bit depth an `OUTPUT_BITDEPTH` code names, or `None` for a reserved
+/// code: the plane-header fields that qualify it are left at zero.
+pub(crate) const fn output_bit_depth(code: u8) -> Option<OutputBitDepth> {
+    OutputBitDepth::from_header_fields(code, 0, 0, 0)
+}
+
+/// Whether `OUTPUT_BITDEPTH` code `code` is reserved.
+pub(super) const fn reserved_bit_depth(code: u8) -> bool {
+    output_bit_depth(code).is_none()
+}
+
+/// Whether each plane header of an image of `OUTPUT_BITDEPTH` code `code`
+/// carries `SHIFT_BITS`.
+pub(super) const fn carries_shift_bits(code: u8) -> bool {
+    matches!(
+        output_bit_depth(code),
+        Some(OutputBitDepth::U16 { .. } | OutputBitDepth::I16 { .. } | OutputBitDepth::I32 { .. })
+    )
+}
+
+/// Whether each plane header of an image of `OUTPUT_BITDEPTH` code `code`
+/// carries the floating-point mantissa length and exponent bias.
+pub(super) const fn carries_float_parameters(code: u8) -> bool {
+    matches!(output_bit_depth(code), Some(OutputBitDepth::F32 { .. }))
+}
 
 pub(super) fn read_dimension(
     reader: &mut BitReader<'_>,

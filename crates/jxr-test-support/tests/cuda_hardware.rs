@@ -125,11 +125,9 @@ fn every_in_scope_t834_output_and_roi_matches_the_cpu_oracle() {
 }
 
 fn t834_root() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("test-support crate is inside the workspace")
-        .join("target/t834-conformance/suite-2014")
+    jxr_test_support::t834_suite(
+        jxr_test_support::workspace_root().expect("test-support crate is inside the workspace"),
+    )
 }
 
 fn preflight_request(view: &JxrView<'_>, mut request: DecodeRequest, path: &Path) {

@@ -1,202 +1,213 @@
-//! Checked capability-token SIMD for contiguous coefficient scaling.
+//! Capability-token SIMD for the encoder's exact quantization, which
+//! dequantization inverts.
 
-use fearless_simd::{Simd, SimdBase};
+use fearless_simd::{Bytes, Select, Simd, SimdBase, SimdCvtFloat, SimdCvtTruncate};
 use jxr_math::quantization::Quantizer;
 
-use crate::CpuCapabilities;
+use crate::cpu::{I32Vectors, with_i32_vectors};
 
-use super::ReconstructionError;
+/// Rounded magnitudes and steps below this bound are exact in `f32`, and
+/// their quotient estimated in `f32` is within one of the true quotient.
+const VECTOR_QUANTIZATION_DOMAIN: u32 = 1 << 24;
 
-const MIN_VECTOR_COEFFICIENTS: usize = 64;
-
-pub(super) fn scale_coefficients(
-    cpu: CpuCapabilities,
+/// Quantizes `coefficients` in place exactly as [`Quantizer::quantize`]
+/// does with `offset`: on `vectors` where they are given and every rounded
+/// magnitude and the step lie in the vector form's domain, and through
+/// [`Quantizer::quantize`], the oracle, otherwise. The inverse of
+/// [`Quantizer::dequantize`].
+pub(crate) fn quantize_coefficients(
+    vectors: Option<I32Vectors>,
     quantizer: Quantizer,
-    input: &[i32],
-    output: &mut [i32],
-) -> Result<bool, ReconstructionError> {
-    if input.len() != output.len() {
-        return Err(ReconstructionError::InvalidPlaneGeometry(
-            "SIMD dequantization slice lengths differ",
-        ));
-    }
-    let step = quantizer.step();
-    let (used_simd, [minimum, maximum]) = scale_with_range(cpu, input, output, step);
-    // Validation is fused into the scaling pass. Wrapped products written for
-    // an out-of-range coefficient are never observed because the call fails.
-    let [lower, upper] = representable_coefficients(step);
-    if minimum < lower || maximum > upper {
-        return Err(ReconstructionError::ArithmeticOverflow(
-            "coefficient dequantization",
-        ));
-    }
-    Ok(used_simd)
-}
-
-/// Returns the inclusive coefficient range whose product with `step` fits `i32`.
-fn representable_coefficients(step: u32) -> [i32; 2] {
-    let step = i64::from(step);
-    // Truncating division rounds the negative bound toward zero, which is the
-    // ceiling required for an inclusive lower bound.
-    [i64::from(i32::MIN) / step, i64::from(i32::MAX) / step]
-        .map(|bound| i32::try_from(bound).expect("a nonzero step narrows the i32 range"))
-}
-
-fn scale_with_range(
-    cpu: CpuCapabilities,
-    input: &[i32],
-    output: &mut [i32],
-    step: u32,
-) -> (bool, [i32; 2]) {
-    if input.len() >= MIN_VECTOR_COEFFICIENTS {
-        let level = cpu.level();
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        if let Some(avx2) = level.as_avx2() {
-            return (true, scale_vectorized(avx2, input, output, step));
-        }
-        #[cfg(target_arch = "aarch64")]
-        if let Some(neon) = level.as_neon() {
-            return (true, scale_vectorized(neon, input, output, step));
+    offset: u32,
+    coefficients: &mut [i32],
+) {
+    let on_vectors = vectors.is_some_and(|vectors| {
+        with_i32_vectors!(vectors, simd => quantize_vectorized(simd, quantizer, offset, coefficients))
+    });
+    if !on_vectors {
+        for coefficient in coefficients {
+            *coefficient = quantizer.quantize(*coefficient, offset);
         }
     }
-    (false, scale_scalar(input, output, step))
 }
 
+/// Quantizes with `f32` estimates of each quotient, corrected exactly, and
+/// returns whether it did; it does nothing when the slice is shorter than a
+/// vector or a rounded magnitude or the step reaches
+/// [`VECTOR_QUANTIZATION_DOMAIN`].
+///
+/// A rounded magnitude `n` and a step `d` below `2^24` convert to `f32`
+/// exactly, and the reciprocal and the product are each rounded once, by
+/// a relative error of at most `2^-24`: the estimate differs from `n / d` by
+/// less than `(n / d) * 2^-23 < 2 / d`, which for `d >= 3` is below one, and
+/// for a power of two, whose reciprocal is exact, is below `2^-24 * n / d`.
+/// Its truncation is therefore the quotient `q` or one either side, the
+/// remainder `n - t * d` then lies in `-d..2 * d` without overflow, and one
+/// step towards it gives `q`.
+///
+/// The domain is checked once for the slice, in a pass of its own: on
+/// WebAssembly a test of each vector costs more than the pass.
 #[inline]
-fn scale_vectorized<S: Simd>(simd: S, input: &[i32], output: &mut [i32], step: u32) -> [i32; 2] {
-    let multiplier = i32::from_ne_bytes(step.to_ne_bytes());
+fn quantize_vectorized<S: Simd>(
+    simd: S,
+    quantizer: Quantizer,
+    offset: u32,
+    coefficients: &mut [i32],
+) -> bool {
+    let step = quantizer.step();
+    // `Quantizer::quantize` clamps the offset below one step.
+    let offset = offset.min(step - 1);
+    if step >= VECTOR_QUANTIZATION_DOMAIN || coefficients.len() < S::i32s::LEN {
+        return false;
+    }
     simd.vectorize(|| {
         let lanes = S::i32s::LEN;
-        let vector_multiplier = S::i32s::splat(simd, multiplier);
-        let mut minimum = S::i32s::splat(simd, i32::MAX);
-        let mut maximum = S::i32s::splat(simd, i32::MIN);
-        let mut input_chunks = input.chunks_exact(lanes);
-        let mut output_chunks = output.chunks_exact_mut(lanes);
-        for (source, destination) in input_chunks.by_ref().zip(output_chunks.by_ref()) {
-            let coefficients = S::i32s::from_slice(simd, source);
-            minimum = minimum.min(coefficients);
-            maximum = maximum.max(coefficients);
-            (coefficients * vector_multiplier).store_slice(destination);
+        let magnitude = coefficients
+            .chunks_exact(lanes)
+            .fold(S::i32s::splat(simd, 0), |bits, chunk| {
+                bits | S::i32s::from_slice(simd, chunk).abs()
+            });
+        let tail = coefficients
+            .chunks_exact(lanes)
+            .remainder()
+            .iter()
+            .fold(0, |bits, coefficient| bits | coefficient.unsigned_abs());
+        // The OR of the magnitudes bounds each of them; the wrapped
+        // magnitude of `i32::MIN` is out of the domain as an unsigned value.
+        let largest = magnitude.bitcast::<S::u32s>().reduce_max() | tail;
+        if largest >= VECTOR_QUANTIZATION_DOMAIN - offset {
+            return false;
         }
-        let [tail_minimum, tail_maximum] = scale_scalar(
-            input_chunks.remainder(),
-            output_chunks.into_remainder(),
-            step,
-        );
-        [
-            minimum.reduce_min().min(tail_minimum),
-            maximum.reduce_max().max(tail_maximum),
-        ]
+        let signed = |value: u32| i32::try_from(value).expect("below the vector domain");
+        let divisor = S::i32s::splat(simd, signed(step));
+        let rounding = S::i32s::splat(simd, signed(offset));
+        let inverse = S::f32s::splat(simd, 1.0) / S::f32s::float_from(divisor);
+        let zero = S::i32s::splat(simd, 0);
+        let one = S::i32s::splat(simd, 1);
+        let mut chunks = coefficients.chunks_exact_mut(lanes);
+        for chunk in &mut chunks {
+            let coefficient = S::i32s::from_slice(simd, chunk);
+            let rounded = coefficient.abs() + rounding;
+            let estimate = S::i32s::truncate_from(S::f32s::float_from(rounded) * inverse);
+            let remainder = rounded - estimate * divisor;
+            let estimate = remainder.simd_ge(divisor).select(estimate + one, estimate);
+            let quotient = remainder.simd_lt(zero).select(estimate - one, estimate);
+            coefficient
+                .simd_lt(zero)
+                .select(-quotient, quotient)
+                .store_slice(chunk);
+        }
+        for coefficient in chunks.into_remainder() {
+            *coefficient = quantizer.quantize(*coefficient, offset);
+        }
+        true
     })
-}
-
-/// Scales with wrapping products and returns the observed coefficient range.
-#[inline]
-fn scale_scalar(input: &[i32], output: &mut [i32], step: u32) -> [i32; 2] {
-    let multiplier = i32::from_ne_bytes(step.to_ne_bytes());
-    let mut range = [i32::MAX, i32::MIN];
-    for (output, &coefficient) in output.iter_mut().zip(input) {
-        range = [range[0].min(coefficient), range[1].max(coefficient)];
-        *output = coefficient.wrapping_mul(multiplier);
-    }
-    range
 }
 
 #[cfg(test)]
 mod tests {
     use jxr_math::quantization::Quantizer;
 
-    use super::scale_coefficients;
-    use crate::CpuCapabilities;
+    use super::{VECTOR_QUANTIZATION_DOMAIN, quantize_coefficients};
+    use crate::{CpuCapabilities, cpu::I32Vectors, tile_decode::quantizer::component_steps};
 
-    #[test]
-    fn selected_level_matches_exact_scalar_dequantization() {
-        let input: Vec<_> = (-128..128).collect();
-        let quantizer = Quantizer::new(37).unwrap();
-        let mut output = vec![0; input.len()];
-        scale_coefficients(CpuCapabilities::detect(), quantizer, &input, &mut output).unwrap();
-        let expected: Vec<_> = input
-            .iter()
-            .map(|&value| quantizer.dequantize(value).unwrap())
+    /// Every step the encoder divides by: each step the decoder's mapping
+    /// gives a parameter of a component, scaled or not, and its double, by
+    /// which DC and low-pass bands are divided where reconstruction doubles
+    /// them.
+    fn codec_steps() -> Vec<u32> {
+        let mut steps: Vec<u32> = (0..=u8::MAX)
+            .flat_map(|parameter| {
+                [(0, false), (0, true), (1, false), (1, true)]
+                    .map(|(component, scaled)| component_steps(component, [parameter; 3], scaled))
+            })
+            .map(Result::unwrap)
+            .flat_map(|steps| [steps.dc, steps.low_pass, steps.high_pass])
+            .flat_map(|step| [step, step * 2])
             .collect();
-        assert_eq!(output, expected);
+        steps.sort_unstable();
+        steps.dedup();
+        steps
     }
 
-    #[test]
-    fn validation_rejects_overflow_before_vector_arithmetic() {
-        let input = vec![i32::MAX; 64];
-        let mut output = vec![0; input.len()];
-        assert!(
-            scale_coefficients(
-                CpuCapabilities::detect(),
-                Quantizer::new(2).unwrap(),
-                &input,
-                &mut output,
-            )
-            .is_err()
-        );
+    fn vectors() -> Option<I32Vectors> {
+        I32Vectors::of(CpuCapabilities::detect().level())
     }
 
-    #[test]
-    fn fused_range_check_matches_widened_products_at_the_boundaries() {
-        for step in [
-            1_u32,
-            2,
-            3,
-            37,
-            113,
-            65_536,
-            i32::MAX.unsigned_abs(),
-            1 << 31,
-            u32::MAX,
-        ] {
-            let quantizer = Quantizer::new(step).unwrap();
-            let [lower, upper] = super::representable_coefficients(step);
-            let candidates = [
-                i32::MIN,
-                lower.saturating_sub(1),
-                lower,
-                -1,
-                0,
-                1,
-                upper,
-                upper.saturating_add(1),
-                i32::MAX,
-            ];
-            for candidate in candidates {
-                // Place the candidate in the vector body and in the scalar tail.
-                for position in [5, 66] {
-                    let mut input = vec![0; 67];
-                    input[position] = candidate;
-                    let mut output = vec![0; input.len()];
-                    let result = scale_coefficients(
-                        CpuCapabilities::detect(),
-                        quantizer,
-                        &input,
-                        &mut output,
-                    );
-                    match quantizer.dequantize(candidate) {
-                        Ok(expected) => {
-                            result.unwrap();
-                            assert_eq!(output[position], expected, "step {step} value {candidate}");
-                        }
-                        Err(_) => assert!(result.is_err(), "step {step} value {candidate}"),
-                    }
-                }
-            }
+    /// Quantizes `coefficients` both ways and compares with the division.
+    fn assert_quantizes(step: u32, offset: u32, coefficients: &[i32]) {
+        let quantizer = Quantizer::new(step).unwrap();
+        let expected: Vec<i32> = coefficients
+            .iter()
+            .map(|&value| quantizer.quantize(value, offset))
+            .collect();
+        for vectors in [vectors(), None] {
+            let mut actual = coefficients.to_vec();
+            quantize_coefficients(vectors, quantizer, offset, &mut actual);
+            assert_eq!(actual, expected, "step {step} offset {offset}");
         }
     }
 
     #[test]
-    fn coefficient_scaling_preserves_negative_values_and_tail() {
-        let input: Vec<_> = (-34..35).collect();
-        let quantizer = Quantizer::new(113).unwrap();
-        let mut output = vec![0; input.len()];
-        scale_coefficients(CpuCapabilities::detect(), quantizer, &input, &mut output).unwrap();
-        let expected: Vec<_> = input
-            .iter()
-            .map(|&value| quantizer.dequantize(value).unwrap())
-            .collect();
-        assert_eq!(output, expected);
+    fn vector_quantization_matches_the_division_at_quotient_boundaries() {
+        for step in codec_steps() {
+            for offset in [step / 2, step / 8 * 3, 0, step - 1] {
+                let top = u64::from(VECTOR_QUANTIZATION_DOMAIN - 1 - offset.min(step - 1));
+                let step = u64::from(step);
+                // Each side of the first quotient boundaries, of the last
+                // ones in the vector domain, and of the domain's edge.
+                let magnitudes = [0, 1, step - 1, step, step + 1, 2 * step - 1, 2 * step]
+                    .into_iter()
+                    .chain([top / step * step, top - 1, top, top + 1, top + 2])
+                    .chain((0..8).map(|index| top * index / 8 / step * step + step / 2));
+                let coefficients: Vec<i32> = magnitudes
+                    .filter_map(|magnitude| i32::try_from(magnitude).ok())
+                    .flat_map(|magnitude| [magnitude, -magnitude])
+                    .chain([i32::MIN, i32::MAX])
+                    .collect();
+                let step = u32::try_from(step).unwrap();
+                // Inside the domain, then one coefficient out of it.
+                let inside: Vec<i32> = coefficients
+                    .iter()
+                    .copied()
+                    .filter(|value| value.unsigned_abs() <= u32::try_from(top).unwrap())
+                    .collect();
+                assert_quantizes(step, offset, &inside);
+                assert_quantizes(step, offset, &coefficients);
+            }
+        }
+    }
+
+    /// Every coefficient of the vector domain at every step the codec uses,
+    /// with the offsets it uses. Run with
+    /// `cargo test --release -p jxr-native -- --ignored`.
+    #[test]
+    #[ignore = "exhaustive over the vector domain; minutes in a release build"]
+    fn vector_quantization_matches_the_division_over_its_whole_domain() {
+        let Some(vectors) = vectors() else {
+            return;
+        };
+        for step in codec_steps()
+            .into_iter()
+            .filter(|&step| step < VECTOR_QUANTIZATION_DOMAIN)
+        {
+            let quantizer = Quantizer::new(step).unwrap();
+            for offset in [step / 2, step / 8 * 3] {
+                let limit =
+                    i32::try_from(VECTOR_QUANTIZATION_DOMAIN - offset.min(step - 1)).unwrap();
+                let all: Vec<i32> = (-limit + 1..limit).collect();
+                for chunk in all.chunks(1 << 16) {
+                    let mut actual = chunk.to_vec();
+                    quantize_coefficients(Some(vectors), quantizer, offset, &mut actual);
+                    for (&value, &quantized) in chunk.iter().zip(&actual) {
+                        assert_eq!(
+                            quantized,
+                            quantizer.quantize(value, offset),
+                            "step {step} offset {offset} coefficient {value}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -8,6 +8,7 @@ extern crate alloc;
 mod container;
 #[doc(hidden)]
 pub mod device_plan;
+mod encode;
 mod error;
 mod format;
 mod image;
@@ -22,12 +23,18 @@ pub use container::{
     AnnexABitDepth, AnnexAChannelOrder, AnnexANumericKind, AnnexAPixelFamily, AnnexAPixelFormat,
     AnnexAPixelFormatDescriptor,
 };
+pub use encode::{
+    EncodeQuantization, EncodeQuantizers, EncodeRequest, EncodedCodestreams, SourceImage,
+    SourcePlane, SourceSamples,
+};
 pub use error::{JxrError, JxrErrorKind, LimitKind};
 pub use format::{
     AlphaMode, BandPresence, BitstreamMode, ChannelLayout, ChromaSampling, ColorFormat, Level,
     Orientation, OverlapMode, PixelFormat, Profile, SampleFormat, StorageKind,
 };
-pub use image::{ByteRange, ImageInfo, ImageMetadata, PlaneInfo, TileGrid};
+pub use image::{
+    ByteRange, ImageInfo, ImageMetadata, PlaneInfo, TileGrid, scaled_after_first_transform,
+};
 pub use j2k_core::{BackendKind, BackendRequest, Rect};
 pub use output::{DecodedImage, DecodedSamples, DecodedSamplesMut, PlaneDescriptor};
 pub use output_policy::{AlphaFormatRequest, CropWindow, OutputBitDepth, OutputFormatRequest};

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use jxr_core::{AlphaMode, CoefficientArena, ColorFormat, PreparedPlan};
+use jxr_core::{AlphaMode, CoefficientArena, PreparedPlan};
 
 use super::{
     MetalArenaInput, MetalCoefficientSource, MetalError, MetalPlaneInput, build_plane, invalid,
@@ -54,9 +54,7 @@ pub(super) fn build_planes(
     for plane_index in 0..expected_primary_planes {
         let alpha = integrated_alpha && plane_index == primary_components;
         let scale_chroma = !alpha
-            && plane_index != 0
-            && prepared.info.primary.scaled
-            && matches!(prepared.info.primary.color_format, ColorFormat::Yuv(_));
+            && jxr_core::scaled_after_first_transform(prepared.info.primary.scaled, plane_index);
         planes.push(build_plane(
             &arenas[0],
             plane_index,

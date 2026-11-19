@@ -1,6 +1,6 @@
 [package]
 name = "jxr"
-description = "JPEG XR decoder and Annex-A writer with optional Metal and CUDA reconstruction"
+description = "JPEG XR decoder and encoder with optional Metal and CUDA reconstruction"
 version = "0.5.1"
 edition.workspace = true
 rust-version.workspace = true

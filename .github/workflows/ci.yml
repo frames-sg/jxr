@@ -29,6 +29,10 @@ jobs:
       - run: cargo test --workspace --all-features
       - run: cargo test -p jxr --no-default-features
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+      - name: Check the size of the decode-only WebAssembly module
+        run: |
+          rustup target add wasm32-unknown-unknown
+          python3 tools/wasm_size_check.py
 
   # The owner-triggered Metal hardware workflow reports status "metal" on the tested commit.
 
@@ -41,3 +45,5 @@ jobs:
         run: cargo latest && cargo latest --manifest-path crates/jxr/fuzz/Cargo.toml
       - run: cargo fmt --manifest-path crates/jxr/fuzz/Cargo.toml -- --check
       - run: cargo clippy --manifest-path crates/jxr/fuzz/Cargo.toml --all-targets -- -D warnings
+      - name: Run the encode round-trip harness on its fixed cases
+        run: cargo test --release --manifest-path crates/jxr/fuzz/Cargo.toml

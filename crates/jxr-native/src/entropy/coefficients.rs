@@ -6,11 +6,11 @@ use super::adaptive::{
 use super::vlc::{self, PrefixTable};
 use super::{AdaptiveHpScan, AdaptiveLpScan, EntropyError, HpScanDirection, PacketBitReader};
 
-const ABS_REMAP: [i32; 6] = [2, 3, 4, 6, 10, 14];
-const ABS_FIXED_LENGTH: [u8; 6] = [0, 0, 1, 2, 2, 2];
-const RUN_REMAP: [u8; 15] = [1, 2, 3, 5, 7, 1, 2, 3, 5, 7, 1, 2, 3, 4, 5];
-const RUN_BIN: [i8; 15] = [-1, -1, -1, -1, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0];
-const RUN_FIXED_LENGTH: [u8; 15] = [0, 0, 1, 1, 3, 0, 0, 1, 1, 2, 0, 0, 0, 0, 1];
+pub(super) const ABS_REMAP: [i32; 6] = [2, 3, 4, 6, 10, 14];
+pub(super) const ABS_FIXED_LENGTH: [u8; 6] = [0, 0, 1, 2, 2, 2];
+pub(super) const RUN_REMAP: [u8; 15] = [1, 2, 3, 5, 7, 1, 2, 3, 5, 7, 1, 2, 3, 4, 5];
+pub(super) const RUN_BIN: [i8; 15] = [-1, -1, -1, -1, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0];
+pub(super) const RUN_FIXED_LENGTH: [u8; 15] = [0, 0, 1, 1, 3, 0, 0, 1, 1, 2, 0, 0, 0, 0, 1];
 
 /// `(run << 3) | length` for every eight-bit prefix, indexed by maximum run.
 ///
@@ -85,7 +85,17 @@ pub enum ComponentClass {
 }
 
 impl ComponentClass {
-    const fn is_chroma(self) -> bool {
+    /// The class of component `component` of an image plane: luma for the
+    /// first and chroma for every other, whatever the component represents.
+    pub(crate) const fn of(component: usize) -> Self {
+        if component == 0 {
+            Self::Luma
+        } else {
+            Self::Chroma
+        }
+    }
+
+    pub(super) const fn is_chroma(self) -> bool {
         matches!(self, Self::Chroma)
     }
 }
@@ -218,6 +228,10 @@ pub fn decode_ac_block(
 /// On error, the caller must discard the partial output and scan state along
 /// with the failed tile. The public run/level decoder retains its original
 /// behavior and does not modify a scan until the entire block has decoded.
+///
+/// Kept out of line: the one plane reader that calls it reads faster
+/// calling it than with it inlined into its block loop.
+#[inline(never)]
 pub(crate) fn decode_hp_block(
     reader: &mut PacketBitReader<'_>,
     class: ComponentClass,
@@ -238,8 +252,8 @@ pub(crate) fn decode_hp_block(
 
 /// Decodes LP coefficients directly into their adaptive scan destinations.
 ///
-/// Placement order and results match [`decode_ac_block`] followed by
-/// [`DecodedBlock::inverse_scan_lp`]. As with [`decode_hp_block`], the caller
+/// Placement order and results match [`decode_ac_block`] with each entry
+/// placed through the scan in turn. As with [`decode_hp_block`], the caller
 /// must discard the partial output and scan state on error.
 pub(crate) fn decode_lp_block(
     reader: &mut PacketBitReader<'_>,
@@ -490,8 +504,9 @@ fn decode_run(reader: &mut PacketBitReader<'_>, max_run: u8) -> Result<u8, Entro
     Ok(RUN_REMAP[table_index] + refinement)
 }
 
+/// `magnitude` with the sign `negative` selects.
 #[inline]
-fn signed(magnitude: i32, negative: bool) -> Result<i32, EntropyError> {
+pub(super) fn signed(magnitude: i32, negative: bool) -> Result<i32, EntropyError> {
     // Sign bits are incompressible, so select the result without a branch;
     // only the unrepresentable negation of `i32::MIN` takes the error path.
     if negative && magnitude == i32::MIN {
@@ -501,8 +516,12 @@ fn signed(magnitude: i32, negative: bool) -> Result<i32, EntropyError> {
     Ok((magnitude ^ mask).wrapping_sub(mask))
 }
 
+/// Reads the sign bit that follows a non-zero magnitude `value`.
 #[inline]
-fn apply_sign(reader: &mut PacketBitReader<'_>, value: i32) -> Result<i32, EntropyError> {
+pub(super) fn apply_sign(
+    reader: &mut PacketBitReader<'_>,
+    value: i32,
+) -> Result<i32, EntropyError> {
     if value == 0 {
         return Ok(0);
     }
@@ -560,9 +579,15 @@ mod tests {
             assert_eq!(state, direct_state);
             match block {
                 Ok(block) => {
-                    block
-                        .inverse_scan_hp(&mut scan, direction, &mut expected)
-                        .unwrap();
+                    // Each run/level pair placed through the scan in turn,
+                    // from scan location one.
+                    let mut index = 1;
+                    for entry in block.entries() {
+                        index += entry.run;
+                        scan.place(direction, &mut expected, index, entry.level)
+                            .unwrap();
+                        index += 1;
+                    }
                     assert_eq!(direct, Ok(block.non_zero_count()));
                     assert_eq!(actual, expected);
                     assert_eq!(direct_scan, scan);
@@ -641,10 +666,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(block.entries(), &[RunLevel { run: 0, level: -1 }]);
+        // Placed directly, scan location one is raster position four.
+        let mut reader = PacketBitReader::with_bit_length(&[0b0001_0100], 6).unwrap();
         let mut coefficients = [0; 16];
-        block
-            .inverse_scan_lp(&mut AdaptiveLpScan::new(), &mut coefficients)
-            .unwrap();
+        let count = decode_lp_block(
+            &mut reader,
+            ComponentClass::Luma,
+            1,
+            &mut AcVlcState::new(),
+            &mut AdaptiveLpScan::new(),
+            &mut coefficients,
+        )
+        .unwrap();
+        assert_eq!(count, 1);
         assert_eq!(coefficients[4], -1);
     }
 

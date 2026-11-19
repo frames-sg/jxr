@@ -6,6 +6,7 @@
 mod batch;
 mod container;
 mod decoder;
+mod encode;
 mod error;
 mod prepared;
 mod reconstruction;
@@ -31,6 +32,7 @@ pub use batch::{
 };
 pub use container::{AnnexAWriteOptions, write_annex_a};
 pub use decoder::{DecodeIntoResult, DecodeIntoSample, JxrDecoder};
+pub use encode::{encode, encode_codestream, encode_codestreams};
 pub use prepared::PreparedJxr;
 pub use reconstruction::{PreparedAlphaReconstruction, PreparedReconstruction};
 pub use view::JxrView;

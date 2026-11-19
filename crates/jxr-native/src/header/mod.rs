@@ -4,12 +4,16 @@ mod fields;
 mod image;
 mod plane;
 mod types;
+mod write;
 
 use crate::{NativeError, bit_reader::BitReader};
 
+pub(crate) use fields::output_bit_depth;
+pub(crate) use image::inferred_margin;
 use image::parse_image_header;
 use plane::parse_plane_header;
 pub use types::{CodestreamHeader, HeaderFlags, ImagePlaneHeader, ParsedHeaders, QuantizerSet};
+pub(crate) use write::write_codestream_headers;
 
 /// Parse the T.832 image and image-plane headers.
 pub fn parse_codestream_headers(bytes: &[u8]) -> Result<ParsedHeaders, NativeError> {

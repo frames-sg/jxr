@@ -1,8 +1,12 @@
 //! Tile quantizer headers, inheritance, and macroblock indices.
 
-use jxr_core::QuantizerSet as ReconstructionQuantizers;
+use jxr_core::{BandPresence, QuantizerSet as ReconstructionQuantizers};
 
-use crate::{ImagePlaneHeader, entropy::PacketBitReader};
+use crate::{
+    ImagePlaneHeader,
+    entropy::{EntropyError, PacketBitReader},
+    metadata::band_presence,
+};
 
 use super::TileDecodeError;
 
@@ -107,23 +111,6 @@ impl TileQuantizers {
         }
     }
 
-    pub(super) fn indices(
-        &self,
-        reader: &mut PacketBitReader<'_>,
-    ) -> Result<QuantizerIndices, TileDecodeError> {
-        let lp = self.low_pass_index(reader)?;
-        let hp = self.high_pass_index(reader, lp)?;
-        Ok(QuantizerIndices { lp, hp })
-    }
-
-    pub(super) fn reconstruction_steps(
-        &self,
-        indices: QuantizerIndices,
-        scaled: bool,
-    ) -> Result<ReconstructionQuantizers, TileDecodeError> {
-        self.reconstruction_steps_for(0, indices, scaled)
-    }
-
     pub(super) fn reconstruction_steps_for(
         &self,
         component: usize,
@@ -146,13 +133,28 @@ impl TileQuantizers {
             self.components,
             component,
         )?;
-        let low_band_shift = u32::from(component == 0);
-        Ok(ReconstructionQuantizers {
-            dc: quant_map(dc, scaled, low_band_shift)?,
-            low_pass: quant_map(lp, scaled, low_band_shift)?,
-            high_pass: quant_map(hp, scaled, 1)?,
-        })
+        component_steps(component, [dc, lp, hp], scaled)
     }
+}
+
+/// Quantization steps of one component from its coded DC, low-pass, and
+/// high-pass parameters.
+///
+/// In scaled streams every high-pass step and the first component's DC and
+/// low-pass steps carry one more factor of two than the other components' DC
+/// and low-pass steps. An encoder divides by the steps this returns so that
+/// it quantizes with exactly the steps reconstruction multiplies by.
+pub(crate) fn component_steps(
+    component: usize,
+    [dc, low_pass, high_pass]: [u8; 3],
+    scaled: bool,
+) -> Result<ReconstructionQuantizers, TileDecodeError> {
+    let low_band_shift = u32::from(component == 0);
+    Ok(ReconstructionQuantizers {
+        dc: quant_map(dc, scaled, low_band_shift)?,
+        low_pass: quant_map(low_pass, scaled, low_band_shift)?,
+        high_pass: quant_map(high_pass, scaled, 1)?,
+    })
 }
 
 fn table_component(
@@ -181,7 +183,7 @@ fn parse_low_pass(
     plane: &ImagePlaneHeader,
     dc: &[u8],
 ) -> Result<(Vec<u8>, bool), TileDecodeError> {
-    if plane.bands_present == 3 {
+    if band_presence(plane.bands_present).is_ok_and(|bands| !bands.has_low_pass()) {
         return Ok((dc.to_vec(), true));
     }
     if let Some(values) = &plane.lp_quantizers {
@@ -202,7 +204,7 @@ fn parse_high_pass(
     plane: &ImagePlaneHeader,
     low_pass: &[u8],
 ) -> Result<(Vec<u8>, bool), TileDecodeError> {
-    if plane.bands_present >= 2 {
+    if !band_presence(plane.bands_present).is_ok_and(BandPresence::has_high_pass) {
         return Ok((low_pass.to_vec(), true));
     }
     if let Some(values) = &plane.hp_quantizers {
@@ -237,27 +239,40 @@ fn parse_set(
     reader: &mut PacketBitReader<'_>,
     components: u16,
 ) -> Result<Vec<u8>, TileDecodeError> {
+    read_quantizer_set(reader, components)?
+        .ok_or(TileDecodeError::Unsupported("reserved QP component mode"))
+}
+
+/// The quantization parameter of each of `components` components that a
+/// `QUANTIZER` syntax structure codes, in a plane header or a tile header:
+/// one for all, one for the first and one for the rest, or one each. `None`
+/// for the reserved `COMPONENT_MODE`.
+pub(crate) fn read_quantizer_set(
+    reader: &mut PacketBitReader<'_>,
+    components: u16,
+) -> Result<Option<Vec<u8>>, EntropyError> {
     let mode = if components == 1 {
         0
     } else {
-        u8::try_from(reader.read_bits(2)?)
-            .map_err(|_| TileDecodeError::ArithmeticOverflow("QP component mode"))?
+        reader.read_bits(2)?
     };
-    match mode {
-        0 => {
-            let value = read_u8(reader)?;
-            Ok(vec![value; usize::from(components)])
-        }
+    let mut parameter = || {
+        reader
+            .read_bits(8)
+            .map(|value| u8::try_from(value).expect("an eight-bit read fits a byte"))
+    };
+    let count = usize::from(components);
+    Ok(Some(match mode {
+        0 => vec![parameter()?; count],
         1 => {
-            let luma = read_u8(reader)?;
-            let chroma = read_u8(reader)?;
-            let mut values = vec![chroma; usize::from(components)];
+            let luma = parameter()?;
+            let mut values = vec![parameter()?; count];
             values[0] = luma;
-            Ok(values)
+            values
         }
-        2 => (0..components).map(|_| read_u8(reader)).collect(),
-        _ => Err(TileDecodeError::Unsupported("reserved QP component mode")),
-    }
+        2 => (0..count).map(|_| parameter()).collect::<Result<_, _>>()?,
+        _ => return Ok(None),
+    }))
 }
 
 fn decode_index(
@@ -290,6 +305,7 @@ fn decode_index(
     Ok(index)
 }
 
+/// Quantization step selected by a coded QP for a band of a component.
 fn quant_map(qp: u8, scaled: bool, scaled_shift: u32) -> Result<u32, TileDecodeError> {
     if qp == 0 {
         return Ok(1);
@@ -311,10 +327,6 @@ fn quant_map(qp: u8, scaled: bool, scaled_shift: u32) -> Result<u32, TileDecodeE
     mantissa
         .checked_shl(exponent)
         .ok_or(TileDecodeError::ArithmeticOverflow("quantizer scaling"))
-}
-
-fn read_u8(reader: &mut PacketBitReader<'_>) -> Result<u8, TileDecodeError> {
-    u8::try_from(reader.read_bits(8)?).map_err(|_| TileDecodeError::ArithmeticOverflow("QP value"))
 }
 
 #[cfg(test)]

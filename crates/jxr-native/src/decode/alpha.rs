@@ -8,25 +8,7 @@ use jxr_core::{
 use crate::CpuCapabilities;
 use crate::{ParsedCodestream, prepare_plan, reconstruct::PlanarSamples};
 
-use super::reconstruction::{
-    ReconstructionWorkspace, reconstruct_components, reconstruct_components_from_arena,
-};
-
-pub(super) fn reconstruct_separate_alpha(
-    source: &[u8],
-    parsed: &ParsedCodestream,
-    primary_plan: &PreparedPlan,
-    request: &DecodeRequest,
-    cpu: CpuCapabilities,
-) -> Result<PlanarSamples, JxrError> {
-    let (alpha_parsed, alpha_plan) = prepare_separate_alpha(source, parsed, primary_plan, request)?;
-    take_alpha_component(reconstruct_components(
-        source,
-        &alpha_parsed,
-        &alpha_plan,
-        cpu,
-    )?)
-}
+use super::reconstruction::{ReconstructionWorkspace, reconstruct_reduced};
 
 pub(super) fn reconstruct_separate_alpha_with_workspace(
     source: &[u8],
@@ -38,10 +20,15 @@ pub(super) fn reconstruct_separate_alpha_with_workspace(
     workspace: &mut ReconstructionWorkspace,
 ) -> Result<(PlanarSamples, bool), JxrError> {
     let (alpha_parsed, alpha_plan) = prepare_separate_alpha(source, parsed, primary_plan, request)?;
-    let reused =
-        crate::coefficient::decode_coefficients_reusing(source, &alpha_parsed, &alpha_plan, arena)?;
-    let components =
-        reconstruct_components_from_arena(arena, &alpha_parsed, &alpha_plan, cpu, workspace)?;
+    let reused = crate::coefficient::decode_coefficients_reusing(
+        source,
+        &alpha_parsed,
+        &alpha_plan,
+        arena,
+        cpu.executor(),
+    )?;
+    let (components, _) =
+        reconstruct_reduced(arena, &alpha_parsed, &alpha_plan, false, cpu, workspace)?;
     Ok((take_alpha_component(components)?, reused))
 }
 
@@ -59,7 +46,9 @@ pub(crate) fn prepare_separate_alpha_coefficients(
     Ok(Some((alpha_plan, coefficients)))
 }
 
-fn prepare_separate_alpha(
+/// The parsed codestream and plan of a separate alpha image, checked against
+/// the primary image it belongs to.
+pub(super) fn prepare_separate_alpha(
     source: &[u8],
     parsed: &ParsedCodestream,
     primary_plan: &PreparedPlan,

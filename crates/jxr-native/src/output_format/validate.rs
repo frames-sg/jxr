@@ -127,16 +127,7 @@ pub(super) fn validate_matrix(
 }
 
 fn validate_alpha(layout: ChannelLayout, has_alpha: bool) -> Result<(), OutputFormatError> {
-    let layout_has_alpha = matches!(
-        layout,
-        ChannelLayout::LumaAlpha
-            | ChannelLayout::Yuva(_)
-            | ChannelLayout::Rgba
-            | ChannelLayout::Bgra
-            | ChannelLayout::Cmyka
-            | ChannelLayout::NComponentAlpha(_)
-    );
-    if layout_has_alpha == has_alpha {
+    if layout.has_alpha() == has_alpha {
         Ok(())
     } else {
         Err(OutputFormatError::AlphaMismatch)

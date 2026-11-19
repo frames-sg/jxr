@@ -5,15 +5,13 @@ use std::{
     fs::File,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use jxr_test_support::{
     T834Case, T834CaseExpectation, T834CaseOutcome, T834CaseResult, T834Summary, T835Oracle,
-    T835ProfileLimit, discover_t834_cases, run_t834_cpu_case,
+    T835ProfileLimit, TempFile, discover_t834_cases, exit_on_error, run_t834_cpu_case, t834_suite,
+    workspace_root,
 };
-
-static REWRAP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Backend {
@@ -41,17 +39,11 @@ struct Options {
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("jxr-t834: {error}");
-        std::process::exit(1);
-    }
+    exit_on_error("jxr-t834", run());
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .ok_or("test-support crate is outside its workspace")?;
+    let workspace = workspace_root()?;
     let options = parse_options(workspace)?;
     let oracle =
         T835Oracle::for_workspace(workspace).with_profile_limit(T835ProfileLimit::Advanced);
@@ -189,7 +181,7 @@ fn execute_case_with_input(
         return execute(case);
     }
     let original = case.clone();
-    let input = match RewrappedInput::create(&case.input) {
+    let input = match rewrapped(&case.input) {
         Ok(input) => input,
         Err(error) => {
             return Ok(T834CaseResult {
@@ -202,64 +194,42 @@ fn execute_case_with_input(
         }
     };
     let mut rewritten = case;
-    rewritten.input.clone_from(&input.path);
+    input.path().clone_into(&mut rewritten.input);
     let mut result = execute(rewritten)?;
     result.case = original;
     Ok(result)
 }
 
-struct RewrappedInput {
-    path: PathBuf,
-}
-
-impl RewrappedInput {
-    fn create(input: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let source = std::fs::read(input)?;
-        let parsed = jxr_native::parse_codestream(&source)?;
-        let annex = parsed
-            .annex_a
-            .as_ref()
-            .ok_or("T.834 rewrap input is not Annex-A")?;
-        let info = jxr_native::image_info(&parsed)?;
-        let primary = &source[annex.codestream_range.clone()];
-        let mut options =
-            jxr::AnnexAWriteOptions::new(annex.width, annex.height, annex.pixel_format_guid)
-                .with_orientation(info.metadata.orientation);
-        if let Some([horizontal, vertical]) = annex.metadata.resolution_dpi_bits {
-            options =
-                options.with_resolution_dpi(f32::from_bits(horizontal), f32::from_bits(vertical));
-        }
-        if let Some(range) = annex.metadata.icc_profile_range.clone() {
-            options = options.with_icc_profile(&source[range]);
-        }
-        if let Some(range) = annex.alpha_range.clone() {
-            options = options.with_separate_alpha(&source[range]);
-        }
-        let output = jxr::write_annex_a(primary, &options)?;
-        let sequence = REWRAP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "jxr-t834-rewrap-{}-{sequence}.jxr",
-            std::process::id()
-        ));
-        let input = Self { path };
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&input.path)?;
-        file.write_all(&output)?;
-        Ok(input)
+/// The Annex-A file `input` written again by the container writer, around
+/// its own codestreams and metadata.
+fn rewrapped(input: &Path) -> Result<TempFile, Box<dyn std::error::Error>> {
+    let source = std::fs::read(input)?;
+    let parsed = jxr_native::parse_codestream(&source)?;
+    let annex = parsed
+        .annex_a
+        .as_ref()
+        .ok_or("T.834 rewrap input is not Annex-A")?;
+    let info = jxr_native::image_info(&parsed)?;
+    let primary = &source[annex.codestream_range.clone()];
+    let mut options =
+        jxr::AnnexAWriteOptions::new(annex.width, annex.height, annex.pixel_format_guid)
+            .with_orientation(info.metadata.orientation);
+    if let Some([horizontal, vertical]) = annex.metadata.resolution_dpi_bits {
+        options = options.with_resolution_dpi(f32::from_bits(horizontal), f32::from_bits(vertical));
     }
-}
-
-impl Drop for RewrappedInput {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+    if let Some(range) = annex.metadata.icc_profile_range.clone() {
+        options = options.with_icc_profile(&source[range]);
     }
+    if let Some(range) = annex.alpha_range.clone() {
+        options = options.with_separate_alpha(&source[range]);
+    }
+    let output = jxr::write_annex_a(primary, &options)?;
+    Ok(TempFile::write("jxr-t834-rewrap", &output)?)
 }
 
 fn parse_options(workspace: &Path) -> Result<Options, Box<dyn std::error::Error>> {
     let mut backend = Backend::Cpu;
-    let mut root = workspace.join("target/t834-conformance/suite-2014");
+    let mut root = t834_suite(workspace);
     let mut report = None;
     let mut category = None;
     let mut limit = None;

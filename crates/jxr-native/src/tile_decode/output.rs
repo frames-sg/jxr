@@ -5,8 +5,8 @@ use jxr_core::{
 };
 
 use super::{
-    ComponentGeometry, TileDecodeError, TileLocation, coefficients_per_macroblock,
-    spatial::SpatialMacroblock, tile_edges,
+    ComponentGeometry, TileDecodeError, coefficients_per_macroblock, dispatch::DecodedRows,
+    tile_edges,
 };
 
 /// Metadata retained for one decoded macroblock after its coefficients are stored.
@@ -78,32 +78,22 @@ impl<'a> PlaneWriter<'a> {
             BandPresence::DcOnly => target[0] = low[0],
             BandPresence::NoHighPass => target.copy_from_slice(&low[..count]),
             BandPresence::NoFlexbits | BandPresence::All => {
-                target.copy_from_slice(&high[..count]);
-                for (slot, &value) in target.iter_mut().step_by(16).zip(low) {
-                    *slot = value;
+                // A block at a time: a copy of a fixed size is a few loads
+                // and stores, where WebAssembly without bulk memory (the
+                // MVP target) calls `memcpy` for one whose size is known
+                // only when it runs.
+                let blocks = target.as_chunks_mut::<16>().0;
+                for ((block, source), &value) in
+                    blocks.iter_mut().zip(high.as_chunks::<16>().0).zip(low)
+                {
+                    *block = *source;
+                    block[0] = value;
                 }
             }
         }
         self.written = end;
         self.records.push(record);
         Ok(())
-    }
-
-    /// Store a macroblock produced by a frequency-mode traversal.
-    pub(in crate::tile_decode) fn push_macroblock(
-        &mut self,
-        macroblock: &SpatialMacroblock,
-    ) -> Result<(), TileDecodeError> {
-        self.push(
-            &macroblock.coefficients.dc_low_pass,
-            &macroblock.coefficients.high_pass,
-            MacroblockRecord {
-                quantizers: macroblock.coefficients.quantizers,
-                bands: macroblock.coefficients.bands,
-                prediction: macroblock.prediction,
-                hp_prediction: macroblock.hp_prediction,
-            },
-        )
     }
 
     /// Require a complete window and return its macroblock records.
@@ -122,8 +112,15 @@ impl<'a> PlaneWriter<'a> {
     }
 }
 
-/// Selected tile index paired with its per-component coefficient windows.
-pub(in crate::tile_decode) type TileWriters<'a> = (usize, Vec<PlaneWriter<'a>>);
+/// A selected tile's coefficient windows, one for each component plane, in
+/// component order.
+pub(in crate::tile_decode) struct TileWriters<'a, T> {
+    /// What names the tile: its index, or the reader that fills it.
+    pub(in crate::tile_decode) tile: T,
+    /// Macroblocks each window stores.
+    macroblocks: usize,
+    pub(in crate::tile_decode) writers: Vec<PlaneWriter<'a>>,
+}
 
 /// Split exact-size storage into plane-major windows for each selected tile.
 ///
@@ -133,18 +130,38 @@ pub(in crate::tile_decode) fn split_planes<'a>(
     destination: &'a mut [i32],
     layouts: &[PlaneLayout],
     tiles: &[TilePlan],
-) -> Result<Vec<TileWriters<'a>>, TileDecodeError> {
+) -> Result<Vec<TileWriters<'a, usize>>, TileDecodeError> {
     let mut selected = Vec::with_capacity(tiles.len());
     for (index, tile) in tiles.iter().enumerate() {
         if tile.required_for_reconstruction {
             let macroblocks = usize::try_from(tile.macroblock_count)
                 .map_err(|_| TileDecodeError::ArithmeticOverflow("plane macroblock count"))?;
-            selected.push((index, macroblocks, Vec::with_capacity(layouts.len())));
+            selected.push((index, macroblocks));
         }
     }
+    split_windows(destination, layouts, selected)
+}
+
+/// Split exact-size storage into plane-major windows for the tiles of
+/// `tiles`, each given with the macroblocks it stores: all of a tile's, or
+/// those of some of its macroblock rows.
+pub(in crate::tile_decode) fn split_windows<'a, T>(
+    destination: &'a mut [i32],
+    layouts: &[PlaneLayout],
+    tiles: impl IntoIterator<Item = (T, usize)>,
+) -> Result<Vec<TileWriters<'a, T>>, TileDecodeError> {
+    let mut selected: Vec<TileWriters<'a, T>> = tiles
+        .into_iter()
+        .map(|(tile, macroblocks)| TileWriters {
+            tile,
+            macroblocks,
+            writers: Vec::with_capacity(layouts.len()),
+        })
+        .collect();
     let mut rest = destination;
     for layout in layouts {
-        for (_, macroblocks, writers) in &mut selected {
+        for selected in &mut selected {
+            let macroblocks = selected.macroblocks;
             let length = macroblocks
                 .checked_mul(layout.coefficients_per_macroblock)
                 .ok_or(TileDecodeError::ArithmeticOverflow(
@@ -155,10 +172,10 @@ pub(in crate::tile_decode) fn split_planes<'a>(
                 .ok_or(TileDecodeError::InvalidPlan(
                     "external coefficient storage length",
                 ))?;
-            writers.push(PlaneWriter::new(
+            selected.writers.push(PlaneWriter::new(
                 window,
                 layout.geometry.block_count(),
-                *macroblocks,
+                macroblocks,
             ));
             rest = tail;
         }
@@ -168,10 +185,7 @@ pub(in crate::tile_decode) fn split_planes<'a>(
             "external coefficient storage length",
         ));
     }
-    Ok(selected
-        .into_iter()
-        .map(|(index, _, writers)| (index, writers))
-        .collect())
+    Ok(selected)
 }
 
 /// Append plane descriptors and macroblock metadata for decoded tile records.
@@ -180,21 +194,24 @@ pub(in crate::tile_decode) fn split_planes<'a>(
 pub(in crate::tile_decode) fn append_metadata(
     metadata: &mut MacroblockMetadata,
     planes: &mut Vec<CoefficientPlane>,
-    decoded: &[(Vec<Vec<MacroblockRecord>>, TileLocation)],
+    decoded: &[DecodedRows],
     layouts: &[PlaneLayout],
 ) -> Result<usize, TileDecodeError> {
-    if decoded.iter().any(|(tile, _)| tile.len() != layouts.len()) {
+    if decoded
+        .iter()
+        .any(|tile| tile.records.len() != layouts.len())
+    {
         return Err(TileDecodeError::InvalidPlan("decoded component count"));
     }
     let mut coefficients = 0_usize;
     for (component, layout) in layouts.iter().enumerate() {
         let coefficient_offset = coefficients;
         let macroblock_offset = metadata.len();
-        for (tile, location) in decoded {
+        for tile in decoded {
             coefficients = append_tile(
                 metadata,
-                &tile[component],
-                *location,
+                &tile.records[component],
+                tile,
                 layout.geometry.block_count(),
                 coefficients,
             )?;
@@ -211,19 +228,26 @@ pub(in crate::tile_decode) fn append_metadata(
     Ok(coefficients)
 }
 
+/// Appends the metadata of one component's records of the rows `tile`
+/// holds of its tile.
 fn append_tile(
     metadata: &mut MacroblockMetadata,
     records: &[MacroblockRecord],
-    location: TileLocation,
+    tile: &DecodedRows,
     block_count: usize,
     mut coefficients: usize,
 ) -> Result<usize, TileDecodeError> {
+    let location = tile.location;
     let width = usize::try_from(location.width)
         .map_err(|_| TileDecodeError::ArithmeticOverflow("tile width"))?;
     let height = usize::try_from(location.height)
         .map_err(|_| TileDecodeError::ArithmeticOverflow("tile height"))?;
+    let first_row = usize::try_from(tile.rows.start)
+        .map_err(|_| TileDecodeError::ArithmeticOverflow("tile row"))?;
+    let rows = usize::try_from(tile.rows.end - tile.rows.start)
+        .map_err(|_| TileDecodeError::ArithmeticOverflow("tile rows"))?;
     let expected = width
-        .checked_mul(height)
+        .checked_mul(rows)
         .ok_or(TileDecodeError::ArithmeticOverflow("tile traversal"))?;
     if records.len() != expected {
         return Err(TileDecodeError::InvalidPlan(
@@ -232,7 +256,7 @@ fn append_tile(
     }
     for (index, record) in records.iter().enumerate() {
         let x = index % width;
-        let y = index / width;
+        let y = first_row + index / width;
         let coefficient_offset = u32::try_from(coefficients)
             .map_err(|_| TileDecodeError::ArithmeticOverflow("coefficient offset"))?;
         metadata.coefficient_offsets.push(coefficient_offset);

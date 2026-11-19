@@ -3,7 +3,7 @@
 use std::{ffi::OsString, path::PathBuf};
 
 use jxr::{BackendRequest, DecodeRequest, DecodeScale};
-use jxr_test_support::oracle_format;
+use jxr_test_support::{exit_on_error, oracle_format};
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
@@ -12,10 +12,7 @@ struct Options {
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("jxr-inspect: {error}");
-        std::process::exit(1);
-    }
+    exit_on_error("jxr-inspect", run());
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {

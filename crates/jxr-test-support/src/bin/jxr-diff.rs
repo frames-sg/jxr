@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[cfg(feature = "metal")]
 use jxr_test_support::compare_file_metal;
-use jxr_test_support::{T835Oracle, compare_file};
+use jxr_test_support::{T835Oracle, T835ProfileLimit, compare_file, exit_on_error, workspace_root};
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("jxr-diff: {error}");
-        std::process::exit(1);
-    }
+    exit_on_error("jxr-diff", run());
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -18,6 +15,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .skip(1)
         .map(PathBuf::from)
         .collect::<Vec<_>>();
+    // Images declaring the Advanced profile need the reference's ceiling
+    // raised before it will decode them.
+    let advanced = arguments
+        .iter()
+        .position(|argument| argument == "--advanced")
+        .map(|index| arguments.remove(index))
+        .is_some();
     let backend = if arguments.first().is_some_and(|value| value == "--backend") {
         if arguments.len() < 2 {
             return Err("--backend requires cpu or metal".into());
@@ -40,13 +44,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let inputs = arguments;
     if inputs.is_empty() {
-        return Err("usage: jxr-diff [--backend cpu|metal] <image.jxr> [image.jxr ...]".into());
+        return Err(
+            "usage: jxr-diff [--advanced] [--backend cpu|metal] <image.jxr> [image.jxr ...]".into(),
+        );
     }
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .ok_or("test-support crate is outside its workspace")?;
-    let oracle = T835Oracle::for_workspace(workspace);
+    let workspace = workspace_root()?;
+    let oracle = T835Oracle::for_workspace(workspace).with_profile_limit(if advanced {
+        T835ProfileLimit::Advanced
+    } else {
+        T835ProfileLimit::Main
+    });
     #[cfg(feature = "metal")]
     let session = (backend == "metal")
         .then(jxr::metal::MetalDecoderSession::system_default)

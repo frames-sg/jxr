@@ -55,7 +55,7 @@ impl SurfaceLayout {
             ));
         }
         let include_alpha = matches!(
-            channel_layout(policy.pixel_format),
+            policy.pixel_format.channel_layout(),
             Some(ChannelLayout::Yuva(_))
         );
         let chroma_height = if sampling == ChromaSampling::Cs420 {
@@ -222,21 +222,6 @@ impl SurfaceLayout {
             .and_then(|end| end.checked_add(row_bytes))
             .ok_or_else(|| JxrError::arithmetic("surface plane extent"))?;
         Ok((plane.byte_offset, required))
-    }
-}
-
-const fn channel_layout(format: PixelFormat) -> Option<ChannelLayout> {
-    match format {
-        PixelFormat::BitPacked(layout)
-        | PixelFormat::U8(layout)
-        | PixelFormat::U16(layout)
-        | PixelFormat::I16(layout)
-        | PixelFormat::I32(layout)
-        | PixelFormat::F16(layout)
-        | PixelFormat::F32(layout) => Some(layout),
-        PixelFormat::Rgb555 | PixelFormat::Rgb565 | PixelFormat::Rgb101010 | PixelFormat::Rgbe => {
-            None
-        }
     }
 }
 

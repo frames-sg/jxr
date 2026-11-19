@@ -156,6 +156,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jxr-alloc-probe"
+version = "0.2.0"
+dependencies = [
+ "jxr",
+ "jxr-test-support",
+ "rayon",
+]
+
+[[package]]
 name = "jxr-core"
 version = "0.5.0"
 dependencies = [
@@ -235,6 +244,13 @@ dependencies = [
  "jxr-native",
  "rayon",
  "thiserror",
+]
+
+[[package]]
+name = "jxr-wasm-size"
+version = "0.2.0"
+dependencies = [
+ "jxr",
 ]
 
 [[package]]

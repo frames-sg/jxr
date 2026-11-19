@@ -7,6 +7,7 @@ use crate::NativeError;
 mod writer;
 
 pub use writer::{AnnexAWriteOptions, write_annex_a};
+pub(crate) use writer::{annex_a_alpha_offset, annex_a_primary_offset, complete_annex_a};
 
 const TAG_PIXEL_FORMAT: u16 = 0xBC01;
 const TAG_TRANSFORMATION: u16 = 0xBC02;

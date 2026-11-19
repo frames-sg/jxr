@@ -1,0 +1,30 @@
+[package]
+name = "jxr-alloc-probe"
+description = "Dev-only allocation probe: peak live heap and allocation counts of JPEG XR codec calls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dev-dependencies]
+jxr = { path = "../jxr", version = "=0.5.1" }
+jxr-test-support = { path = "../jxr-test-support" }
+rayon.workspace = true
+
+# The workspace forbids `unsafe`; this crate exists for the one item that
+# needs it, a `GlobalAlloc` implementation, and is never published or linked
+# into a codec crate.
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

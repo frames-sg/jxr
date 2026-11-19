@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/jxr",
+    "crates/jxr-alloc-probe",
     "crates/jxr-core",
     "crates/jxr-image",
     "crates/jxr-math",
@@ -10,6 +11,7 @@ members = [
     "crates/jxr-cuda",
     "crates/jxr-mpsgraph",
     "crates/jxr-test-support",
+    "crates/jxr-wasm-size",
 ]
 
 [workspace.package]

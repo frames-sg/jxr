@@ -66,7 +66,8 @@ pub struct MacroblockMetadata {
     pub quantizers: Vec<QuantizerSet>,
     pub bands: Vec<BandPresence>,
     pub predictions: Vec<PredictionMode>,
-    /// HP prediction direction selected from reconstructed DC/LP coefficients.
+    /// HP prediction direction selected from reconstructed DC/LP coefficients;
+    /// [`PredictionMode::None`] for a macroblock whose HP band is not read.
     pub hp_predictions: Vec<PredictionMode>,
     pub tile_edges: Vec<TileEdgeFlags>,
     /// Macroblock column in the extended coded plane.

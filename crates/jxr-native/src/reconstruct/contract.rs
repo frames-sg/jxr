@@ -24,6 +24,21 @@ pub struct QuantizedMacroblock {
     pub bands: BandPresence,
 }
 
+impl QuantizedMacroblock {
+    /// A macroblock of the DC band alone whose coefficients and steps are
+    /// all zero: the storage a reader unpacks macroblocks into.
+    pub(crate) const ZERO: Self = Self {
+        dc_low_pass: [0; 16],
+        high_pass: [0; 256],
+        quantizers: QuantizerSet {
+            dc: 0,
+            low_pass: 0,
+            high_pass: 0,
+        },
+        bands: BandPresence::DcOnly,
+    };
+}
+
 /// Macroblock tile partition used to select soft- or hard-edge overlap behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TilePartition {
@@ -62,7 +77,8 @@ pub struct ReconstructionConfig {
     pub block_columns: u8,
     /// Number of 4-sample transform blocks down each component macroblock.
     pub block_rows: u8,
-    /// Apply the normative post-first-transform chroma factor for scaled streams.
+    /// Double the component after its DC/low-pass inverse transform, as
+    /// scaled streams require of every component but the first.
     pub scale_after_first_transform: bool,
     /// Normative overlap-filtering mode.
     pub overlap: OverlapMode,

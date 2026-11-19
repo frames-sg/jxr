@@ -4,7 +4,7 @@ use std::path::Path;
 
 use jxr::{BackendRequest, DecodeRequest, DecodedSamples, JxrView, PixelFormat};
 
-use crate::{OracleError, T835Oracle, oracle_format};
+use crate::{OracleError, OracleFormat, T835Oracle, oracle_format};
 
 /// Successful byte-for-byte differential comparison metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,7 +28,8 @@ pub struct RustRawOutput {
     pub width: u32,
     /// Decoded image height.
     pub height: u32,
-    /// Native-endian bytes matching the reference program's host representation.
+    /// Native-endian bytes matching the reference program's host
+    /// representation, plane by plane where it writes planes.
     pub bytes: Vec<u8>,
 }
 
@@ -91,8 +92,76 @@ fn decode_file(input: &Path, backend: DecodeBackend<'_>) -> Result<RustRawOutput
         format: format.pixel_format,
         width: decoded.info.width,
         height: decoded.info.height,
-        bytes: sample_bytes(&decoded.samples),
+        bytes: reference_bytes(&sample_bytes(&decoded.samples), format),
     })
+}
+
+/// Rearrange the Rust decoder's tightly packed samples of an image into the
+/// raw layout the reference program writes an image of `format` in.
+///
+/// The decoder returns interleaved samples, or for YUV 4:2:0 and 4:2:2 the
+/// planes themselves, which then only gain the planes the reference appends.
+#[must_use]
+pub fn reference_bytes(decoded: &[u8], format: OracleFormat) -> Vec<u8> {
+    if !format.planar {
+        return decoded.to_vec();
+    }
+    let mut bytes = if format.subsampling().is_some() {
+        decoded.to_vec()
+    } else {
+        planar_bytes(decoded, format.pixel_format)
+    };
+    // One storage element of the fill: its low byte for eight-bit samples.
+    let wide = format.trailing_fill.to_ne_bytes();
+    let narrow = [format.trailing_fill.to_le_bytes()[0]];
+    let fill: &[u8] = if format.pixel_format.storage_kind().element_bytes() == 1 {
+        &narrow
+    } else {
+        &wide
+    };
+    for plane in 1..=usize::from(format.trailing_planes) {
+        for _ in 0..format.plane_samples(plane) {
+            bytes.extend_from_slice(fill);
+        }
+    }
+    bytes
+}
+
+/// The alpha samples of raw bytes in the reference layout of `format`: the
+/// last sample of every pixel, or the plane after the primary channels'
+/// planes.
+#[must_use]
+pub fn reference_alpha_bytes(bytes: &[u8], format: OracleFormat) -> Vec<u8> {
+    let element = format.pixel_format.storage_kind().element_bytes();
+    let channels = usize::from(format.pixel_format.channel_count()).max(1);
+    if format.planar {
+        let start: usize = (0..channels - 1)
+            .map(|channel| format.plane_samples(channel))
+            .sum();
+        let end = start + format.plane_samples(channels - 1);
+        return bytes[start * element..end * element].to_vec();
+    }
+    bytes
+        .chunks_exact(element * channels)
+        .flat_map(|pixel| &pixel[element * (channels - 1)..])
+        .copied()
+        .collect()
+}
+
+/// Rearrange tightly packed interleaved samples of `format` into whole
+/// planes, one channel after another: the order the reference program writes
+/// the formats [`crate::OracleFormat::planar`] marks.
+#[must_use]
+pub fn planar_bytes(interleaved: &[u8], format: PixelFormat) -> Vec<u8> {
+    let element = format.storage_kind().element_bytes();
+    let channels = usize::from(format.channel_count());
+    let mut planar = Vec::with_capacity(interleaved.len());
+    for channel in 0..channels {
+        for pixel in interleaved.chunks_exact(element * channels) {
+            planar.extend_from_slice(&pixel[channel * element..(channel + 1) * element]);
+        }
+    }
+    planar
 }
 
 /// Decode one Annex-A image through strict Metal and T.835, then compare raw bytes.
@@ -150,7 +219,9 @@ fn compare_output(
     })
 }
 
-fn sample_bytes(samples: &DecodedSamples) -> Vec<u8> {
+/// Native-endian bytes of decoded samples in their own storage order.
+#[must_use]
+pub fn sample_bytes(samples: &DecodedSamples) -> Vec<u8> {
     match samples {
         DecodedSamples::BitPacked(values) | DecodedSamples::U8(values) => values.clone(),
         DecodedSamples::U16(values)
@@ -192,7 +263,7 @@ fn compare_bytes(oracle: &[u8], rust: &[u8]) -> Result<(), OracleError> {
     })
 }
 
-fn rust_error(error: &jxr::JxrError) -> OracleError {
+pub(crate) fn rust_error(error: &jxr::JxrError) -> OracleError {
     OracleError::RustDecode {
         message: error.to_string(),
     }
@@ -200,8 +271,137 @@ fn rust_error(error: &jxr::JxrError) -> OracleError {
 
 #[cfg(test)]
 mod tests {
-    use super::compare_bytes;
-    use crate::OracleError;
+    use jxr::{ChannelLayout, PixelFormat};
+
+    use super::{compare_bytes, planar_bytes, reference_alpha_bytes, reference_bytes};
+    use crate::{OracleError, OracleFormat};
+
+    #[test]
+    fn reference_bytes_follow_the_declared_layout() {
+        let interleaved: Vec<u8> = (1..=10).collect();
+        let mut format = OracleFormat {
+            pixel_format: PixelFormat::U8(ChannelLayout::Cmyka),
+            alpha: jxr::AlphaHandling::Preserve,
+            planar: false,
+            trailing_planes: 0,
+            trailing_fill: 0,
+            width: 2,
+            height: 1,
+        };
+        assert_eq!(reference_bytes(&interleaved, format), interleaved);
+        format.planar = true;
+        assert_eq!(
+            reference_bytes(&interleaved, format),
+            [1, 6, 2, 7, 3, 8, 4, 9, 5, 10]
+        );
+        // A separately decoded alpha image leaves three planes unfilled.
+        format.trailing_planes = 3;
+        assert_eq!(
+            reference_bytes(&interleaved, format),
+            [1, 6, 2, 7, 3, 8, 4, 9, 5, 10, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn alpha_is_the_last_sample_or_the_plane_after_the_primary_ones() {
+        let mut format = OracleFormat {
+            pixel_format: PixelFormat::U16(ChannelLayout::Rgba),
+            alpha: jxr::AlphaHandling::Preserve,
+            planar: false,
+            trailing_planes: 0,
+            trailing_fill: 0,
+            width: 2,
+            height: 1,
+        };
+        let interleaved: Vec<u8> = (0..16).collect();
+        assert_eq!(reference_alpha_bytes(&interleaved, format), [6, 7, 14, 15]);
+        format.pixel_format = PixelFormat::U8(ChannelLayout::Cmyka);
+        format.planar = true;
+        format.trailing_planes = 3;
+        let planar = [1, 6, 2, 7, 3, 8, 4, 9, 5, 10, 0, 0, 0, 0, 0, 0];
+        assert_eq!(reference_alpha_bytes(&planar, format), [5, 10]);
+    }
+
+    #[test]
+    fn subsampled_yuv_keeps_its_planes_and_gains_neutral_chroma_after_alpha() {
+        use jxr::ChromaSampling;
+
+        // A 4 x 2 image: eight Y, two U, two V, and eight alpha samples.
+        let decoded: Vec<u8> = (1..=20).collect();
+        let mut format = OracleFormat {
+            pixel_format: PixelFormat::U8(ChannelLayout::Yuva(ChromaSampling::Cs420)),
+            alpha: jxr::AlphaHandling::Preserve,
+            planar: true,
+            trailing_planes: 0,
+            trailing_fill: 0x80,
+            width: 4,
+            height: 2,
+        };
+        assert_eq!(reference_bytes(&decoded, format), decoded);
+        assert_eq!(
+            reference_alpha_bytes(&decoded, format),
+            (13..=20).collect::<Vec<u8>>()
+        );
+        // Separate alpha is followed by a plane for each chroma channel.
+        format.trailing_planes = 2;
+        let mut expected = decoded.clone();
+        expected.extend([0x80; 4]);
+        assert_eq!(reference_bytes(&decoded, format), expected);
+        assert_eq!(
+            reference_alpha_bytes(&expected, format),
+            (13..=20).collect::<Vec<u8>>()
+        );
+        // 4:2:2 chroma keeps every row: four samples a plane.
+        format.pixel_format = PixelFormat::U8(ChannelLayout::Yuva(ChromaSampling::Cs422));
+        let decoded: Vec<u8> = (1..=24).collect();
+        assert_eq!(reference_bytes(&decoded, format).len(), 24 + 8);
+        assert_eq!(
+            reference_alpha_bytes(&decoded, format),
+            (17..=24).collect::<Vec<u8>>()
+        );
+    }
+
+    #[test]
+    fn full_resolution_yuv_is_gathered_into_planes_with_sixteen_bit_fill() {
+        use jxr::ChromaSampling;
+
+        // Two pixels of Y, U, V, alpha in sixteen-bit elements.
+        let interleaved: Vec<u8> = (0..16).collect();
+        let format = OracleFormat {
+            pixel_format: PixelFormat::U16(ChannelLayout::Yuva(ChromaSampling::Cs444)),
+            alpha: jxr::AlphaHandling::Preserve,
+            planar: true,
+            trailing_planes: 2,
+            trailing_fill: 0x200,
+            width: 2,
+            height: 1,
+        };
+        let bytes = reference_bytes(&interleaved, format);
+        assert_eq!(
+            bytes[..16],
+            [0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15]
+        );
+        let fill = 0x200_u16.to_ne_bytes();
+        assert_eq!(bytes[16..], [fill, fill, fill, fill].concat());
+        assert_eq!(reference_alpha_bytes(&bytes, format), [6, 7, 14, 15]);
+    }
+
+    #[test]
+    fn planar_bytes_gather_each_channel_in_pixel_order() {
+        assert_eq!(
+            planar_bytes(
+                &[1, 2, 3, 4, 11, 12, 13, 14],
+                PixelFormat::U8(ChannelLayout::Cmyk)
+            ),
+            [1, 11, 2, 12, 3, 13, 4, 14]
+        );
+        // Sixteen-bit samples move as whole elements.
+        let interleaved: Vec<u8> = (0..16).collect();
+        assert_eq!(
+            planar_bytes(&interleaved, PixelFormat::U16(ChannelLayout::Cmyk)),
+            [0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15]
+        );
+    }
 
     #[test]
     fn reports_first_value_mismatch() {

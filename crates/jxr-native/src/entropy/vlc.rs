@@ -1,6 +1,7 @@
 //! Normative prefix-code tables from T.832 Tables 52 and 76 through 82.
 
 use super::{EntropyError, PacketBitReader};
+use crate::bit_writer::BitWriter;
 
 /// One normative prefix code: `(code bits, code length, symbol)`.
 pub(crate) type VlcCode = (u16, u8, u8);
@@ -74,6 +75,75 @@ pub(crate) fn decode(
         syntax,
         bit_position: reader.bit_position(),
     })
+}
+
+/// Largest symbol value, plus one, in any prefix table that is written.
+const CODE_SYMBOLS: usize = 16;
+
+/// A prefix-code table indexed by symbol for writing.
+///
+/// Built from the same normative code list as the matching [`PrefixTable`],
+/// so the two directions cannot disagree. A zero length marks a symbol the
+/// table does not define.
+pub(crate) struct CodeTable {
+    codes: [(u16, u8); CODE_SYMBOLS],
+}
+
+impl CodeTable {
+    pub(crate) const fn new(codes: &[VlcCode]) -> Self {
+        let mut table = [(0_u16, 0_u8); CODE_SYMBOLS];
+        let mut index = 0;
+        while index < codes.len() {
+            let (bits, length, symbol) = codes[index];
+            assert!((symbol as usize) < CODE_SYMBOLS, "prefix code symbol");
+            assert!(
+                table[symbol as usize].1 == 0,
+                "duplicate prefix code symbol"
+            );
+            table[symbol as usize] = (bits, length);
+            index += 1;
+        }
+        Self { codes: table }
+    }
+
+    /// `(code bits, code length)` of `symbol`; the length is zero for a
+    /// symbol the table does not define.
+    pub(crate) const fn code(&self, symbol: usize) -> (u16, u8) {
+        self.codes[symbol]
+    }
+}
+
+/// The prefix code of `symbol` as `(code bits, code length)`.
+///
+/// A symbol outside the table is a caller error.
+#[inline]
+pub(crate) fn code(
+    syntax: &'static str,
+    table: &CodeTable,
+    symbol: u8,
+) -> Result<(u16, u8), EntropyError> {
+    match table.codes.get(usize::from(symbol)) {
+        Some(&code) if code.1 != 0 => Ok(code),
+        _ => Err(EntropyError::InvalidParameter {
+            parameter: syntax,
+            value: i64::from(symbol),
+        }),
+    }
+}
+
+/// Writes the prefix code of `symbol`.
+///
+/// A symbol outside the table is a caller error and writes nothing.
+#[inline]
+pub(crate) fn encode(
+    writer: &mut BitWriter,
+    syntax: &'static str,
+    table: &CodeTable,
+    symbol: u8,
+) -> Result<(), EntropyError> {
+    let (bits, length) = code(syntax, table, symbol)?;
+    writer.write_bits(u64::from(bits), length);
+    Ok(())
 }
 
 const fn c(bits: u16, length: u8, symbol: u8) -> VlcCode {
@@ -248,6 +318,40 @@ pub(super) static FIRST_INDEX: [PrefixTable; 5] = [
     PrefixTable::new(FIRST_INDEX_CODES[3]),
     PrefixTable::new(FIRST_INDEX_CODES[4]),
 ];
+
+/// Symbol-indexed tables for writing, mirroring the lookup tables above.
+pub(super) mod write {
+    use super::{
+        ABS_LEVEL_CODES, CodeTable, FIRST_INDEX_CODES, INDEX_A_CODES, INDEX_B_CODES,
+        RUN_INDEX_CODES, RUN_VALUE_CODES,
+    };
+
+    pub(in crate::entropy) static ABS_LEVEL: [CodeTable; 2] = [
+        CodeTable::new(ABS_LEVEL_CODES[0]),
+        CodeTable::new(ABS_LEVEL_CODES[1]),
+    ];
+    /// `RUN_VALUE` tables for maximum runs two, three, and four.
+    pub(in crate::entropy) static RUN_VALUE: [CodeTable; 3] = [
+        CodeTable::new(RUN_VALUE_CODES[0]),
+        CodeTable::new(RUN_VALUE_CODES[1]),
+        CodeTable::new(RUN_VALUE_CODES[2]),
+    ];
+    pub(in crate::entropy) static RUN_INDEX: CodeTable = CodeTable::new(RUN_INDEX_CODES);
+    pub(in crate::entropy) static INDEX_A: [CodeTable; 4] = [
+        CodeTable::new(INDEX_A_CODES[0]),
+        CodeTable::new(INDEX_A_CODES[1]),
+        CodeTable::new(INDEX_A_CODES[2]),
+        CodeTable::new(INDEX_A_CODES[3]),
+    ];
+    pub(in crate::entropy) static INDEX_B: CodeTable = CodeTable::new(INDEX_B_CODES);
+    pub(in crate::entropy) static FIRST_INDEX: [CodeTable; 5] = [
+        CodeTable::new(FIRST_INDEX_CODES[0]),
+        CodeTable::new(FIRST_INDEX_CODES[1]),
+        CodeTable::new(FIRST_INDEX_CODES[2]),
+        CodeTable::new(FIRST_INDEX_CODES[3]),
+        CodeTable::new(FIRST_INDEX_CODES[4]),
+    ];
+}
 
 #[cfg(test)]
 pub(crate) mod tests {

@@ -3,15 +3,17 @@
 use std::{
     hint::black_box,
     path::{Path, PathBuf},
-    sync::Arc,
     time::{Duration, Instant},
 };
 
 use jxr::{
-    AlphaHandling, BackendRequest, DecodeRequest, JxrView, PixelFormat, Rect,
+    BackendRequest, DecodeRequest, JxrView, Rect,
     cuda::{CudaDecodePlan, CudaDecoderSession},
 };
-use jxr_test_support::{checksum_bytes, checksum_samples, oracle_format, summarize_timings};
+use jxr_test_support::{
+    BenchmarkFile, check_checksum, checksum_bytes, checksum_samples, exit_on_error, milliseconds,
+    summarize_timings, t834_suite, workspace_root,
+};
 use rayon::prelude::*;
 
 const BATCH_SIZES: [usize; 5] = [1, 8, 32, 64, 128];
@@ -21,12 +23,7 @@ type BenchmarkError = Box<dyn std::error::Error + Send + Sync>;
 
 struct SourceWorkload {
     label: &'static str,
-    path: PathBuf,
-    source: Arc<[u8]>,
-    format: PixelFormat,
-    alpha: AlphaHandling,
-    width: u32,
-    height: u32,
+    file: BenchmarkFile,
 }
 
 #[derive(Clone, Copy)]
@@ -45,24 +42,18 @@ struct Measurements {
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("jxr-cuda-pathology-bench: {error}");
-        std::process::exit(1);
-    }
+    exit_on_error("jxr-cuda-pathology-bench", run());
 }
 
 fn run() -> Result<(), BenchmarkError> {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .ok_or("test-support crate is outside its workspace")?;
+    let workspace = workspace_root()?;
     let mut arguments = std::env::args_os().skip(1);
     let small_path = arguments.next().map_or_else(
-        || workspace.join("target/t834-conformance/suite-2014/BasicAndOverlap_2x2Tile/Small_Freq_Ov2_2x2_YUV420_QP10.jxr"),
+        || t834_suite(workspace).join("BasicAndOverlap_2x2Tile/Small_Freq_Ov2_2x2_YUV420_QP10.jxr"),
         PathBuf::from,
     );
     let large_path = arguments.next().map_or_else(
-        || workspace.join("target/t834-conformance/suite-2014/Windowing/Windowed8.jxr"),
+        || t834_suite(workspace).join("Windowing/Windowed8.jxr"),
         PathBuf::from,
     );
     if arguments.next().is_some() {
@@ -87,13 +78,13 @@ fn run() -> Result<(), BenchmarkError> {
         session.stream_count()
     );
     for source in &sources {
-        println!("source.{}={}", source.label, source.path.display());
+        println!("source.{}={}", source.label, source.file.path.display());
     }
     println!(
         "size\tpath\tbatch\twidth\theight\tprepare_median_ms\tsubmit_median_ms\tsync_median_ms\treadback_median_ms\ttotal_median_ms\ttotal_p95_ms\timages_per_s\tpool_allocations\th2d_bytes\td2h_bytes"
     );
     for source in &sources {
-        for region in [None, Some(roi(source.width, source.height)?)] {
+        for region in [None, Some(roi(source.file.width, source.file.height)?)] {
             let workload = Workload { source, region };
             for batch_size in BATCH_SIZES {
                 benchmark(&session, workload, batch_size, iterations)?;
@@ -118,7 +109,7 @@ fn benchmark(
         .byte_len;
     let warm_resident = session.submit_batch(&warm)?.wait()?;
     for image in &warm_resident {
-        check_checksum(checksum_bytes(&session.readback(image)?), expected)?;
+        check_checksum("CUDA", checksum_bytes(&session.readback(image)?), expected)?;
     }
     let pool_before = session.buffer_pool_diagnostics()?;
     let upload_before = session.upload_cache_diagnostics()?;
@@ -137,7 +128,7 @@ fn benchmark(
         let readback_start = Instant::now();
         for image in &resident {
             let bytes = session.readback(image)?;
-            check_checksum(checksum_bytes(&bytes), expected)?;
+            check_checksum("CUDA", checksum_bytes(&bytes), expected)?;
             black_box(bytes);
         }
         measurements.readback.push(readback_start.elapsed());
@@ -151,11 +142,10 @@ fn benchmark(
         summarize_timings(&measurements.synchronize).ok_or("empty synchronization sample")?;
     let readback = summarize_timings(&measurements.readback).ok_or("empty readback sample")?;
     let total = summarize_timings(&measurements.total).ok_or("empty total sample")?;
-    let dimensions = workload
-        .region
-        .map_or((workload.source.width, workload.source.height), |region| {
-            (region.w, region.h)
-        });
+    let dimensions = workload.region.map_or(
+        (workload.source.file.width, workload.source.file.height),
+        |region| (region.w, region.h),
+    );
     let batch_count = u32::try_from(batch_size)?;
     let images_per_second = f64::from(batch_count) / total.median.as_secs_f64();
     let d2h_bytes = output_bytes
@@ -173,12 +163,12 @@ fn benchmark(
         batch_size,
         dimensions.0,
         dimensions.1,
-        ms(prepare.median),
-        ms(submit.median),
-        ms(synchronize.median),
-        ms(readback.median),
-        ms(total.median),
-        ms(total.p95),
+        milliseconds(prepare.median),
+        milliseconds(submit.median),
+        milliseconds(synchronize.median),
+        milliseconds(readback.median),
+        milliseconds(total.median),
+        milliseconds(total.p95),
         images_per_second,
         pool_after.misses.saturating_sub(pool_before.misses),
         upload_after
@@ -196,7 +186,7 @@ fn prepare_plans(
     (0..batch_size)
         .into_par_iter()
         .map(|_| {
-            let view = JxrView::parse(&workload.source.source)?;
+            let view = JxrView::parse(&workload.source.file.source)?;
             let request = request(workload, BackendRequest::Cuda);
             Ok(view
                 .decoder()
@@ -207,7 +197,7 @@ fn prepare_plans(
 }
 
 fn cpu_checksum(workload: Workload<'_>) -> Result<u64, BenchmarkError> {
-    let view = JxrView::parse(&workload.source.source)?;
+    let view = JxrView::parse(&workload.source.file.source)?;
     let image = view
         .decoder()
         .decode(&request(workload, BackendRequest::Cpu))?;
@@ -215,27 +205,15 @@ fn cpu_checksum(workload: Workload<'_>) -> Result<u64, BenchmarkError> {
 }
 
 fn request(workload: Workload<'_>, backend: BackendRequest) -> DecodeRequest {
-    let mut request = DecodeRequest::new(workload.source.format)
-        .with_alpha(workload.source.alpha)
-        .with_backend(backend);
+    let mut request = workload.source.file.request(backend);
     request.region = workload.region;
     request
 }
 
 fn load_source(label: &'static str, path: &Path) -> Result<SourceWorkload, BenchmarkError> {
-    let source: Arc<[u8]> = std::fs::read(path)?.into();
-    let view = JxrView::parse(&source)?;
-    let format = oracle_format(view.info())?;
-    let width = view.info().width;
-    let height = view.info().height;
     Ok(SourceWorkload {
         label,
-        path: path.to_owned(),
-        source,
-        format: format.pixel_format,
-        alpha: format.alpha,
-        width,
-        height,
+        file: BenchmarkFile::load(path)?,
     })
 }
 
@@ -248,17 +226,4 @@ fn roi(width: u32, height: u32) -> Result<Rect, BenchmarkError> {
     let w = ((width / 2) & !1).max(2);
     let h = ((height / 2) & !1).max(2);
     Ok(Rect { x, y, w, h })
-}
-
-fn check_checksum(actual: u64, expected: u64) -> Result<(), BenchmarkError> {
-    black_box(actual);
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(format!("CUDA checksum changed: expected {expected:016x}, got {actual:016x}").into())
-    }
-}
-
-fn ms(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1_000.0
 }

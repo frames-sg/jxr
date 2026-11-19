@@ -1,6 +1,6 @@
 [package]
 name = "jxr-native"
-description = "Safe Rust JPEG XR parser, CPU decoder, and Annex-A writer"
+description = "Safe Rust JPEG XR parser, CPU decoder, CPU encoder, and Annex-A writer"
 version = "0.5.1"
 edition.workspace = true
 rust-version.workspace = true
